@@ -16,11 +16,14 @@ run:
     - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
 
     - |
-      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
+      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run_v4l2_iris.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
 
       # Custom media bundle (local) path
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
+      
+      # ✅ V4L2 Compliance Binary Path
+      V4L2_COMPLIANCE_BIN="/usr/bin/v4l2-compliance"
 
       # Optional: downstream module / FW (not used now, but kept for future)
       KO_DIR="/data/vendor/iris_test_app"
@@ -52,7 +55,8 @@ run:
       echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
 
       # Common args (local clips; no Wi-Fi/TAR_URL needed)
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
+      # ✅ Added --v4l2-compliance argument
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test --v4l2-compliance $V4L2_COMPLIANCE_BIN $PLAT --retry-on-fail 2 --loglevel 15"
 
       # --- BASE (upstream) only ---
       ARGS_BASE="--stack base $ARGS_COMMON"
