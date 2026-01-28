@@ -1,7 +1,7 @@
 metadata:
   format: Lava-Test Test Definition 1.0
   name: Video_V4L2_LocalClips_Compliance
-  description: "Run Video V4L2 runner (Upstream & Downstream) with explicit V4L2 Compliance testing on Upstream."
+  description: "Run Video V4L2 runner (Upstream Only) with explicit V4L2 Compliance testing."
   maintainer:
     - smuppand@qti.qualcomm.com
   os:
@@ -22,8 +22,6 @@ run:
       
       # Local resources
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
-      KO_DIR="/data/vendor/iris_test_app"
-      DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
       V4L2_BIN="/usr/bin/v4l2-compliance"
 
       # --- Platform Detection ---
@@ -49,19 +47,11 @@ run:
       echo "DEBUG: TARGET='${TARGET:-}' Detected Platform='$TL' Args='$PLAT'"
 
       # --- Arguments ---
-      # NOTE: Removed --v4l2-compliance flags from here to avoid "Unknown arg" errors in run_v4l2_iris.sh
       ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
 
+      # Force BASE stack only
       ARGS_BASE="--stack base $ARGS_COMMON"
       
-      ARGS_OVERLAY="--stack overlay $ARGS_COMMON"
-      if [ -n "$KO_DIR" ]; then
-          ARGS_OVERLAY="$ARGS_OVERLAY --ko-dir $KO_DIR"
-      fi
-      if [ "$TL" = "kodiak" ]; then
-        ARGS_OVERLAY="$ARGS_OVERLAY --downstream-fw $DS_FW"
-      fi
-
       # ---------------------------------------------------------
       # STEP 1: Run Upstream (Base) Functional Tests
       # ---------------------------------------------------------
@@ -72,8 +62,6 @@ run:
       # ---------------------------------------------------------
       # STEP 2: Run V4L2 Compliance (Upstream Context)
       # ---------------------------------------------------------
-      # We run this explicitly here so it works even if run_v4l2_iris.sh doesn't support the flags.
-      # The stack is currently 'base' (Upstream) from the previous step.
       echo ">>> [LAVA] Starting V4L2 Compliance on Upstream"
       
       if [ -x "$V4L2_BIN" ]; then
@@ -82,7 +70,9 @@ run:
           for dev in /dev/video*; do
               if [ -e "$dev" ]; then
                   found_nodes=1
+                  echo "---------------------------------------------------"
                   echo ">>> Running compliance on $dev"
+                  echo "---------------------------------------------------"
                   # Run compliance; allow fail (|| true) to prevent aborting the script entirely
                   $V4L2_BIN -d "$dev" || echo "Compliance failed on $dev"
               fi
@@ -96,11 +86,7 @@ run:
       fi
 
       # ---------------------------------------------------------
-      # STEP 3: Run Downstream (Overlay) Functional Tests
+      # FINISH: Parse Results
       # ---------------------------------------------------------
-      echo ">>> [LAVA] Starting Downstream (Overlay) Functional Tests"
-      sh -lc "$RPATH $ARGS_OVERLAY" || true
-      "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
-
-      # Final Result Parsing
+      # (Step 3 Overlay removed per request)
       "$REPO_ROOT/utils/result_parse.sh" || true
