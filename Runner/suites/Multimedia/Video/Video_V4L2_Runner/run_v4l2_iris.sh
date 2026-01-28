@@ -63,6 +63,7 @@ if [ -z "${REPEAT_POLICY:-}" ]; then REPEAT_POLICY="all"; fi
 JUNIT_OUT=""
 VERBOSE="0"
 COMPLIANCE_H264="0"
+RUN_V4L2_COMPLIANCE="0"
 
 # --- Stabilizers (opt-in) ---
 RETRY_ON_FAIL="0" # extra attempts after a FAIL
@@ -117,6 +118,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--app-launch-sleep S] [--inter-test-sleep S]
           [--log-flavor NAME] # internal: e.g. upstream or downstream (used by --stack both)
           [--compliance-h264] # run only 1 H264 Decode + 1 H264 Encode
+          [--v4l2-compliance] # Run v4l2-compliance tool on /dev/video0 (dec) and /dev/video1 (enc)
           # --- Stabilizers ---
           [--retry-on-fail N] # retry up to N times if a case ends FAIL
           [--post-test-sleep S] # sleep S seconds after each case
@@ -248,6 +250,9 @@ while [ $# -gt 0 ]; do
         --compliance-h264)
             COMPLIANCE_H264="1"
             ;;
+        --v4l2-compliance)
+            RUN_V4L2_COMPLIANCE="1"
+            ;;
         # --- Stabilizers ---
         --retry-on-fail)
             shift
@@ -374,14 +379,18 @@ else
     fi
 fi
 
-if [ -z "$final_app" ]; then
+# NOTE: If running v4l2-compliance, we might not strictly need iris_v4l2_test,
+# but we leave this check as warning or valid if user didn't specify mode yet.
+if [ -z "$final_app" ] && [ "$RUN_V4L2_COMPLIANCE" -ne 1 ]; then
     log_skip "$TESTNAME SKIP - iris_v4l2_test not available (VIDEO_APP=$VIDEO_APP). Provide --app or install the binary."
     printf '%s\n' "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
 
-VIDEO_APP="$final_app"
-export VIDEO_APP
+if [ -n "$final_app" ]; then
+    VIDEO_APP="$final_app"
+    export VIDEO_APP
+fi
 
 # --- Resolve testcase path and cd so outputs land here ---
 if ! check_dependencies grep sed awk find sort; then
@@ -460,8 +469,9 @@ else
 fi
 
 # If we're going to fetch, ensure network is online first — only once
+# NOTE: If RUN_V4L2_COMPLIANCE is 1, we assume we need the clips too.
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
-    if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ] && [ -z "$CLIPS_TAR" ]; then
+    if { [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ] && [ -z "$CLIPS_TAR" ]; } || [ "$RUN_V4L2_COMPLIANCE" -eq 1 ]; then
         net_rc=1
 
         if command -v check_network_status_rc >/dev/null 2>&1; then
@@ -500,7 +510,8 @@ fi
 
 # --- Optional early fetch of bundle (best-effort, ALWAYS in LOG_ROOT) — only once
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
-    if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
+    # Fetch if config not given OR if v4l2-compliance mode is active (since that needs clips too)
+    if { [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; } || [ "$RUN_V4L2_COMPLIANCE" -eq 1 ]; then
         if [ -n "$CLIPS_TAR" ]; then
             log_info "Custom --clips-tar provided; skipping online early fetch."
         else
@@ -645,6 +656,11 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         if [ "${COMPLIANCE_H264:-0}" -eq 1 ]; then
             args="$args --compliance-h264"
         fi
+        
+        # --- Propagate v4l2-compliance flag ---
+        if [ "${RUN_V4L2_COMPLIANCE:-0}" -eq 1 ]; then
+            args="$args --v4l2-compliance"
+        fi
 
         # --- Stabilizers passthrough ---
         if [ -n "${RETRY_ON_FAIL:-}" ]; then
@@ -730,6 +746,9 @@ log_info "TIMEOUT=${TIMEOUT}s LOGLEVEL=$LOGLEVEL REPEAT=$REPEAT REPEAT_POLICY=$R
 log_info "APP=$VIDEO_APP"
 if [ "$COMPLIANCE_H264" -eq 1 ]; then
     log_info "MODE=COMPLIANCE_H264 (Selecting 1 Decode + 1 Encode H.264)"
+fi
+if [ "$RUN_V4L2_COMPLIANCE" -eq 1 ]; then
+    log_info "MODE=V4L2_COMPLIANCE (Running v4l2-compliance tool)"
 fi
 
 if [ -n "$VIDEO_FW_DS" ]; then
@@ -961,6 +980,73 @@ case "$LOGLEVEL" in
         ;;
 esac
 
+# ==============================================================================
+#  OPT-IN: Run v4l2-compliance instead of iris_v4l2_test
+# ==============================================================================
+if [ "$RUN_V4L2_COMPLIANCE" -eq 1 ]; then
+    log_info "----------------------------------------------------------------------"
+    log_info "Running v4l2-compliance mode"
+
+    if ! command -v v4l2-compliance >/dev/null 2>&1; then
+        log_fail "v4l2-compliance tool not found in PATH"
+        printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+    fi
+
+    # Locate media file "FVDO_Freeway_720p.264"
+    # Search in: CLIPS_DEST, ., test_path, LOG_ROOT
+    search_dirs="${CLIPS_DEST:-} . $test_path $LOG_ROOT"
+    media_file=""
+    
+    # Simple check first
+    for d in $search_dirs; do
+        if [ -n "$d" ] && [ -f "$d/FVDO_Freeway_720p.264" ]; then
+            media_file="$d/FVDO_Freeway_720p.264"
+            break
+        fi
+    done
+    
+    # Fallback with find if not found directly
+    if [ -z "$media_file" ]; then
+        media_file=$(find $search_dirs -name "FVDO_Freeway_720p.264" 2>/dev/null | head -n 1)
+    fi
+
+    if [ -z "$media_file" ]; then
+        log_fail "Media file FVDO_Freeway_720p.264 not found. Ensure clips are fetched (EXTRACT_INPUT_CLIPS=true) or path is valid."
+        printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+    fi
+
+    log_info "Using media file: $media_file"
+    
+    # 1. Decoder
+    log_info ">>> Running Decoder Compliance (H.264): /dev/video0"
+    log_info "CMD: v4l2-compliance -d /dev/video0 -s5 --stream-from=\"$media_file\""
+    
+    v4l2-compliance -d /dev/video0 -s5 --stream-from="$media_file"
+    rc_dec=$?
+    log_info "Decoder exited with rc=$rc_dec"
+
+    # 2. Encoder
+    log_info ">>> Running Encoder Compliance: /dev/video1"
+    log_info "CMD: v4l2-compliance -d /dev/video1 -s"
+    
+    v4l2-compliance -d /dev/video1 -s
+    rc_enc=$?
+    log_info "Encoder exited with rc=$rc_enc"
+
+    if [ "$rc_dec" -eq 0 ] && [ "$rc_enc" -eq 0 ]; then
+        log_pass "v4l2-compliance: PASS"
+        printf '%s\n' "$TESTNAME PASS" > "$RES_FILE"
+        exit 0
+    else
+        log_fail "v4l2-compliance: FAIL (dec=$rc_dec enc=$rc_enc)"
+        printf '%s\n' "$TESTNAME FAIL" > "$RES_FILE"
+        exit 1
+    fi
+fi
+# ==============================================================================
+
 # --- Discover config list ---
 CFG_LIST="$LOG_DIR/.cfgs"
 : > "$CFG_LIST"
@@ -1064,7 +1150,7 @@ first_case="1"
 
 while IFS= read -r cfg; do
     if [ -z "$cfg" ]; then
-        continue
+        continue;
     fi
 
     # Inter-test pause (skip before the very first case)

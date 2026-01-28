@@ -22,7 +22,7 @@ run:
       # Custom media bundle (local) path
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
       
-      # ✅ V4L2 Compliance Binary Path
+      # (Variable unused in ARGS, but defined for clarity if needed)
       V4L2_COMPLIANCE_BIN="/usr/bin/v4l2-compliance"
 
       # Optional: downstream module / FW (not used now, but kept for future)
@@ -55,8 +55,8 @@ run:
       echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
 
       # Common args (local clips; no Wi-Fi/TAR_URL needed)
-      # ✅ Added --v4l2-compliance argument
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test --v4l2-compliance $V4L2_COMPLIANCE_BIN $PLAT --retry-on-fail 2 --loglevel 15"
+      # ✅ REMOVED $V4L2_COMPLIANCE_BIN from here. Just pass the flag.
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test --v4l2-compliance $PLAT --retry-on-fail 2 --loglevel 15"
 
       # --- BASE (upstream) only ---
       ARGS_BASE="--stack base $ARGS_COMMON"
