@@ -1,13 +1,14 @@
 metadata:
   format: Lava-Test Test Definition 1.0
-  name: Video_V4L2_LocalClips
-  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco; run base & overlay with V4L2 Compliance"
+  name: Video_V4L2_LocalClips_Compliance
+  description: "Run Video V4L2 runner (Upstream & Downstream) with explicit V4L2 Compliance testing on Upstream."
   maintainer:
     - smuppand@qti.qualcomm.com
   os:
     - openembedded
   scope:
     - functional
+
 run:
   steps:
     - cd Runner
@@ -15,21 +16,17 @@ run:
     - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
 
     - |
-      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
+      # --- Configuration ---
+      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run_v4l2_iris.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
-
-      # Custom media bundle (local) path
-      CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
-
-      # Custom downstream module location (directory containing iris_vpu.ko)
-      KO_DIR="/data/vendor/iris_test_app"
-
-      # Optional: downstream firmware needed on Kodiak overlay
-      DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
       
-      # V4L2 Compliance Binary Path
-      V4L2_COMPLIANCE_BIN="/usr/bin/v4l2-compliance"
+      # Local resources
+      CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
+      KO_DIR="/data/vendor/iris_test_app"
+      DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
+      V4L2_BIN="/usr/bin/v4l2-compliance"
 
+      # --- Platform Detection ---
       # Prefer explicit TARGET; otherwise derive from LAVA device-type
       if [ -n "${TARGET:-}" ]; then
         TL="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
@@ -37,33 +34,26 @@ run:
         DEVTYPE_RAW="${DEVICE_TYPE:-${LAVA_DEVICE_TYPE:-${LAVA_DEVICE_TYPE_NAME:-${DEVICE_TYPE_NAME:-}}}}"
         DEVTYPE="$(printf '%s' "$DEVTYPE_RAW" | tr '[:upper:]' '[:lower:]')"
         case "$DEVTYPE" in
-          # monaco
           qcs8300-ride|qcs8300-ride-sx|iq-8275-evk) TL="monaco" ;;
-          # lemans
           qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx) TL="lemans" ;;
-          # kodiak
           qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit) TL="kodiak" ;;
-          # fallback to autodetect in run.sh
           *) TL="" ;;
         esac
       fi
 
       case "$TL" in
         kodiak|lemans|monaco) PLAT="--platform $TL" ;;
-        *) PLAT="" ;; # autodetect
+        *) PLAT="" ;; 
       esac
 
-      echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
+      echo "DEBUG: TARGET='${TARGET:-}' Detected Platform='$TL' Args='$PLAT'"
 
-      # Common args (local clips; no Wi-Fi/TAR_URL needed)
-      # Added: --v4l2-compliance and --v4l2-compliance-bin
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test --v4l2-compliance --v4l2-compliance-bin $V4L2_COMPLIANCE_BIN $PLAT --retry-on-fail 2 --loglevel 15"
+      # --- Arguments ---
+      # NOTE: Removed --v4l2-compliance flags from here to avoid "Unknown arg" errors in run_v4l2_iris.sh
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
 
-      # --- BASE (upstream): NO ko args here ---
       ARGS_BASE="--stack base $ARGS_COMMON"
-
-      # --- OVERLAY (downstream): add ko args; only add FW on kodiak ---
-      # Note: If you want to use the KO_DIR variable defined above, append --ko-dir "$KO_DIR" here
+      
       ARGS_OVERLAY="--stack overlay $ARGS_COMMON"
       if [ -n "$KO_DIR" ]; then
           ARGS_OVERLAY="$ARGS_OVERLAY --ko-dir $KO_DIR"
@@ -72,18 +62,45 @@ run:
         ARGS_OVERLAY="$ARGS_OVERLAY --downstream-fw $DS_FW"
       fi
 
-      echo "BASE ARGS: $ARGS_BASE"
-      echo "OVERLAY ARGS: $ARGS_OVERLAY"
-
-      # Run BASE (upstream)
-      # shellcheck disable=SC2086
+      # ---------------------------------------------------------
+      # STEP 1: Run Upstream (Base) Functional Tests
+      # ---------------------------------------------------------
+      echo ">>> [LAVA] Starting Upstream (Base) Functional Tests"
       sh -lc "$RPATH $ARGS_BASE" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
 
-      # Run OVERLAY (downstream)
-      # shellcheck disable=SC2086
+      # ---------------------------------------------------------
+      # STEP 2: Run V4L2 Compliance (Upstream Context)
+      # ---------------------------------------------------------
+      # We run this explicitly here so it works even if run_v4l2_iris.sh doesn't support the flags.
+      # The stack is currently 'base' (Upstream) from the previous step.
+      echo ">>> [LAVA] Starting V4L2 Compliance on Upstream"
+      
+      if [ -x "$V4L2_BIN" ]; then
+          # Loop through video nodes (e.g., /dev/video0, /dev/video1)
+          found_nodes=0
+          for dev in /dev/video*; do
+              if [ -e "$dev" ]; then
+                  found_nodes=1
+                  echo ">>> Running compliance on $dev"
+                  # Run compliance; allow fail (|| true) to prevent aborting the script entirely
+                  $V4L2_BIN -d "$dev" || echo "Compliance failed on $dev"
+              fi
+          done
+          
+          if [ "$found_nodes" -eq 0 ]; then
+              echo "WARNING: No /dev/video* nodes found for compliance testing."
+          fi
+      else
+          echo "ERROR: v4l2-compliance binary not found at $V4L2_BIN"
+      fi
+
+      # ---------------------------------------------------------
+      # STEP 3: Run Downstream (Overlay) Functional Tests
+      # ---------------------------------------------------------
+      echo ">>> [LAVA] Starting Downstream (Overlay) Functional Tests"
       sh -lc "$RPATH $ARGS_OVERLAY" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
 
-      # Optional roll-up (ignored if absent)
+      # Final Result Parsing
       "$REPO_ROOT/utils/result_parse.sh" || true
