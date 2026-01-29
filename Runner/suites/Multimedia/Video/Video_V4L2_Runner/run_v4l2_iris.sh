@@ -62,6 +62,8 @@ if [ -z "${REPEAT_DELAY:-}" ]; then REPEAT_DELAY="0"; fi
 if [ -z "${REPEAT_POLICY:-}" ]; then REPEAT_POLICY="all"; fi
 JUNIT_OUT=""
 VERBOSE="0"
+# ADDED: Initialize compliance run variable
+V4L2_COMPLIANCE_RUN="0"
 
 # --- Stabilizers (opt-in) ---
 RETRY_ON_FAIL="0" # extra attempts after a FAIL
@@ -108,6 +110,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--platform lemans|monaco|kodiak]
           [--downstream-fw PATH] [--force]
           [--app /path/to/iris_v4l2_test]
+          [--v4l2-compliance] # Run v4l2-compliance streaming tests
           [--ssid SSID] [--password PASS]
           [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
           [--ko-tree ROOT] # opt-in: modprobe -d ROOT (expects lib/modules/\$(uname -r))
@@ -206,6 +209,10 @@ while [ $# -gt 0 ]; do
         --app)
             shift
             VIDEO_APP="$1"
+            ;;
+        # ADDED: Case for --v4l2-compliance
+        --v4l2-compliance)
+            V4L2_COMPLIANCE_RUN="1"
             ;;
         --ssid)
             shift
@@ -616,6 +623,10 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         if [ -n "${VIDEO_APP:-}" ]; then
             esc_app="$(printf %s "$VIDEO_APP" | sed "s/'/'\\\\''/g")"
             args="$args --app '$esc_app'"
+        fi
+        # --- ADDED: Pass through compliance flag to sub-runs ---
+        if [ "${V4L2_COMPLIANCE_RUN:-0}" -eq 1 ]; then
+            args="$args --v4l2-compliance"
         fi
 
         if [ -n "${SSID:-}" ]; then
