@@ -13,7 +13,7 @@ run:
   steps:
     - cd Runner
     - export REPO_ROOT="$PWD"
-    - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
+    - export TARGET="${TARGET:-}"
 
     - |
       # --- Configuration ---
@@ -22,10 +22,10 @@ run:
       
       # Local resources
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
-      V4L2_BIN="/usr/bin/v4l2-compliance"
+      
+      # (Note: V4L2_BIN is no longer needed here as the script handles it)
 
       # --- Platform Detection ---
-      # Prefer explicit TARGET; otherwise derive from LAVA device-type
       if [ -n "${TARGET:-}" ]; then
         TL="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
       else
@@ -47,46 +47,27 @@ run:
       echo "DEBUG: TARGET='${TARGET:-}' Detected Platform='$TL' Args='$PLAT'"
 
       # --- Arguments ---
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
+      # CHANGED: Added --v4l2-compliance flag here so the script runs the streaming tests
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15 --v4l2-compliance"
 
       # Force BASE stack only
       ARGS_BASE="--stack base $ARGS_COMMON"
       
       # ---------------------------------------------------------
-      # STEP 1: Run Upstream (Base) Functional Tests
+      # STEP 1: Run Upstream (Base) Functional + Compliance Tests
       # ---------------------------------------------------------
-      echo ">>> [LAVA] Starting Upstream (Base) Functional Tests"
+      echo ">>> [LAVA] Starting Upstream (Base) Functional & Compliance Tests"
+      
+      # The script now handles both functional tests AND the 52-case streaming compliance
       sh -lc "$RPATH $ARGS_BASE" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
 
       # ---------------------------------------------------------
-      # STEP 2: Run V4L2 Compliance (Upstream Context)
+      # STEP 2 REMOVED: Manual compliance loop is no longer needed
+      # because the script does it better (with streaming).
       # ---------------------------------------------------------
-      echo ">>> [LAVA] Starting V4L2 Compliance on Upstream"
-      
-      if [ -x "$V4L2_BIN" ]; then
-          # Loop through video nodes (e.g., /dev/video0, /dev/video1)
-          found_nodes=0
-          for dev in /dev/video*; do
-              if [ -e "$dev" ]; then
-                  found_nodes=1
-                  echo "---------------------------------------------------"
-                  echo ">>> Running compliance on $dev"
-                  echo "---------------------------------------------------"
-                  # Run compliance; allow fail (|| true) to prevent aborting the script entirely
-                  $V4L2_BIN -d "$dev" || echo "Compliance failed on $dev"
-              fi
-          done
-          
-          if [ "$found_nodes" -eq 0 ]; then
-              echo "WARNING: No /dev/video* nodes found for compliance testing."
-          fi
-      else
-          echo "ERROR: v4l2-compliance binary not found at $V4L2_BIN"
-      fi
 
       # ---------------------------------------------------------
       # FINISH: Parse Results
       # ---------------------------------------------------------
-      # (Step 3 Overlay removed per request)
       "$REPO_ROOT/utils/result_parse.sh" || true

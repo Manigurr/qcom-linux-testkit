@@ -1318,109 +1318,114 @@ done < "$CFG_LIST"
 # ======================================================================
 # --- V4L2 Compliance (Decoder & Encoder) ---
 # ======================================================================
-log_info "----------------------------------------------------------------------"
-log_info "Starting V4L2 Compliance Tests"
+if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
+    log_info "----------------------------------------------------------------------"
+    log_info "Starting V4L2 Compliance Tests (Streaming Enabled)"
 
-V4L2_BIN="$(command -v v4l2-compliance || echo "/usr/bin/v4l2-compliance")"
+    V4L2_BIN="$(command -v v4l2-compliance || echo "/usr/bin/v4l2-compliance")"
 
-if [ ! -x "$V4L2_BIN" ]; then
-    log_warn "v4l2-compliance binary not found at $V4L2_BIN; skipping compliance tests."
-else
-    # --- 1. Find an H.264 media file from the test suite ---
-    h264_media_file=""
-    h264_cfg_file=""
-
-    # Find a decode config for H.264 that was processed
-    if [ -s "$CFG_LIST" ]; then
-        while IFS= read -r cfg_path; do
-            raw_codec="$(video_guess_codec_from_cfg "$cfg_path")"
-            canon_codec="$(video_canon_codec "$raw_codec")"
-            is_decode=$(video_is_decode_cfg "$cfg_path" && echo "yes" || echo "no")
-
-            if [ "$is_decode" = "yes" ] && [ "$canon_codec" = "h264" ]; then
-                h264_cfg_file="$cfg_path"
-                break
-            fi
-        done < "$CFG_LIST"
-    fi
-
-    if [ -n "$h264_cfg_file" ]; then
-        log_info "Found H.264 config file: $h264_cfg_file"
-        # Extract the relative path of the input clip from the JSON
-        relative_clip_path=$(video_extract_input_clips "$h264_cfg_file" | head -n 1)
-
-        if [ -n "$relative_clip_path" ]; then
-            # Construct the absolute path
-            cfg_dir="$(cd "$(dirname "$h264_cfg_file")" 2>/dev/null && pwd)"
-            abs_clip_path="$cfg_dir/$relative_clip_path"
-
-            if [ -f "$abs_clip_path" ]; then
-                h264_media_file="$abs_clip_path"
-                log_info "Found H.264 media for compliance test: $h264_media_file"
-            else
-                log_warn "Media file '$abs_clip_path' from JSON does not exist."
-            fi
-        fi
+    if [ ! -x "$V4L2_BIN" ]; then
+        log_warn "v4l2-compliance binary not found at $V4L2_BIN; skipping compliance tests."
     else
-        log_warn "Could not find a processed H.264 decode config in the suite, will search manually."
-    fi
-    
-    # Fallback if the above fails: search for a file directly
-    if [ -z "$h264_media_file" ]; then
-        log_info "Falling back to searching for any .264 media file."
-        search_dirs="${CLIPS_DEST:-} ${test_path:-} ${DIR:-} ."
-        for d in $search_dirs; do
-            if [ -n "$d" ] && [ -d "$d" ]; then
-                found=$(find "$d" -name "*.264" 2>/dev/null | head -n 1)
-                if [ -n "$found" ]; then
-                    h264_media_file="$found"
+        # --- 1. Find an H.264 media file from the test suite ---
+        h264_media_file=""
+        h264_cfg_file=""
+
+        # Find a decode config for H.264 that was processed
+        if [ -s "$CFG_LIST" ]; then
+            while IFS= read -r cfg_path; do
+                raw_codec="$(video_guess_codec_from_cfg "$cfg_path")"
+                canon_codec="$(video_canon_codec "$raw_codec")"
+                is_decode=$(video_is_decode_cfg "$cfg_path" && echo "yes" || echo "no")
+
+                if [ "$is_decode" = "yes" ] && [ "$canon_codec" = "h264" ]; then
+                    h264_cfg_file="$cfg_path"
                     break
                 fi
-            fi
-        done
-    fi
+            done < "$CFG_LIST"
+        fi
 
-    # --- 2. Run Decoder Compliance ---
-    total=$((total + 1))
-    if [ -n "$h264_media_file" ]; then
-        log_info "Compliance Media: $h264_media_file"
-        log_info "Running Decoder Compliance on /dev/video0 (Stream)"
-        comp_dec_log="$LOG_DIR/compliance_decoder.log"
-        
-        if $V4L2_BIN -d /dev/video0 -s5 --stream-from="$h264_media_file" > "$comp_dec_log" 2>&1; then
-            log_pass "V4L2 Decoder Compliance (video0) PASS"
-            pass=$((pass + 1))
-            printf '%s\n' "compliance-dec PASS" >> "$LOG_DIR/summary.txt"
+        if [ -n "$h264_cfg_file" ]; then
+            log_info "Found H.264 config file: $h264_cfg_file"
+            relative_clip_path=$(video_extract_input_clips "$h264_cfg_file" | head -n 1)
+
+            if [ -n "$relative_clip_path" ]; then
+                cfg_dir="$(cd "$(dirname "$h264_cfg_file")" 2>/dev/null && pwd)"
+                abs_clip_path="$cfg_dir/$relative_clip_path"
+
+                if [ -f "$abs_clip_path" ]; then
+                    h264_media_file="$abs_clip_path"
+                    log_info "Found H.264 media for compliance test: $h264_media_file"
+                else
+                    log_warn "Media file '$abs_clip_path' from JSON does not exist."
+                fi
+            fi
         else
-            log_fail "V4L2 Decoder Compliance (video0) FAIL"
+            log_warn "Could not find a processed H.264 decode config in the suite, will search manually."
+        fi
+        
+        # Fallback search
+        if [ -z "$h264_media_file" ]; then
+            log_info "Falling back to searching for any .264 media file."
+            search_dirs="${CLIPS_DEST:-} ${test_path:-} ${DIR:-} ."
+            for d in $search_dirs; do
+                if [ -n "$d" ] && [ -d "$d" ]; then
+                    found=$(find "$d" -name "*.264" 2>/dev/null | head -n 1)
+                    if [ -n "$found" ]; then
+                        h264_media_file="$found"
+                        break
+                    fi
+                fi
+            done
+        fi
+
+        # --- 2. Run Decoder Compliance ---
+        total=$((total + 1))
+        if [ -n "$h264_media_file" ]; then
+            log_info "Compliance Media: $h264_media_file"
+            log_info "Running Decoder Compliance on /dev/video0 (Stream)"
+            comp_dec_log="$LOG_DIR/compliance_decoder.log"
+            
+            # --- THIS IS THE STREAM TEST (-s5 --stream-from) ---
+            if $V4L2_BIN -d /dev/video0 -s5 --stream-from="$h264_media_file" > "$comp_dec_log" 2>&1; then
+                log_pass "V4L2 Decoder Compliance (video0) PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "compliance-dec PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "V4L2 Decoder Compliance (video0) FAIL"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "compliance-dec FAIL" >> "$LOG_DIR/summary.txt"
+            fi
+        else
+            log_warn "No .264 media file found; skipping Decoder Compliance streaming test."
+            skip=$((skip + 1))
+            printf '%s\n' "compliance-dec SKIP" >> "$LOG_DIR/summary.txt"
+        fi
+
+        # --- 3. Run Encoder Compliance ---
+        total=$((total + 1))
+        log_info "Running Encoder Compliance on /dev/video1 (Stream)"
+        comp_enc_log="$LOG_DIR/compliance_encoder.log"
+        
+        # --- THIS IS THE STREAM TEST (-s) ---
+        if $V4L2_BIN -d /dev/video1 -s > "$comp_enc_log" 2>&1; then
+            log_pass "V4L2 Encoder Compliance (video1) PASS"
+            pass=$((pass + 1))
+            printf '%s\n' "compliance-enc PASS" >> "$LOG_DIR/summary.txt"
+        else
+            log_fail "V4L2 Encoder Compliance (video1) FAIL"
             fail=$((fail + 1))
             suite_rc=1
-            printf '%s\n' "compliance-dec FAIL" >> "$LOG_DIR/summary.txt"
+            printf '%s\n' "compliance-enc FAIL" >> "$LOG_DIR/summary.txt"
         fi
-    else
-        log_warn "No .264 media file found; skipping Decoder Compliance streaming test."
-        skip=$((skip + 1))
-        printf '%s\n' "compliance-dec SKIP" >> "$LOG_DIR/summary.txt"
     fi
-
-    # --- 3. Run Encoder Compliance ---
-    total=$((total + 1))
-    log_info "Running Encoder Compliance on /dev/video1 (Stream)"
-    comp_enc_log="$LOG_DIR/compliance_encoder.log"
-    
-    if $V4L2_BIN -d /dev/video1 -s > "$comp_enc_log" 2>&1; then
-        log_pass "V4L2 Encoder Compliance (video1) PASS"
-        pass=$((pass + 1))
-        printf '%s\n' "compliance-enc PASS" >> "$LOG_DIR/summary.txt"
-    else
-        log_fail "V4L2 Encoder Compliance (video1) FAIL"
-        fail=$((fail + 1))
-        suite_rc=1
-        printf '%s\n' "compliance-enc FAIL" >> "$LOG_DIR/summary.txt"
-    fi
+else
+    log_info "Skipping V4L2 Compliance Tests (use --v4l2-compliance to enable)"
 fi
 
 log_info "Summary: total=$total pass=$pass fail=$fail skip=$skip"
+
 
 # --- End-of-run detailed per-test results ---
 if [ -s "$LOG_DIR/summary.txt" ]; then
