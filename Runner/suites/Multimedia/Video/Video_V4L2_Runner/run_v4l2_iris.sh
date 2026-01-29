@@ -1398,8 +1398,16 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
             log_info "Running Decoder Compliance on /dev/video0 (Stream)"
             comp_dec_log="$LOG_DIR/compliance_decoder.log"
             
-            # --- THIS IS THE STREAM TEST (-s5 --stream-from) ---
-            if $V4L2_BIN -d /dev/video0 -s5 --stream-from="$h264_media_file" > "$comp_dec_log" 2>&1; then
+            # --- EXECUTE TEST & CAPTURE LOGS ---
+            "$V4L2_BIN" -d /dev/video0 -s5 --stream-from="$h264_media_file" > "$comp_dec_log" 2>&1
+            rc_dec=$?
+            
+            # --- PRINT DETAILED LOGS TO CONSOLE ---
+            log_info ">>> DETAILED DECODER COMPLIANCE LOGS START >>>"
+            cat "$comp_dec_log"
+            log_info "<<< DETAILED DECODER COMPLIANCE LOGS END <<<"
+
+            if [ "$rc_dec" -eq 0 ]; then
                 log_pass "V4L2 Decoder Compliance (video0) PASS"
                 pass=$((pass + 1))
                 printf '%s\n' "compliance-dec PASS" >> "$LOG_DIR/summary.txt"
@@ -1420,8 +1428,16 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
         log_info "Running Encoder Compliance on /dev/video1 (Stream)"
         comp_enc_log="$LOG_DIR/compliance_encoder.log"
         
-        # --- THIS IS THE STREAM TEST (-s) ---
-        if $V4L2_BIN -d /dev/video1 -s > "$comp_enc_log" 2>&1; then
+        # --- EXECUTE TEST & CAPTURE LOGS ---
+        "$V4L2_BIN" -d /dev/video1 -s > "$comp_enc_log" 2>&1
+        rc_enc=$?
+
+        # --- PRINT DETAILED LOGS TO CONSOLE ---
+        log_info ">>> DETAILED ENCODER COMPLIANCE LOGS START >>>"
+        cat "$comp_enc_log"
+        log_info "<<< DETAILED ENCODER COMPLIANCE LOGS END <<<"
+
+        if [ "$rc_enc" -eq 0 ]; then
             log_pass "V4L2 Encoder Compliance (video1) PASS"
             pass=$((pass + 1))
             printf '%s\n' "compliance-enc PASS" >> "$LOG_DIR/summary.txt"
