@@ -62,8 +62,6 @@ if [ -z "${REPEAT_DELAY:-}" ]; then REPEAT_DELAY="0"; fi
 if [ -z "${REPEAT_POLICY:-}" ]; then REPEAT_POLICY="all"; fi
 JUNIT_OUT=""
 VERBOSE="0"
-# ADDED: Initialize compliance run variable
-V4L2_COMPLIANCE_RUN="0"
 
 # --- Stabilizers (opt-in) ---
 RETRY_ON_FAIL="0" # extra attempts after a FAIL
@@ -86,6 +84,9 @@ if [ -z "${VIDEO_FW_BACKUP_DIR:-}" ]; then VIDEO_FW_BACKUP_DIR=""; fi
 if [ -z "${VIDEO_NO_REBOOT:-}" ]; then VIDEO_NO_REBOOT="0"; fi
 if [ -z "${VIDEO_FORCE:-}" ]; then VIDEO_FORCE="0"; fi
 if [ -z "${VIDEO_APP:-}" ]; then VIDEO_APP="/usr/bin/iris_v4l2_test"; fi
+
+# <<< CHANGE #1: Initialize the V4L2 compliance run variable >>>
+V4L2_COMPLIANCE_RUN="0"
 
 # --- Net/DL tunables (no-op if helpers ignore them) ---
 if [ -z "${NET_STABILIZE_SLEEP:-}" ]; then NET_STABILIZE_SLEEP="5"; fi
@@ -110,7 +111,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--platform lemans|monaco|kodiak]
           [--downstream-fw PATH] [--force]
           [--app /path/to/iris_v4l2_test]
-          [--v4l2-compliance] # Run v4l2-compliance streaming tests
+          [--v4l2-compliance] # <<< This flag is now recognized
           [--ssid SSID] [--password PASS]
           [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
           [--ko-tree ROOT] # opt-in: modprobe -d ROOT (expects lib/modules/\$(uname -r))
@@ -210,7 +211,7 @@ while [ $# -gt 0 ]; do
             shift
             VIDEO_APP="$1"
             ;;
-        # ADDED: Case for --v4l2-compliance
+        # <<< CHANGE #2: Handle the --v4l2-compliance argument >>>
         --v4l2-compliance)
             V4L2_COMPLIANCE_RUN="1"
             ;;
@@ -624,8 +625,8 @@ if [ "${VIDEO_STACK}" = "both" ]; then
             esc_app="$(printf %s "$VIDEO_APP" | sed "s/'/'\\\\''/g")"
             args="$args --app '$esc_app'"
         fi
-        # --- ADDED: Pass through compliance flag to sub-runs ---
-        if [ "${V4L2_COMPLIANCE_RUN:-0}" -eq 1 ]; then
+        
+        if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
             args="$args --v4l2-compliance"
         fi
 
