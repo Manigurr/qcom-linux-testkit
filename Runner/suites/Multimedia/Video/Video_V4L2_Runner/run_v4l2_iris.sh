@@ -1429,7 +1429,7 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
         comp_enc_log="$LOG_DIR/compliance_encoder.log"
         
         # --- EXECUTE TEST & CAPTURE LOGS ---
-        "$V4L2_BIN" -d /dev/video1 -s > "$comp_enc_log" 2>&1
+        "$V4L2_BIN" -d /dev/video1 -s5 > "$comp_enc_log" 2>&1
         rc_enc=$?
 
         # --- PRINT DETAILED LOGS TO CONSOLE ---
