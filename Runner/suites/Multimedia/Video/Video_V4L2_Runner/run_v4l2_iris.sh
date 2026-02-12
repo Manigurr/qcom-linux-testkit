@@ -1456,7 +1456,6 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
     log_info "Starting Custom v4l2-ctl Tests"
 
     # --- 1. Dynamic Device Discovery ---
-    # Find the correct nodes for Decoder (iris_dec/venus_dec) and Encoder (iris_enc/venus_enc)
     
     DEC_DEV=""
     ENC_DEV=""
@@ -1467,8 +1466,6 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
 
     # If no symlinks, search by capability using v4l2-ctl
     if [ -z "$DEC_DEV" ]; then
-        # Look for a device that supports Video Output Overlay or Video Output (Decoder uses Output for compressed)
-        # Note: A robust way is looking for the driver name 'venus' or 'iris'
         for dev in /dev/video*; do
             if [ -c "$dev" ]; then
                 # Check if it supports H264 decoding
@@ -1526,39 +1523,82 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
 
     if [ -e "$DEC_DEV" ]; then
         # 1. Decoder H264
+        total=$((total + 1))
         dec_h264_clip=$(find_media_for_test "264" "")
         if [ -z "$dec_h264_clip" ]; then dec_h264_clip=$(find_media_for_test "h264" ""); fi
         
         if [ -n "$dec_h264_clip" ]; then
             log_info "Testing Decoder H264 with: $dec_h264_clip"
             v4l2-ctl --set-fmt-video-out=pixelformat=H264 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from "$dec_h264_clip" --stream-to=/tmp/v4l2_h264_to_nv12_decoder_output.yuv -d "$DEC_DEV"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                log_pass "v4l2-ctl Decoder H264 PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "v4l2-ctl-dec-h264 PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "v4l2-ctl Decoder H264 FAIL (rc=$rc)"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "v4l2-ctl-dec-h264 FAIL" >> "$LOG_DIR/summary.txt"
+            fi
         else
             log_warn "Skipping Decoder H264: No .264/.h264 clip found"
+            skip=$((skip + 1))
+            printf '%s\n' "v4l2-ctl-dec-h264 SKIP" >> "$LOG_DIR/summary.txt"
         fi
 
         # 2. Decoder HEVC
+        total=$((total + 1))
         dec_hevc_clip=$(find_media_for_test "265" "")
         if [ -z "$dec_hevc_clip" ]; then dec_hevc_clip=$(find_media_for_test "hevc" ""); fi
         
         if [ -n "$dec_hevc_clip" ]; then
             log_info "Testing Decoder HEVC with: $dec_hevc_clip"
             v4l2-ctl --set-fmt-video-out=pixelformat=HEVC --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from="$dec_hevc_clip" --stream-to=/tmp/v4l2_hevc_to_nv12_decoder_output.yuv -d "$DEC_DEV"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                log_pass "v4l2-ctl Decoder HEVC PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "v4l2-ctl-dec-hevc PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "v4l2-ctl Decoder HEVC FAIL (rc=$rc)"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "v4l2-ctl-dec-hevc FAIL" >> "$LOG_DIR/summary.txt"
+            fi
         else
             log_warn "Skipping Decoder HEVC: No .265/.hevc clip found"
+            skip=$((skip + 1))
+            printf '%s\n' "v4l2-ctl-dec-hevc SKIP" >> "$LOG_DIR/summary.txt"
         fi
 
         # 3. Decoder VP9
+        total=$((total + 1))
         dec_vp9_clip=$(find_media_for_test "vp9" "")
         if [ -z "$dec_vp9_clip" ]; then dec_vp9_clip=$(find_media_for_test "ivf" ""); fi
         
         if [ -n "$dec_vp9_clip" ]; then
             log_info "Testing Decoder VP9 with: $dec_vp9_clip"
             v4l2-ctl --set-fmt-video-out=pixelformat=VP90 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from-hdr="$dec_vp9_clip" --stream-mmap --stream-to=/tmp/v4l2_vp9_to_nv12_decoder_output.yuv -d "$DEC_DEV"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+                log_pass "v4l2-ctl Decoder VP9 PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "v4l2-ctl-dec-vp9 PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "v4l2-ctl Decoder VP9 FAIL (rc=$rc)"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "v4l2-ctl-dec-vp9 FAIL" >> "$LOG_DIR/summary.txt"
+            fi
         else
             log_warn "Skipping Decoder VP9: No .vp9/.ivf clip found"
+            skip=$((skip + 1))
+            printf '%s\n' "v4l2-ctl-dec-vp9 SKIP" >> "$LOG_DIR/summary.txt"
         fi
     else
         log_fail "Decoder device $DEC_DEV not found. Skipping Decoder Tests."
+        suite_rc=1
     fi
 
     # --- Encoder v4l2-ctl tests ---
@@ -1588,17 +1628,49 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
             raw_clip=$(find_raw_clip "$w" "$h")
             
             if [ -n "$raw_clip" ]; then
+                # H264 Encode
+                total=$((total + 1))
                 log_info "Enc H264 ${w}x${h} using: $raw_clip"
                 v4l2-ctl --set-fmt-video-out=width=$w,height=$h,pixelformat=NV12 --set-selection-output target=crop,top=0,left=0,width=$w,height=$h --set-fmt-video=pixelformat=H264 --stream-mmap --stream-out-mmap --stream-from="$raw_clip" --stream-to=/tmp/${name}_${w}x${h}.h264 -d "$ENC_DEV"
+                rc=$?
+                if [ "$rc" -eq 0 ]; then
+                    log_pass "v4l2-ctl Encoder H264 ${w}x${h} PASS"
+                    pass=$((pass + 1))
+                    printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} PASS" >> "$LOG_DIR/summary.txt"
+                else
+                    log_fail "v4l2-ctl Encoder H264 ${w}x${h} FAIL (rc=$rc)"
+                    fail=$((fail + 1))
+                    suite_rc=1
+                    printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} FAIL" >> "$LOG_DIR/summary.txt"
+                fi
 
+                # HEVC Encode
+                total=$((total + 1))
                 log_info "Enc HEVC ${w}x${h} using: $raw_clip"
                 v4l2-ctl --set-fmt-video-out=width=$w,height=$h,pixelformat=NV12 --set-selection-output target=crop,top=0,left=0,width=$w,height=$h --set-fmt-video=pixelformat=HEVC --stream-mmap --stream-out-mmap --stream-from="$raw_clip" --stream-to=/tmp/${name}_${w}x${h}.hevc -d "$ENC_DEV"
+                rc=$?
+                if [ "$rc" -eq 0 ]; then
+                    log_pass "v4l2-ctl Encoder HEVC ${w}x${h} PASS"
+                    pass=$((pass + 1))
+                    printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} PASS" >> "$LOG_DIR/summary.txt"
+                else
+                    log_fail "v4l2-ctl Encoder HEVC ${w}x${h} FAIL (rc=$rc)"
+                    fail=$((fail + 1))
+                    suite_rc=1
+                    printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} FAIL" >> "$LOG_DIR/summary.txt"
+                fi
             else
+                # Skip counts for both H264 and HEVC if input not found
+                total=$((total + 2))
                 log_warn "Skipping Enc ${w}x${h}: No raw input found"
+                skip=$((skip + 2))
+                printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} SKIP" >> "$LOG_DIR/summary.txt"
+                printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} SKIP" >> "$LOG_DIR/summary.txt"
             fi
         done
     else
         log_fail "Encoder device $ENC_DEV not found. Skipping Encoder Tests."
+        suite_rc=1
     fi
 
 else
