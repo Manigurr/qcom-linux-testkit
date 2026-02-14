@@ -52,8 +52,9 @@ run:
 
       # --- Arguments ---
       # CHANGED: Added --v4l2-compliance flag here so the script runs the streaming tests
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15 --v4l2-compliance"
-
+            # --- Arguments ---
+      # CHANGED: Added --v4l2-compliance AND --v4l2-ctl flags
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15 --v4l2-compliance --v4l2-ctl"
       # Force BASE stack only
       ARGS_BASE="--stack base $ARGS_COMMON"
       
