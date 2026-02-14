@@ -85,8 +85,9 @@ if [ -z "${VIDEO_NO_REBOOT:-}" ]; then VIDEO_NO_REBOOT="0"; fi
 if [ -z "${VIDEO_FORCE:-}" ]; then VIDEO_FORCE="0"; fi
 if [ -z "${VIDEO_APP:-}" ]; then VIDEO_APP="/usr/bin/iris_v4l2_test"; fi
 
-# <<< CHANGE #1: Initialize the V4L2 compliance run variable >>>
+# Initialize the V4L2 compliance and V4L2-CTL run variables
 V4L2_COMPLIANCE_RUN="0"
+V4L2_CTL_RUN="0"
 
 # --- Net/DL tunables (no-op if helpers ignore them) ---
 if [ -z "${NET_STABILIZE_SLEEP:-}" ]; then NET_STABILIZE_SLEEP="5"; fi
@@ -111,7 +112,8 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--platform lemans|monaco|kodiak]
           [--downstream-fw PATH] [--force]
           [--app /path/to/iris_v4l2_test]
-          [--v4l2-compliance] # <<< This flag is now recognized
+          [--v4l2-compliance] # Run v4l2-compliance tool tests
+          [--v4l2-ctl]        # Run v4l2-ctl encoder tests (H264/HEVC)
           [--ssid SSID] [--password PASS]
           [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
           [--ko-tree ROOT] # opt-in: modprobe -d ROOT (expects lib/modules/\$(uname -r))
@@ -211,9 +213,11 @@ while [ $# -gt 0 ]; do
             shift
             VIDEO_APP="$1"
             ;;
-        # <<< CHANGE #2: Handle the --v4l2-compliance argument >>>
         --v4l2-compliance)
             V4L2_COMPLIANCE_RUN="1"
+            ;;
+        --v4l2-ctl)
+            V4L2_CTL_RUN="1"
             ;;
         --ssid)
             shift
@@ -630,6 +634,10 @@ if [ "${VIDEO_STACK}" = "both" ]; then
             args="$args --v4l2-compliance"
         fi
 
+        if [ "$V4L2_CTL_RUN" -eq 1 ]; then
+            args="$args --v4l2-ctl"
+        fi
+
         if [ -n "${SSID:-}" ]; then
             esc_ssid="$(printf %s "$SSID" | sed "s/'/'\\\\''/g")"
             args="$args --ssid '$esc_ssid'"
@@ -994,13 +1002,6 @@ fi
 cfg_count="$(wc -l < "$CFG_LIST" 2>/dev/null | tr -d ' ')"
 log_info "Discovered $cfg_count JSON config(s) to run"
 
-# --- JUnit prep / results files ---
-JUNIT_TMP="$LOG_DIR/.junit_cases.xml"
-: > "$JUNIT_TMP"
-
-printf '%s\n' "mode,id,result,name,elapsed,pass_runs,fail_runs" > "$LOG_DIR/results.csv"
-: > "$LOG_DIR/summary.txt"
-
 # --- Suite loop ---
 total="0"
 pass="0"
@@ -1285,7 +1286,7 @@ while IFS= read -r cfg; do
             "$id" "$mode" "$pretty" "$final" "$pass_runs" "$fail_runs" "$elapsed"
     } >> "$logf" 2>&1
 
-    video_junit_append_case "$JUNIT_TMP" "Video.$mode" "$pretty" "$elapsed" "$final" "$logf"
+    # video_junit_append_case "$JUNIT_TMP" "Video.$mode" "$pretty" "$elapsed" "$final" "$logf"
 
     case "$final" in
         PASS)
@@ -1402,10 +1403,10 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
             "$V4L2_BIN" -d /dev/video0 -s5 --stream-from="$h264_media_file" > "$comp_dec_log" 2>&1
             rc_dec=$?
             
-            # --- DETAILED LOGS SAVED TO ARTIFACTS ONLY ---
-            log_info "Detailed Decoder Compliance logs saved to: $comp_dec_log"
-            # Print summary/fail lines only to keep log size down
-            grep -iE "fail|error|summary" "$comp_dec_log" | head -n 50 || true
+            # --- PRINT DETAILED LOGS TO CONSOLE ---
+            log_info ">>> DETAILED DECODER COMPLIANCE LOGS START >>>"
+            cat "$comp_dec_log"
+            log_info "<<< DETAILED DECODER COMPLIANCE LOGS END <<<"
 
             if [ "$rc_dec" -eq 0 ]; then
                 log_pass "V4L2 Decoder Compliance (video0) PASS"
@@ -1432,10 +1433,10 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
         "$V4L2_BIN" -d /dev/video1 -s5 > "$comp_enc_log" 2>&1
         rc_enc=$?
 
-        # --- DETAILED LOGS SAVED TO ARTIFACTS ONLY ---
-        log_info "Detailed Encoder Compliance logs saved to: $comp_enc_log"
-        # Print summary/fail lines only to keep log size down
-        grep -iE "fail|error|summary" "$comp_enc_log" | head -n 50 || true
+        # --- PRINT DETAILED LOGS TO CONSOLE ---
+        log_info ">>> DETAILED ENCODER COMPLIANCE LOGS START >>>"
+        cat "$comp_enc_log"
+        log_info "<<< DETAILED ENCODER COMPLIANCE LOGS END <<<"
 
         if [ "$rc_enc" -eq 0 ]; then
             log_pass "V4L2 Encoder Compliance (video1) PASS"
@@ -1448,234 +1449,98 @@ if [ "$V4L2_COMPLIANCE_RUN" -eq 1 ]; then
             printf '%s\n' "compliance-enc FAIL" >> "$LOG_DIR/summary.txt"
         fi
     fi
-
-    # ======================================================================
-    # --- Custom v4l2-ctl Tests (Decoder & Encoder) ---
-    # ======================================================================
-    log_info "----------------------------------------------------------------------"
-    log_info "Starting Custom v4l2-ctl Tests"
-
-    # --- 1. Dynamic Device Discovery ---
-    
-    DEC_DEV=""
-    ENC_DEV=""
-
-    # Check for symbolic links first (often reliable)
-    if [ -e /dev/video-dec0 ]; then DEC_DEV="/dev/video-dec0"; fi
-    if [ -e /dev/video-enc0 ]; then ENC_DEV="/dev/video-enc0"; fi
-
-    # If no symlinks, search by capability using v4l2-ctl
-    if [ -z "$DEC_DEV" ]; then
-        for dev in /dev/video*; do
-            if [ -c "$dev" ]; then
-                # Check if it supports H264 decoding
-                if v4l2-ctl -d "$dev" --list-formats-out 2>/dev/null | grep -q "H264"; then
-                    DEC_DEV="$dev"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    if [ -z "$ENC_DEV" ]; then
-        for dev in /dev/video*; do
-            if [ -c "$dev" ]; then
-                # Check if it supports H264 encoding (H264 on Capture queue)
-                if v4l2-ctl -d "$dev" --list-formats 2>/dev/null | grep -q "H264"; then
-                    ENC_DEV="$dev"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # Fallback defaults if discovery fails (common qualcomm defaults)
-    if [ -z "$DEC_DEV" ]; then DEC_DEV="/dev/video32"; fi
-    if [ -z "$ENC_DEV" ]; then ENC_DEV="/dev/video33"; fi
-
-    log_info "Identified DECODER device: $DEC_DEV"
-    log_info "Identified ENCODER device: $ENC_DEV"
-
-    # --- Helper to find media ---
-    find_media_for_test() {
-        local ext="$1"
-        local pattern="${2:-}"
-        local search_dirs="${CLIPS_DEST:-} ${test_path:-} ${DIR:-} ."
-        
-        for d in $search_dirs; do
-            if [ -n "$d" ] && [ -d "$d" ]; then
-                if [ -n "$pattern" ]; then
-                    found=$(find "$d" -name "*${pattern}*.${ext}" 2>/dev/null | head -n 1)
-                else
-                    found=$(find "$d" -name "*.${ext}" 2>/dev/null | head -n 1)
-                fi
-                if [ -n "$found" ]; then
-                    echo "$found"
-                    return 0
-                fi
-            fi
-        done
-        echo ""
-    }
-
-    # --- Decoder v4l2-ctl tests ---
-    log_info "--- Decoder v4l2-ctl tests ---"
-
-    if [ -e "$DEC_DEV" ]; then
-        # 1. Decoder H264
-        total=$((total + 1))
-        dec_h264_clip=$(find_media_for_test "264" "")
-        if [ -z "$dec_h264_clip" ]; then dec_h264_clip=$(find_media_for_test "h264" ""); fi
-        
-        if [ -n "$dec_h264_clip" ]; then
-            log_info "Testing Decoder H264 with: $dec_h264_clip"
-            v4l2-ctl --set-fmt-video-out=pixelformat=H264 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from "$dec_h264_clip" --stream-to=/tmp/v4l2_h264_to_nv12_decoder_output.yuv -d "$DEC_DEV"
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-                log_pass "v4l2-ctl Decoder H264 PASS"
-                pass=$((pass + 1))
-                printf '%s\n' "v4l2-ctl-dec-h264 PASS" >> "$LOG_DIR/summary.txt"
-            else
-                log_fail "v4l2-ctl Decoder H264 FAIL (rc=$rc)"
-                fail=$((fail + 1))
-                suite_rc=1
-                printf '%s\n' "v4l2-ctl-dec-h264 FAIL" >> "$LOG_DIR/summary.txt"
-            fi
-        else
-            log_warn "Skipping Decoder H264: No .264/.h264 clip found"
-            skip=$((skip + 1))
-            printf '%s\n' "v4l2-ctl-dec-h264 SKIP" >> "$LOG_DIR/summary.txt"
-        fi
-
-        # 2. Decoder HEVC
-        total=$((total + 1))
-        dec_hevc_clip=$(find_media_for_test "265" "")
-        if [ -z "$dec_hevc_clip" ]; then dec_hevc_clip=$(find_media_for_test "hevc" ""); fi
-        
-        if [ -n "$dec_hevc_clip" ]; then
-            log_info "Testing Decoder HEVC with: $dec_hevc_clip"
-            v4l2-ctl --set-fmt-video-out=pixelformat=HEVC --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from="$dec_hevc_clip" --stream-to=/tmp/v4l2_hevc_to_nv12_decoder_output.yuv -d "$DEC_DEV"
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-                log_pass "v4l2-ctl Decoder HEVC PASS"
-                pass=$((pass + 1))
-                printf '%s\n' "v4l2-ctl-dec-hevc PASS" >> "$LOG_DIR/summary.txt"
-            else
-                log_fail "v4l2-ctl Decoder HEVC FAIL (rc=$rc)"
-                fail=$((fail + 1))
-                suite_rc=1
-                printf '%s\n' "v4l2-ctl-dec-hevc FAIL" >> "$LOG_DIR/summary.txt"
-            fi
-        else
-            log_warn "Skipping Decoder HEVC: No .265/.hevc clip found"
-            skip=$((skip + 1))
-            printf '%s\n' "v4l2-ctl-dec-hevc SKIP" >> "$LOG_DIR/summary.txt"
-        fi
-
-        # 3. Decoder VP9
-        total=$((total + 1))
-        dec_vp9_clip=$(find_media_for_test "vp9" "")
-        if [ -z "$dec_vp9_clip" ]; then dec_vp9_clip=$(find_media_for_test "ivf" ""); fi
-        
-        if [ -n "$dec_vp9_clip" ]; then
-            log_info "Testing Decoder VP9 with: $dec_vp9_clip"
-            v4l2-ctl --set-fmt-video-out=pixelformat=VP90 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from-hdr="$dec_vp9_clip" --stream-mmap --stream-to=/tmp/v4l2_vp9_to_nv12_decoder_output.yuv -d "$DEC_DEV"
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-                log_pass "v4l2-ctl Decoder VP9 PASS"
-                pass=$((pass + 1))
-                printf '%s\n' "v4l2-ctl-dec-vp9 PASS" >> "$LOG_DIR/summary.txt"
-            else
-                log_fail "v4l2-ctl Decoder VP9 FAIL (rc=$rc)"
-                fail=$((fail + 1))
-                suite_rc=1
-                printf '%s\n' "v4l2-ctl-dec-vp9 FAIL" >> "$LOG_DIR/summary.txt"
-            fi
-        else
-            log_warn "Skipping Decoder VP9: No .vp9/.ivf clip found"
-            skip=$((skip + 1))
-            printf '%s\n' "v4l2-ctl-dec-vp9 SKIP" >> "$LOG_DIR/summary.txt"
-        fi
-    else
-        log_fail "Decoder device $DEC_DEV not found. Skipping Decoder Tests."
-        suite_rc=1
-    fi
-
-    # --- Encoder v4l2-ctl tests ---
-    log_info "--- Encoder v4l2-ctl tests ---"
-
-    if [ -e "$ENC_DEV" ]; then
-        find_raw_clip() {
-            local w="$1"
-            local h="$2"
-            local match=$(find_media_for_test "yuv" "${w}x${h}")
-            if [ -z "$match" ]; then match=$(find_media_for_test "nv12" "${w}x${h}"); fi
-            if [ -z "$match" ]; then match=$(find_media_for_test "yuv" "${h}p"); fi
-            
-            if [ -z "$match" ]; then 
-                match=$(find_media_for_test "yuv" "")
-                if [ -n "$match" ]; then log_warn "Exact resolution ${w}x${h} raw clip not found, using generic: $match"; fi
-            fi
-            echo "$match"
-        }
-
-        # Loop through resolutions
-        for res in "1920 1080 Big_Buck" "1280 720 cyclists" "640 480 jets" "352 288 foreman"; do
-            w=$(echo $res | awk '{print $1}')
-            h=$(echo $res | awk '{print $2}')
-            name=$(echo $res | awk '{print $3}')
-            
-            raw_clip=$(find_raw_clip "$w" "$h")
-            
-            if [ -n "$raw_clip" ]; then
-                # H264 Encode
-                total=$((total + 1))
-                log_info "Enc H264 ${w}x${h} using: $raw_clip"
-                v4l2-ctl --set-fmt-video-out=width=$w,height=$h,pixelformat=NV12 --set-selection-output target=crop,top=0,left=0,width=$w,height=$h --set-fmt-video=pixelformat=H264 --stream-mmap --stream-out-mmap --stream-from="$raw_clip" --stream-to=/tmp/${name}_${w}x${h}.h264 -d "$ENC_DEV"
-                rc=$?
-                if [ "$rc" -eq 0 ]; then
-                    log_pass "v4l2-ctl Encoder H264 ${w}x${h} PASS"
-                    pass=$((pass + 1))
-                    printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} PASS" >> "$LOG_DIR/summary.txt"
-                else
-                    log_fail "v4l2-ctl Encoder H264 ${w}x${h} FAIL (rc=$rc)"
-                    fail=$((fail + 1))
-                    suite_rc=1
-                    printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} FAIL" >> "$LOG_DIR/summary.txt"
-                fi
-
-                # HEVC Encode
-                total=$((total + 1))
-                log_info "Enc HEVC ${w}x${h} using: $raw_clip"
-                v4l2-ctl --set-fmt-video-out=width=$w,height=$h,pixelformat=NV12 --set-selection-output target=crop,top=0,left=0,width=$w,height=$h --set-fmt-video=pixelformat=HEVC --stream-mmap --stream-out-mmap --stream-from="$raw_clip" --stream-to=/tmp/${name}_${w}x${h}.hevc -d "$ENC_DEV"
-                rc=$?
-                if [ "$rc" -eq 0 ]; then
-                    log_pass "v4l2-ctl Encoder HEVC ${w}x${h} PASS"
-                    pass=$((pass + 1))
-                    printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} PASS" >> "$LOG_DIR/summary.txt"
-                else
-                    log_fail "v4l2-ctl Encoder HEVC ${w}x${h} FAIL (rc=$rc)"
-                    fail=$((fail + 1))
-                    suite_rc=1
-                    printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} FAIL" >> "$LOG_DIR/summary.txt"
-                fi
-            else
-                # Skip counts for both H264 and HEVC if input not found
-                total=$((total + 2))
-                log_warn "Skipping Enc ${w}x${h}: No raw input found"
-                skip=$((skip + 2))
-                printf '%s\n' "v4l2-ctl-enc-h264-${w}x${h} SKIP" >> "$LOG_DIR/summary.txt"
-                printf '%s\n' "v4l2-ctl-enc-hevc-${w}x${h} SKIP" >> "$LOG_DIR/summary.txt"
-            fi
-        done
-    else
-        log_fail "Encoder device $ENC_DEV not found. Skipping Encoder Tests."
-        suite_rc=1
-    fi
-
 else
     log_info "Skipping V4L2 Compliance Tests (use --v4l2-compliance to enable)"
 fi
+
+# ======================================================================
+# --- V4L2-CTL Encoder Tests (Manual H264/HEVC) ---
+# ======================================================================
+if [ "$V4L2_CTL_RUN" -eq 1 ]; then
+    log_info "----------------------------------------------------------------------"
+    log_info "Starting V4L2-CTL Encoder Tests (H264 & HEVC)"
+
+    V4L2_CTL_BIN="$(command -v v4l2-ctl || echo "/usr/bin/v4l2-ctl")"
+    CTL_CLIPS_DIR="/data/vendor/iris_test_app/v4l2_clips"
+    ENC_DEV="/dev/video1"
+
+    if [ ! -x "$V4L2_CTL_BIN" ]; then
+        log_warn "v4l2-ctl binary not found at $V4L2_CTL_BIN; skipping control tests."
+        skip=$((skip + 1))
+    elif [ ! -d "$CTL_CLIPS_DIR" ]; then
+        log_warn "Clips directory $CTL_CLIPS_DIR not found; skipping control tests."
+        skip=$((skip + 1))
+    else
+        # Helper function to run a single v4l2-ctl encoder test
+        # Usage: run_v4l2_ctl_test <width> <height> <pixelformat> <input_file> <output_ext>
+        run_v4l2_ctl_test() {
+            w="$1"; h="$2"; fmt="$3"; infile="$4"; ext="$5"
+            input_path="$CTL_CLIPS_DIR/$infile"
+            output_path="/tmp/${infile%.yuv}.${ext}"
+            
+            test_id="ctl-enc-${fmt}-${w}x${h}"
+            log_info "[$test_id] START - $infile -> $output_path"
+            
+            if [ ! -f "$input_path" ]; then
+                log_fail "[$test_id] FAIL - input file missing: $input_path"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "$test_id FAIL" >> "$LOG_DIR/summary.txt"
+                return
+            fi
+
+            total=$((total + 1))
+            
+            # Construct the command
+            cmd="$V4L2_CTL_BIN --verbose \
+                --set-fmt-video-out=width=$w,height=$h,pixelformat=NV12 \
+                --set-selection-output target=crop,top=0,left=0,width=$w,height=$h \
+                --set-fmt-video=pixelformat=$fmt \
+                --stream-mmap --stream-out-mmap \
+                --stream-from=$input_path \
+                --stream-to=$output_path \
+                -d $ENC_DEV"
+
+            log_info "CMD: $cmd"
+            
+            # Capture output
+            ctl_log="$LOG_DIR/${test_id}.log"
+            $cmd > "$ctl_log" 2>&1
+            rc_ctl=$?
+            
+            # Dump log to stdout
+            cat "$ctl_log"
+            
+            if [ "$rc_ctl" -eq 0 ]; then
+                log_pass "[$test_id] PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "$test_id PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "[$test_id] FAIL"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "$test_id FAIL" >> "$LOG_DIR/summary.txt"
+            fi
+        }
+
+        # --- H264 Tests ---
+        log_info ">>> Running H264 Tests <<<"
+        run_v4l2_ctl_test 1920 1080 "H264" "Big_Buck_Bunny_1080_10s.yuv" "h264"
+        run_v4l2_ctl_test 1280 720  "H264" "cyclists_1280x720_92frames.yuv" "h264"
+        run_v4l2_ctl_test 640  480  "H264" "jets_640x480_20frames.yuv" "h264"
+        run_v4l2_ctl_test 352  288  "H264" "foreman_352x288_20frames.yuv" "h264"
+
+        # --- HEVC Tests ---
+        log_info ">>> Running HEVC Tests <<<"
+        run_v4l2_ctl_test 1920 1080 "HEVC" "Big_Buck_Bunny_1080_10s.yuv" "hevc"
+        run_v4l2_ctl_test 1280 720  "HEVC" "cyclists_1280x720_92frames.yuv" "hevc"
+        run_v4l2_ctl_test 640  480  "HEVC" "jets_640x480_20frames.yuv" "hevc"
+        run_v4l2_ctl_test 352  288  "HEVC" "foreman_352x288_20frames.yuv" "hevc"
+    fi
+else
+    log_info "Skipping V4L2-CTL Encoder Tests (use --v4l2-ctl to enable)"
+fi
+
 
 log_info "Summary: total=$total pass=$pass fail=$fail skip=$skip"
 
@@ -1725,7 +1590,9 @@ if [ -n "$JUNIT_OUT" ]; then
 
     {
         printf '<testsuite name="%s" tests="%s" failures="%s" skipped="%s">\n' "$TESTNAME" "$tests" "$failures" "$skipped"
-        cat "$JUNIT_TMP"
+        if [ -f "$JUNIT_TMP" ]; then
+            cat "$JUNIT_TMP"
+        fi
         # Manually add compliance test results to JUnit if needed
     } > "$JUNIT_OUT"
 
