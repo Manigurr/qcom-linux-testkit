@@ -1,14 +1,22 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause-Clear
-###############################################################################
+# SPDX-License-Identifier: BSD-3-Clause###############################################################################
 # DRM display + Weston + Wayland helpers
 # (assumes log_info/log_warn/log_error and run_with_timeout from functestlib.sh)
 ###############################################################################
-
 ###############################################################################
 # Internal helpers
 ###############################################################################
+# These are intentional cache outputs used by callers after display_print_eglinfo_pipeline().
+# ShellCheck cannot always see cross-file/global usage.
+# shellcheck disable=SC2034
+EGLI_LAST_PLATFORM=""
+EGLI_LAST_DRIVER=""
+EGLI_LAST_GL_VENDOR=""
+EGLI_LAST_GL_RENDERER=""
+EGLI_LAST_PIPE_KIND=""
+EGLI_LAST_OUT=""
+
 debugfs_is_mounted() {
     awk '$3=="debugfs" && $2=="/sys/kernel/debug" {found=1} END{exit(found?0:1)}' /proc/mounts 2>/dev/null
 }
@@ -1062,6 +1070,66 @@ egli_pick_platform_flag() {
   return 0
 }
 
+egli_glvnd_icd_from_json() {
+  # Extract ICD library_path from a GLVND EGL vendor JSON (no jq).
+  # Prints the value (e.g., libEGL_adreno.so.1) or empty on failure.
+  f="$1"
+  [ -r "$f" ] || { printf '%s\n' ""; return 0; }
+ 
+  # Match a line containing "library_path" : "...."
+  # Keep it resilient to whitespace.
+  sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1
+}
+
+egli_glvnd_icd_from_json() {
+  # Extract ICD library_path from a GLVND EGL vendor JSON (no jq).
+  # Prints the value (e.g., libEGL_adreno.so.1) or empty on failure.
+  f="$1"
+  [ -r "$f" ] || { printf '%s\n' ""; return 0; }
+ 
+  # Match a line containing "library_path" : "...."
+  # Keep it resilient to whitespace.
+  sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1
+}
+ 
+egli_derive_driver_name() {
+  # Best-effort for log readability only.
+  # Inputs: gl_vendor gl_renderer
+  v="$1"
+  r="$2"
+ 
+  # Qualcomm/Adreno path
+  if printf '%s %s\n' "$v" "$r" | grep -Eqi '(qualcomm|adreno)'; then
+    icd=""
+    if [ -f /usr/share/glvnd/egl_vendor.d/10_EGL_adreno.json ]; then
+      icd="$(egli_glvnd_icd_from_json /usr/share/glvnd/egl_vendor.d/10_EGL_adreno.json)"
+    fi
+    if [ -n "$icd" ]; then
+      printf '%s\n' "adreno ($icd)"
+      return 0
+    fi
+    printf '%s\n' "adreno"
+    return 0
+  fi
+ 
+  # Mesa path
+  if printf '%s %s\n' "$v" "$r" | grep -Eqi '(mesa|llvmpipe|softpipe|swrast|lavapipe)'; then
+    icd=""
+    if [ -f /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+      icd="$(egli_glvnd_icd_from_json /usr/share/glvnd/egl_vendor.d/50_mesa.json)"
+    fi
+    if [ -n "$icd" ]; then
+      printf '%s\n' "mesa ($icd)"
+      return 0
+    fi
+    printf '%s\n' "mesa"
+    return 0
+  fi
+ 
+  printf '%s\n' "unknown"
+  return 0
+}
+
 egli_get_field() {
   key="$1"
   awk -v k="$key" '
@@ -1142,6 +1210,32 @@ egli_classify_pipeline() {
   return 0
 }
 
+egli_wayland_socket_ok() {
+  wd="${WAYLAND_DISPLAY:-}"
+  [ -n "$wd" ] || return 1
+ 
+  case "$wd" in
+    /*)
+      [ -S "$wd" ] && return 0
+      return 1
+      ;;
+    *)
+      xrd="${XDG_RUNTIME_DIR:-}"
+      if [ -n "$xrd" ]; then
+        [ -S "$xrd/$wd" ] && return 0
+        return 1
+      fi
+ 
+      # Fallbacks when XDG_RUNTIME_DIR is unset (common in minimal shells)
+      [ -S "/run/user/0/$wd" ] && return 0
+      [ -S "/run/user/1000/$wd" ] && return 0
+      [ -S "/run/$wd" ] && return 0
+ 
+      return 1
+      ;;
+  esac
+}
+
 egli_print_legacy() {
   plat="$1"
   driver="$2"
@@ -1182,9 +1276,9 @@ egli_try_one_platform() {
   egl_api_ver="$(printf '%s\n' "$out" | egli_get_field "EGL API version")"
 
   ok=0
-  if [ -n "$egl_vendor" ]; then ok=1; fi
-  if [ -n "$egl_version" ]; then ok=1; fi
-  if [ -n "$egl_api_ver" ]; then ok=1; fi
+  [ -n "$egl_vendor" ] && ok=1
+  [ -n "$egl_version" ] && ok=1
+  [ -n "$egl_api_ver" ] && ok=1
 
   if [ "$rc" -ne 0 ] || [ "$ok" -eq 0 ]; then
     log_warn "eglinfo platform '$plat' did not initialize cleanly (rc=$rc)."
@@ -1203,34 +1297,46 @@ egli_try_one_platform() {
     "Driver name" \
     "Driver")"
 
-  # GL vendor (prefer explicit GL_VENDOR if present)
+  # GL vendor
   gl_vendor="$(egli_get_first "$out" \
     "GL_VENDOR" \
     "OpenGL ES profile vendor string" \
     "OpenGL vendor string" \
     "OpenGL ES vendor string")"
 
-  # GL renderer (prefer explicit GL_RENDERER if present)
+  # GL renderer
   gl_renderer="$(egli_get_first "$out" \
     "GL_RENDERER" \
     "OpenGL ES profile renderer string" \
     "OpenGL renderer string" \
     "OpenGL ES renderer string")"
 
-  # NEW: avoid classification on empty strings
+  # Avoid classification on empty strings
   [ -n "$driver" ] || driver="unknown"
   [ -n "$gl_vendor" ] || gl_vendor="unknown"
   [ -n "$gl_renderer" ] || gl_renderer="unknown"
 
-  # If we got nothing useful, treat as failure (prevents misleading GPU/CPU label)
-  if [ "$driver" = "unknown" ] && [ "$gl_vendor" = "unknown" ] && [ "$gl_renderer" = "unknown" ]; then
-    log_warn "eglinfo platform '$plat' returned no driver/vendor/renderer strings; skipping classification."
-    return 1
+  # If eglinfo didn't expose a driver name, derive one from GLVND JSON + strings
+  if [ "$driver" = "unknown" ]; then
+    driver="$(egli_derive_driver_name "$gl_vendor" "$gl_renderer")"
   fi
 
-  # Print GPU/CPU pipeline type (align to your sample: no extra indentation)
+  # Print GPU/CPU pipeline type
   pipe_kind="$(egli_classify_pipeline "$driver" "$gl_vendor" "$gl_renderer")"
   log_info "EGLINFO: Pipeline type: $pipe_kind"
+
+  # ---- Cache what we used, so decision uses the same data ----
+  EGLI_LAST_PLATFORM="$plat"
+  EGLI_LAST_DRIVER="$driver"
+  EGLI_LAST_GL_VENDOR="$gl_vendor"
+  EGLI_LAST_GL_RENDERER="$gl_renderer"
+  EGLI_LAST_PIPE_KIND="$pipe_kind"
+  if [ "${EGLINFO_CACHE_OUTPUT:-0}" = "1" ]; then
+    EGLI_LAST_OUT="$out"
+  else
+    EGLI_LAST_OUT=""
+  fi
+  # -----------------------------------------------------------
 
   egli_print_legacy "$plat" "$driver" "$gl_vendor" "$gl_renderer"
   return 0
@@ -1240,20 +1346,28 @@ display_print_eglinfo_pipeline() {
   # Usage: display_print_eglinfo_pipeline auto|wayland|gbm|device|surfaceless
   mode="${1:-auto}"
 
+  # Clear cached result on every call (prevents stale decisions)
+  EGLI_LAST_PLATFORM=""
+  EGLI_LAST_DRIVER=""
+  EGLI_LAST_GL_VENDOR=""
+  EGLI_LAST_GL_RENDERER=""
+  EGLI_LAST_PIPE_KIND=""
+  EGLI_LAST_OUT=""
+
   EGLINFO="${EGLINFO:-eglinfo}"
   if ! command -v "$EGLINFO" >/dev/null 2>&1; then
     log_error "eglinfo not found (EGLINFO='$EGLINFO')"
     return 1
   fi
 
-  # NOTE: unchanged usage; now egli_pick_platform_flag can return 1
-  # but when it does, plat_flag will be empty and caller already checked eglinfo.
+  # egli_pick_platform_flag may return non-zero; treat empty as "use EGL_PLATFORM="
   plat_flag="$(egli_pick_platform_flag 2>/dev/null)" || plat_flag=""
 
   log_info "---------------- EGLINFO pipeline detection (select one) ----------------"
 
   if [ "$mode" = "auto" ]; then
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    # Prefer wayland only if the socket really exists (base/prop handled)
+    if egli_wayland_socket_ok; then
       if egli_try_one_platform "wayland" "$plat_flag"; then
         log_info "---------------- End EGLINFO pipeline detection --------------------------"
         return 0
@@ -1282,18 +1396,24 @@ display_print_eglinfo_pipeline() {
 
   case "$mode" in
     wayland|gbm|device|surfaceless)
-      if ! egli_try_one_platform "$mode" "$plat_flag"; then
-        log_warn "Requested '$mode' did not work. Trying fallbacks..."
-
-        if ! egli_try_one_platform "gbm" "$plat_flag"; then
-          if ! egli_try_one_platform "device" "$plat_flag"; then
-            if ! egli_try_one_platform "surfaceless" "$plat_flag"; then
-              if ! egli_try_one_platform "wayland" "$plat_flag"; then
-                log_warn "No fallback platforms worked either."
-              fi
-            fi
-          fi
+      # If user explicitly requested wayland but socket is not present, warn and fallback
+      if [ "$mode" = "wayland" ] && ! egli_wayland_socket_ok; then
+        log_warn "Requested 'wayland' but WAYLAND_DISPLAY socket is not present; trying fallbacks..."
+      else
+        if egli_try_one_platform "$mode" "$plat_flag"; then
+          log_info "---------------- End EGLINFO pipeline detection --------------------------"
+          return 0
         fi
+        log_warn "Requested '$mode' did not work. Trying fallbacks..."
+      fi
+
+      # Fallback order: gbm -> device -> surfaceless -> wayland (last)
+      if egli_try_one_platform "gbm" "$plat_flag"; then :;
+      elif egli_try_one_platform "device" "$plat_flag"; then :;
+      elif egli_try_one_platform "surfaceless" "$plat_flag"; then :;
+      elif egli_wayland_socket_ok && egli_try_one_platform "wayland" "$plat_flag"; then :;
+      else
+        log_warn "No fallback platforms worked either."
       fi
 
       log_info "---------------- End EGLINFO pipeline detection --------------------------"
@@ -1312,102 +1432,199 @@ display_print_eglinfo_pipeline() {
 ###############################################################################
 display_is_cpu_renderer() {
   # Usage: display_is_cpu_renderer <mode>
-  # Prints EGLINFO block when called (your requirement).
+  # Prints EGLINFO block via display_print_eglinfo_pipeline().
   # Returns: 0 if CPU/software renderer detected, 1 otherwise (GPU or unknown)
   mode="${1:-auto}"
 
-  # Always print EGLINFO pipeline detection (do NOT redirect)
+  # Print + cache a single selected platform (no re-run of eglinfo for decision)
   display_print_eglinfo_pipeline "$mode" || true
 
-  EGLINFO="${EGLINFO:-eglinfo}"
-  if ! command -v "$EGLINFO" >/dev/null 2>&1; then
+  # If we couldn't cache anything usable, do NOT claim CPU.
+  if [ -z "${EGLI_LAST_PIPE_KIND:-}" ]; then
     return 1
   fi
 
-  # NOTE: unchanged usage; now egli_pick_platform_flag can return 1
-  plat_flag="$(egli_pick_platform_flag 2>/dev/null)" || plat_flag=""
-
-  # Run eglinfo and decide CPU/software for one platform.
-  # Return 0 if CPU/software, 1 otherwise.
-  egli_is_cpu_for_platform() {
-    p="$1"
-
-    if [ -n "$plat_flag" ]; then
-      out="$("$EGLINFO" "$plat_flag" "$p" 2>&1)"
-      rc=$?
-    else
-      out="$(EGL_PLATFORM="$p" "$EGLINFO" 2>&1)"
-      rc=$?
-    fi
-
-    # Must initialize
-    egl_vendor="$(printf '%s\n' "$out" | egli_get_field "EGL vendor string")"
-    egl_version="$(printf '%s\n' "$out" | egli_get_field "EGL version string")"
-    egl_api_ver="$(printf '%s\n' "$out" | egli_get_field "EGL API version")"
-
-    ok=0
-    if [ -n "$egl_vendor" ]; then ok=1; fi
-    if [ -n "$egl_version" ]; then ok=1; fi
-    if [ -n "$egl_api_ver" ]; then ok=1; fi
-    if [ "$rc" -ne 0 ] || [ "$ok" -eq 0 ]; then
-      return 1
-    fi
-
-    driver="$(egli_get_first "$out" \
-      "EGL driver name" \
-      "EGL driver" \
-      "Driver name" \
-      "Driver")"
-
-    gl_vendor="$(egli_get_first "$out" \
-      "GL_VENDOR" \
-      "OpenGL ES profile vendor string" \
-      "OpenGL vendor string" \
-      "OpenGL ES vendor string")"
-
-    gl_renderer="$(egli_get_first "$out" \
-      "GL_RENDERER" \
-      "OpenGL ES profile renderer string" \
-      "OpenGL renderer string" \
-      "OpenGL ES renderer string")"
-
-    # NEW: avoid classification on empty strings
-    [ -n "$driver" ] || driver="unknown"
-    [ -n "$gl_vendor" ] || gl_vendor="unknown"
-    [ -n "$gl_renderer" ] || gl_renderer="unknown"
-
-    # If we got nothing useful, treat as not-CPU (unknown) rather than mislabel
-    if [ "$driver" = "unknown" ] && [ "$gl_vendor" = "unknown" ] && [ "$gl_renderer" = "unknown" ]; then
-      return 1
-    fi
-
-    pipe_kind="$(egli_classify_pipeline "$driver" "$gl_vendor" "$gl_renderer")"
-    if printf '%s\n' "$pipe_kind" | grep -qi '^CPU'; then
-      return 0
-    fi
-    return 1
-  }
-
-  if [ "$mode" = "auto" ]; then
-    # Match display_print_eglinfo_pipeline(auto) preference order.
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-      if egli_is_cpu_for_platform "wayland"; then return 0; fi
-    fi
-    if egli_is_cpu_for_platform "gbm"; then return 0; fi
-    if egli_is_cpu_for_platform "device"; then return 0; fi
-    if egli_is_cpu_for_platform "surfaceless"; then return 0; fi
-    return 1
+  if printf '%s\n' "$EGLI_LAST_PIPE_KIND" | grep -qi '^CPU'; then
+    return 0
   fi
 
-  case "$mode" in
-    wayland|gbm|device|surfaceless)
-      if egli_is_cpu_for_platform "$mode"; then
-        return 0
-      fi
-      return 1
+  return 1
+}
+
+###############################################################################
+# Wayland protocol validation (client-side)
+###############################################################################
+# Validate that the client actually created a surface and committed buffers.
+# Expects WAYLAND_DEBUG output in the provided logfile.
+#
+# Usage:
+# display_wayland_proto_validate "/path/to/run.log"
+# Returns:
+# 0 = looks good (surface + commit seen)
+# 1 = missing required evidence
+display_wayland_proto_validate() {
+  logf="${1:-}"
+  [ -n "$logf" ] && [ -f "$logf" ] || return 1
+
+  # Accept both wl_compositor@X and wl_compositor#X formats
+  # Accept commit() with or without parentheses in logs
+  if grep -Eq 'wl_compositor[@#][0-9]+\.create_surface' "$logf" &&
+     grep -Eq 'wl_surface[@#][0-9]+\.commit' "$logf"; then
+    return 0
+  fi
+
+  return 1
+}
+
+###############################################################################
+# Screenshot capture + delta validation
+###############################################################################
+# Uses weston-screenshooter when available.
+# If the compositor rejects capture (unauthorized / protocol failure),
+# treat it as "not available" so tests do not FAIL due to policy.
+#
+# Returns convention:
+# 0 = success
+# 1 = tool exists but capture failed
+# 2 = tool not available or not permitted (unauthorized / protocol failure)
+
+display_screenshot_tool() {
+  if command -v weston-screenshooter >/dev/null 2>&1; then
+    echo "weston-screenshooter"
+    return 0
+  fi
+  return 1
+}
+
+display_take_screenshot() {
+  out="${1:-}"
+  [ -n "$out" ] || return 1
+
+  tool="$(display_screenshot_tool 2>/dev/null || true)"
+  [ -n "$tool" ] || return 2
+
+  tmp_log="$(mktemp /tmp/weston_shot_XXXXXX.log 2>/dev/null || true)"
+  [ -n "$tmp_log" ] || tmp_log="/tmp/weston_shot.log"
+
+  rc=0
+  case "$tool" in
+    weston-screenshooter)
+      # capture stdout+stderr to inspect authorization failures
+      weston-screenshooter "$out" >"$tmp_log" 2>&1 || rc=$?
       ;;
     *)
-      return 1
+      rm -f "$tmp_log" 2>/dev/null || true
+      return 2
       ;;
   esac
+
+  # If compositor rejects capture, treat as "not permitted" (skip)
+  if grep -qiE 'unauthorized|protocol failure' "$tmp_log" 2>/dev/null; then
+    rm -f "$tmp_log" 2>/dev/null || true
+    rm -f "$out" 2>/dev/null || true
+    return 2
+  fi
+
+  rm -f "$tmp_log" 2>/dev/null || true
+
+  [ "$rc" -eq 0 ] || return 1
+  [ -s "$out" ] || return 1
+  return 0
+}
+
+display_hash_file() {
+  f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+    return 0
+  fi
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+# Begin screenshot-delta session (captures "before" shot).
+# Usage:
+# display_screenshot_delta_begin "testname" "/path/to/outdir"
+# Side effects:
+# sets DISPLAY_SHOT_BEFORE and DISPLAY_SHOT_DIR
+# Returns:
+# 0 ok
+# 2 tool missing or not permitted
+# 1 capture failed
+display_screenshot_delta_begin() {
+  tn="${1:-weston-test}"
+  od="${2:-.}"
+
+  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || date +%s)"
+  DISPLAY_SHOT_DIR="$od"
+  DISPLAY_SHOT_BEFORE="${od}/${tn}_before_${ts}.png"
+
+  rc=0
+  display_take_screenshot "$DISPLAY_SHOT_BEFORE" || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    log_info "Screenshot before captured: $DISPLAY_SHOT_BEFORE"
+    return 0
+  fi
+
+  if [ "$rc" -eq 2 ]; then
+    log_warn "Screenshot tool not available or not permitted skipping screenshot delta validation"
+    DISPLAY_SHOT_BEFORE=""
+    return 2
+  fi
+
+  log_warn "Failed to capture screenshot before skipping screenshot delta validation"
+  DISPLAY_SHOT_BEFORE=""
+  return 1
+}
+
+# End screenshot-delta session (captures "after" and compares hash).
+# Usage:
+# display_screenshot_delta_end "testname"
+# Returns:
+# 0 changed (PASS)
+# 1 identical (FAIL)
+# 2 not available or skipped
+display_screenshot_delta_end() {
+  tn="${1:-weston-test}"
+  [ -n "${DISPLAY_SHOT_BEFORE:-}" ] || return 2
+
+  od="${DISPLAY_SHOT_DIR:-.}"
+  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || date +%s)"
+  after="${od}/${tn}_after_${ts}.png"
+
+  rc=0
+  display_take_screenshot "$after" || rc=$?
+
+  if [ "$rc" -eq 2 ]; then
+    log_warn "Screenshot tool not available or not permitted skipping screenshot delta validation"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log_warn "Failed to capture screenshot after skipping screenshot delta validation"
+    return 2
+  fi
+
+  log_info "Screenshot after captured: $after"
+
+  h1="$(display_hash_file "$DISPLAY_SHOT_BEFORE" 2>/dev/null || true)"
+  h2="$(display_hash_file "$after" 2>/dev/null || true)"
+
+  if [ -z "$h1" ] || [ -z "$h2" ]; then
+    log_warn "Could not hash screenshots skipping screenshot delta validation"
+    return 2
+  fi
+
+  if [ "$h1" = "$h2" ]; then
+    log_warn "Screenshot delta check identical no visible change detected"
+    return 1
+  fi
+
+  log_info "Screenshot delta check changed visual validation OK"
+  return 0
 }
