@@ -1619,3 +1619,14 @@ else
 fi
 
 exit "$suite_rc"
+
+add this v4l2 ctrl decode testcases 
+v4l2-ctl --verbose --set-fmt-video-out=pixelformat=H264 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from /media/FVDO_Freeway_720p.264 --stream-to=/tmp/v4l2_h264_to_nv12_decoder_output.yuv
+ 
+HEVC:
+v4l2-ctl --verbose --set-fmt-video-out=pixelformat=HEVC --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from=/media/DELTAQP_B_SONY_3_832_480.bit --stream-to=/tmp/v4l2_hevc_to_nv12_decoder_output.yuv
+ 
+VP9:
+v4l2-ctl --verbose --set-fmt-video-out=pixelformat=VP90 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from-hdr=/media/vp90-2-00-quantizer-00.hdr  --stream-mmap --stream-to=/tmp/v4l2_vp9_to_nv12_decoder_output.yuv
+the media files located
+data\vendor\iris_test_app\v4l2_clips
