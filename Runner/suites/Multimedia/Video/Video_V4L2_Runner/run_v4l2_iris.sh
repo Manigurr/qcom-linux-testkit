@@ -1454,14 +1454,17 @@ else
 fi
 
 # ======================================================================
-# --- V4L2-CTL Encoder Tests (Manual H264/HEVC) ---
+# --- V4L2-CTL Tests (Decoder & Encoder) ---
 # ======================================================================
 if [ "$V4L2_CTL_RUN" -eq 1 ]; then
     log_info "----------------------------------------------------------------------"
-    log_info "Starting V4L2-CTL Encoder Tests (H264 & HEVC)"
+    log_info "Starting V4L2-CTL Tests (Decoder & Encoder)"
 
     V4L2_CTL_BIN="$(command -v v4l2-ctl || echo "/usr/bin/v4l2-ctl")"
     CTL_CLIPS_DIR="/data/vendor/iris_test_app/v4l2_clips"
+    
+    # Standard devices: video0 usually decoder, video1 usually encoder
+    DEC_DEV="/dev/video0"
     ENC_DEV="/dev/video1"
 
     if [ ! -x "$V4L2_CTL_BIN" ]; then
@@ -1471,6 +1474,74 @@ if [ "$V4L2_CTL_RUN" -eq 1 ]; then
         log_warn "Clips directory $CTL_CLIPS_DIR not found; skipping control tests."
         skip=$((skip + 1))
     else
+        # ---------------------------------------------------------
+        # 1. V4L2-CTL DECODER TESTS
+        # ---------------------------------------------------------
+        log_info ">>> Running V4L2-CTL Decoder Tests (H264, HEVC, VP9) <<<"
+
+        run_v4l2_dec_test() {
+            test_name="$1"
+            cmd_str="$2"
+            input_file="$3"
+
+            test_id="ctl-dec-${test_name}"
+            full_input="$CTL_CLIPS_DIR/$input_file"
+
+            log_info "[$test_id] START - Input: $full_input"
+
+            if [ ! -f "$full_input" ]; then
+                log_fail "[$test_id] FAIL - input file missing: $full_input"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "$test_id FAIL" >> "$LOG_DIR/summary.txt"
+                return
+            fi
+
+            total=$((total + 1))
+            
+            # Construct full command with the input file path injected
+            # Note: We assume the cmd_str passed includes the flags but needs the path
+            log_info "CMD: $cmd_str"
+
+            dec_log="$LOG_DIR/${test_id}.log"
+            eval "$cmd_str" > "$dec_log" 2>&1
+            rc_dec=$?
+
+            # Dump log to stdout for visibility
+            cat "$dec_log"
+
+            if [ "$rc_dec" -eq 0 ]; then
+                log_pass "[$test_id] PASS"
+                pass=$((pass + 1))
+                printf '%s\n' "$test_id PASS" >> "$LOG_DIR/summary.txt"
+            else
+                log_fail "[$test_id] FAIL (rc=$rc_dec)"
+                fail=$((fail + 1))
+                suite_rc=1
+                printf '%s\n' "$test_id FAIL" >> "$LOG_DIR/summary.txt"
+            fi
+        }
+
+        # --- H264 Decode ---
+        # Input: FVDO_Freeway_720p.264
+        cmd_h264="$V4L2_CTL_BIN -d $DEC_DEV --verbose --set-fmt-video-out=pixelformat=H264 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from \"$CTL_CLIPS_DIR/FVDO_Freeway_720p.264\" --stream-to=/tmp/v4l2_h264_to_nv12_decoder_output.yuv"
+        run_v4l2_dec_test "h264" "$cmd_h264" "FVDO_Freeway_720p.264"
+
+        # --- HEVC Decode ---
+        # Input: DELTAQP_B_SONY_3_832_480.bit
+        cmd_hevc="$V4L2_CTL_BIN -d $DEC_DEV --verbose --set-fmt-video-out=pixelformat=HEVC --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from=\"$CTL_CLIPS_DIR/DELTAQP_B_SONY_3_832_480.bit\" --stream-to=/tmp/v4l2_hevc_to_nv12_decoder_output.yuv"
+        run_v4l2_dec_test "hevc" "$cmd_hevc" "DELTAQP_B_SONY_3_832_480.bit"
+
+        # --- VP9 Decode ---
+        # Input: vp90-2-00-quantizer-00.hdr (Using --stream-from-hdr as requested)
+        cmd_vp9="$V4L2_CTL_BIN -d $DEC_DEV --verbose --set-fmt-video-out=pixelformat=VP90 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from-hdr=\"$CTL_CLIPS_DIR/vp90-2-00-quantizer-00.hdr\" --stream-to=/tmp/v4l2_vp9_to_nv12_decoder_output.yuv"
+        run_v4l2_dec_test "vp9" "$cmd_vp9" "vp90-2-00-quantizer-00.hdr"
+
+        # ---------------------------------------------------------
+        # 2. V4L2-CTL ENCODER TESTS
+        # ---------------------------------------------------------
+        log_info ">>> Running V4L2-CTL Encoder Tests (H264 & HEVC) <<<"
+
         # Helper function to run a single v4l2-ctl encoder test
         # Usage: run_v4l2_ctl_test <width> <height> <pixelformat> <input_file> <output_ext>
         run_v4l2_ctl_test() {
@@ -1524,21 +1595,21 @@ if [ "$V4L2_CTL_RUN" -eq 1 ]; then
         }
 
         # --- H264 Tests ---
-        log_info ">>> Running H264 Tests <<<"
+        log_info ">>> Running Encoder H264 Tests <<<"
         run_v4l2_ctl_test 1920 1080 "H264" "Big_Buck_Bunny_1080_10s.yuv" "h264"
         run_v4l2_ctl_test 1280 720  "H264" "cyclists_1280x720_92frames.yuv" "h264"
         run_v4l2_ctl_test 640  480  "H264" "jets_640x480_20frames.yuv" "h264"
         run_v4l2_ctl_test 352  288  "H264" "foreman_352x288_20frames.yuv" "h264"
 
         # --- HEVC Tests ---
-        log_info ">>> Running HEVC Tests <<<"
+        log_info ">>> Running Encoder HEVC Tests <<<"
         run_v4l2_ctl_test 1920 1080 "HEVC" "Big_Buck_Bunny_1080_10s.yuv" "hevc"
         run_v4l2_ctl_test 1280 720  "HEVC" "cyclists_1280x720_92frames.yuv" "hevc"
         run_v4l2_ctl_test 640  480  "HEVC" "jets_640x480_20frames.yuv" "hevc"
         run_v4l2_ctl_test 352  288  "HEVC" "foreman_352x288_20frames.yuv" "hevc"
     fi
 else
-    log_info "Skipping V4L2-CTL Encoder Tests (use --v4l2-ctl to enable)"
+    log_info "Skipping V4L2-CTL Tests (use --v4l2-ctl to enable)"
 fi
 
 
@@ -1619,14 +1690,3 @@ else
 fi
 
 exit "$suite_rc"
-
-add this v4l2 ctrl decode testcases 
-v4l2-ctl --verbose --set-fmt-video-out=pixelformat=H264 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from /media/FVDO_Freeway_720p.264 --stream-to=/tmp/v4l2_h264_to_nv12_decoder_output.yuv
- 
-HEVC:
-v4l2-ctl --verbose --set-fmt-video-out=pixelformat=HEVC --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from=/media/DELTAQP_B_SONY_3_832_480.bit --stream-to=/tmp/v4l2_hevc_to_nv12_decoder_output.yuv
- 
-VP9:
-v4l2-ctl --verbose --set-fmt-video-out=pixelformat=VP90 --set-fmt-video=pixelformat=NV12 --stream-mmap --stream-out-mmap --stream-from-hdr=/media/vp90-2-00-quantizer-00.hdr  --stream-mmap --stream-to=/tmp/v4l2_vp9_to_nv12_decoder_output.yuv
-the media files located
-data\vendor\iris_test_app\v4l2_clips
