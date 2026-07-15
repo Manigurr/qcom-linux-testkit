@@ -381,6 +381,46 @@ display_select_primary_connector() {
     return 0
 }
 
+# Select the DRM card device that owns the preferred connected display.
+# Prints /dev/dri/cardN when a real connected connector is available.
+display_select_primary_drm_device() {
+    connector=""
+    card_idx=""
+    card_dev=""
+
+    if connector="$(display_select_primary_connector)"; then
+        if [ -z "$connector" ]; then
+            log_warn "display_select_primary_drm_device: display_select_primary_connector returned empty output" >&2
+            return 1
+        fi
+    else
+        log_warn "display_select_primary_drm_device: display_select_primary_connector failed" >&2
+        return 1
+    fi
+
+    if card_idx="$(display__drm_idx_from_sysfs_connector "$connector")"; then
+        :
+    else
+        log_warn "display_select_primary_drm_device: failed to extract DRM card index from connector '$connector'" >&2
+        return 1
+    fi
+
+    case "$card_idx" in
+        ""|*[!0-9]*)
+            log_warn "display_select_primary_drm_device: invalid DRM card index '$card_idx' from connector '$connector'" >&2
+            return 1
+            ;;
+    esac
+
+    card_dev="/dev/dri/card$card_idx"
+    if [ ! -e "$card_dev" ]; then
+        log_warn "display_select_primary_drm_device: selected DRM device '$card_dev' does not exist for connector '$connector'" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$card_dev"
+    return 0
+}
 ###############################################################################
 # Weston weston.ini helpers
 ###############################################################################
@@ -595,12 +635,14 @@ wayland_debug_snapshot() {
     log_info "----- End snapshot: $tag -----"
 }
 
+# Discover an available Wayland socket from common runtime locations.
+# Prefers user-session sockets first, then system-wide sockets such as /run/wayland-*.
 discover_wayland_socket_anywhere() {
     candidates=""
     if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
         candidates="$candidates $XDG_RUNTIME_DIR"
     fi
-    candidates="$candidates /dev/socket/weston /run/user/0 /run/user/1000"
+    candidates="$candidates /run/user/1000 /run/user/0 /run /dev/socket/weston"
 
     for dir in $candidates; do
         [ -d "$dir" ] || continue
@@ -665,6 +707,158 @@ wayland_connection_ok() {
     return 0
 }
 
+# Return success if any real Weston/Wayland socket currently exists.
+# Checks discovered sockets first, then common fallback socket paths.
+weston_runtime_socket_exists() {
+    weston_sock=""
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        weston_sock=$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)
+        if [ -n "$weston_sock" ]; then
+            return 0
+        fi
+    fi
+
+    for weston_sock in /run/wayland-* /run/user/0/wayland-* /run/user/1000/wayland-*; do
+        [ -S "$weston_sock" ] || continue
+        return 0
+    done
+
+    return 1
+}
+
+# Wait until Weston is usable by requiring both process presence and socket availability.
+# Returns 0 when ready, 1 after timeout seconds if Weston does not become ready.
+weston_wait_ready() {
+    timeout="${1:-15}"
+    i=0
+
+    while [ "$i" -lt "$timeout" ]; do
+        weston_proc_ready=1
+        weston_sock_ready=1
+
+        if command -v weston_is_running >/dev/null 2>&1; then
+            if weston_is_running >/dev/null 2>&1; then
+                weston_proc_ready=0
+            fi
+        else
+            if command -v pgrep >/dev/null 2>&1; then
+                if pgrep -x weston >/dev/null 2>&1; then
+                    weston_proc_ready=0
+                fi
+            fi
+        fi
+
+        if weston_runtime_socket_exists; then
+            weston_sock_ready=0
+        fi
+
+        if [ "$weston_proc_ready" -eq 0 ] && [ "$weston_sock_ready" -eq 0 ]; then
+            return 0
+        fi
+
+        i=$((i + 1))
+        sleep 1
+    done
+
+    log_warn "weston_wait_ready: Weston did not become ready within ${timeout}s"
+    return 1
+}
+
+# Restore Weston runtime after a DRM-exclusive test stopped it.
+# Starts socket/service first, then falls back to weston_start, and waits until ready.
+weston_restore_runtime() {
+    timeout="${1:-15}"
+ 
+    if command -v weston_is_running >/dev/null 2>&1; then
+        if weston_is_running >/dev/null 2>&1 && weston_runtime_socket_exists; then
+            return 0
+        fi
+    fi
+ 
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start weston.socket >/dev/null 2>&1 || true
+        systemctl start weston.service >/dev/null 2>&1 || \
+        systemctl start weston@root.service >/dev/null 2>&1 || true
+    fi
+ 
+    if weston_wait_ready 3; then
+        return 0
+    fi
+ 
+    if command -v weston_start >/dev/null 2>&1; then
+        weston_start >/dev/null 2>&1 || true
+    fi
+ 
+    weston_wait_ready "$timeout"
+}
+
+# Remove stale Wayland socket files only when Weston is not running.
+# Best-effort cleanup for common Weston runtime paths; ignores missing files
+# and permission errors. Intentionally does not touch /run/wayland-* because
+# that may be owned by systemd weston.socket on base builds.
+weston_cleanup_stale_sockets() {
+    if weston_is_running; then
+        return 0
+    fi
+
+    for s in \
+        /dev/socket/weston/wayland-* \
+        /run/user/0/wayland-* \
+        /run/user/1000/wayland-* \
+        /tmp/wayland-* \
+        "${XDG_RUNTIME_DIR:-/nonexistent}"/wayland-*; do
+        [ -S "$s" ] || continue
+        rm -f "$s" 2>/dev/null || true
+    done
+
+    return 0
+}
+
+# Adopt an existing Wayland socket and validate that a client can connect.
+# This supports socket-activated Weston setups where weston.service may not
+# already be running, but weston.socket or /run/wayland-* can activate it.
+weston_adopt_existing_runtime_and_probe() {
+    tag="$1"
+    sock=""
+
+    if command -v weston_preferred_socket >/dev/null 2>&1; then
+        sock="$(weston_preferred_socket 2>/dev/null || true)"
+    fi
+
+    if [ -z "$sock" ] && command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)"
+    fi
+
+    if [ -z "$sock" ]; then
+        log_warn "No Wayland socket found for ${tag}"
+        return 1
+    fi
+
+    if ! command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        log_warn "adopt_wayland_env_from_socket helper not found for ${tag}"
+        return 1
+    fi
+
+    if ! command -v wayland_connection_ok >/dev/null 2>&1; then
+        log_warn "wayland_connection_ok helper not found for ${tag}"
+        return 1
+    fi
+
+    log_info "Found existing Wayland socket, ${sock}"
+
+    if ! adopt_wayland_env_from_socket "$sock"; then
+        log_warn "Failed to adopt Wayland environment from ${sock}"
+        return 1
+    fi
+
+    if ! wayland_connection_ok; then
+        log_warn "Wayland socket probe failed for ${sock}"
+        return 1
+    fi
+
+    return 0
+}
 ###############################################################################
 # Hz helpers
 ###############################################################################
@@ -1068,17 +1262,6 @@ egli_pick_platform_flag() {
   # No platform selection flag supported — not an error
   echo ""
   return 0
-}
-
-egli_glvnd_icd_from_json() {
-  # Extract ICD library_path from a GLVND EGL vendor JSON (no jq).
-  # Prints the value (e.g., libEGL_adreno.so.1) or empty on failure.
-  f="$1"
-  [ -r "$f" ] || { printf '%s\n' ""; return 0; }
- 
-  # Match a line containing "library_path" : "...."
-  # Keep it resilient to whitespace.
-  sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1
 }
 
 egli_glvnd_icd_from_json() {
@@ -1628,3 +1811,1130 @@ display_screenshot_delta_end() {
   log_info "Screenshot delta check changed visual validation OK"
   return 0
 }
+
+# Resolve FPS expectation policy for display tests.
+# Sets DISPLAY_FPS_* globals from FPS_EXPECT_MODE / EXPECT_FPS / detected refresh.
+display_resolve_fps_policy() {
+    DISPLAY_FPS_MODE=""
+    DISPLAY_FPS_EXPECTED=""
+    DISPLAY_FPS_DETECTED_HZ=""
+    DISPLAY_FPS_MIN_OK=""
+    DISPLAY_FPS_MAX_OK=""
+
+    fps_mode="${FPS_EXPECT_MODE:-auto}"
+    fps_expect="${EXPECT_FPS:-}"
+    fps_default="${EXPECT_FPS_DEFAULT:-60}"
+    fps_tol="${FPS_TOL_PCT:-10}"
+    fps_min_pct="${MIN_FPS_PCT:-85}"
+
+    case "$fps_mode" in
+        auto)
+            if [ -n "$fps_expect" ]; then
+                DISPLAY_FPS_MODE="fixed"
+            else
+                DISPLAY_FPS_MODE="detected"
+            fi
+            ;;
+        fixed|detected)
+            DISPLAY_FPS_MODE="$fps_mode"
+            ;;
+        *)
+            log_warn "display_resolve_fps_policy: unknown FPS_EXPECT_MODE='$fps_mode', defaulting to auto"
+            if [ -n "$fps_expect" ]; then
+                DISPLAY_FPS_MODE="fixed"
+            else
+                DISPLAY_FPS_MODE="detected"
+            fi
+            ;;
+    esac
+
+    if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
+        if command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+            DISPLAY_FPS_DETECTED_HZ="$(weston_get_primary_refresh_hz 2>/dev/null || true)"
+        fi
+
+        case "$DISPLAY_FPS_DETECTED_HZ" in
+            ''|*[!0-9.]*)
+                DISPLAY_FPS_MODE="fixed"
+                if [ -n "$fps_expect" ]; then
+                    DISPLAY_FPS_EXPECTED="$fps_expect"
+                    log_warn "display_resolve_fps_policy: refresh detect failed, falling back to fixed EXPECT_FPS=$DISPLAY_FPS_EXPECTED"
+                else
+                    DISPLAY_FPS_EXPECTED="$fps_default"
+                    log_warn "display_resolve_fps_policy: refresh detect failed, falling back to fixed EXPECT_FPS_DEFAULT=$DISPLAY_FPS_EXPECTED"
+                fi
+                ;;
+            *)
+                DISPLAY_FPS_EXPECTED="$(printf '%s\n' "$DISPLAY_FPS_DETECTED_HZ" | awk '{printf "%.0f\n", $1 + 0.0}')"
+                DISPLAY_FPS_MIN_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v p="$fps_min_pct" 'BEGIN { printf "%.0f\n", f * p / 100.0 }')"
+                log_info "FPS policy: mode=detected refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK}"
+                return 0
+                ;;
+        esac
+    fi
+
+    if [ -z "$DISPLAY_FPS_EXPECTED" ]; then
+        if [ -n "$fps_expect" ]; then
+            DISPLAY_FPS_EXPECTED="$fps_expect"
+        else
+            DISPLAY_FPS_EXPECTED="$fps_default"
+        fi
+    fi
+
+    DISPLAY_FPS_MIN_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v t="$fps_tol" 'BEGIN { printf "%.0f\n", f * (100.0 - t) / 100.0 }')"
+    DISPLAY_FPS_MAX_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v t="$fps_tol" 'BEGIN { printf "%.0f\n", f * (100.0 + t) / 100.0 }')"
+
+    log_info "FPS policy: mode=fixed expected=${DISPLAY_FPS_EXPECTED} range=[${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}]"
+    return 0
+}
+
+# Apply refresh policy for display tests.
+# Fixed ~60 FPS target gets best-effort 60Hz normalization; detected mode keeps native refresh.
+display_apply_fps_refresh_policy() {
+    if [ -z "${DISPLAY_FPS_MODE:-}" ] || [ -z "${DISPLAY_FPS_EXPECTED:-}" ]; then
+        log_warn "display_apply_fps_refresh_policy: FPS policy not resolved"
+        return 1
+    fi
+
+    if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
+        log_info "Detected FPS mode selected; keeping native refresh"
+        return 0
+    fi
+
+    if hz_is_about_60 "${DISPLAY_FPS_EXPECTED}"; then
+        if command -v weston_force_primary_1080p60_if_not_60 >/dev/null 2>&1; then
+            log_info "Fixed ~60 FPS policy selected; ensuring primary output is ~60Hz (best-effort)"
+            if weston_force_primary_1080p60_if_not_60; then
+                log_info "Primary output is ~60Hz (or was already ~60Hz)"
+            else
+                log_warn "Unable to force ~60Hz (continuing; not a hard failure)"
+            fi
+        else
+            log_warn "weston_force_primary_1080p60_if_not_60 helper not found; skipping ~60Hz enforcement"
+        fi
+    else
+        log_info "Fixed FPS policy selected with expected=${DISPLAY_FPS_EXPECTED}; no refresh normalization applied"
+    fi
+
+    return 0
+}
+
+# Gate measured FPS against the resolved display FPS policy.
+# Returns 0 for pass, 1 for fail. Logs the reason internally.
+display_fps_gate_avg() {
+    fps_avg="$1"
+    fps_count="$2"
+    require_fps="${REQUIRE_FPS:-1}"
+
+    if [ "$require_fps" -eq 0 ]; then
+        if [ "$fps_count" -eq 0 ]; then
+            log_warn "REQUIRE_FPS=0 and no FPS samples found; skipping FPS gating"
+        else
+            log_info "REQUIRE_FPS=0; FPS stats recorded but not used for gating"
+        fi
+        return 0
+    fi
+
+    if [ "$fps_count" -eq 0 ]; then
+        log_fail "FPS gating enabled but no FPS samples were found"
+        return 1
+    fi
+
+    fps_int="$(printf '%s\n' "$fps_avg" | awk 'BEGIN {v=0} {v=$1+0.0} END {printf "%.0f\n", v}')"
+
+    if [ "${DISPLAY_FPS_MODE:-}" = "detected" ]; then
+        if [ -z "${DISPLAY_FPS_MIN_OK:-}" ]; then
+            log_fail "Detected FPS policy missing minimum threshold"
+            return 1
+        fi
+
+        if [ "$fps_int" -lt "$DISPLAY_FPS_MIN_OK" ]; then
+            log_fail "Average FPS below detected-refresh threshold: avg=${fps_avg} (~${fps_int}) < ${DISPLAY_FPS_MIN_OK} (refresh=${DISPLAY_FPS_DETECTED_HZ}Hz)"
+            return 1
+        fi
+
+        log_info "Detected-refresh FPS gate passed: avg=${fps_avg} (~${fps_int}) >= ${DISPLAY_FPS_MIN_OK} (refresh=${DISPLAY_FPS_DETECTED_HZ}Hz)"
+        return 0
+    fi
+
+    if [ -z "${DISPLAY_FPS_MIN_OK:-}" ] || [ -z "${DISPLAY_FPS_MAX_OK:-}" ]; then
+        log_fail "Fixed FPS policy missing valid range"
+        return 1
+    fi
+
+    if [ "$fps_int" -lt "$DISPLAY_FPS_MIN_OK" ] || [ "$fps_int" -gt "$DISPLAY_FPS_MAX_OK" ]; then
+        log_fail "Average FPS out of range: avg=${fps_avg} (~${fps_int}) not in [${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}] (expected=${DISPLAY_FPS_EXPECTED})"
+        return 1
+    fi
+
+    log_info "Fixed FPS gate passed: avg=${fps_avg} (~${fps_int}) in [${DISPLAY_FPS_MIN_OK}, ${DISPLAY_FPS_MAX_OK}]"
+    return 0
+}
+
+# Parse FPS samples from a weston-simple-egl style log.
+# Sets DISPLAY_FPS_COUNT / DISPLAY_FPS_AVG / DISPLAY_FPS_MIN / DISPLAY_FPS_MAX.
+display_parse_fps_log() {
+    logf="$1"
+
+    DISPLAY_FPS_COUNT=0
+    DISPLAY_FPS_AVG="-"
+    DISPLAY_FPS_MIN="-"
+    DISPLAY_FPS_MAX="-"
+
+    [ -n "$logf" ] || return 1
+    [ -r "$logf" ] || return 1
+
+    fps_stats=$(
+        awk '
+            /[0-9]+[[:space:]]+frames in[[:space:]]+[0-9]+[[:space:]]+seconds/ {
+                val = $(NF-1) + 0.0
+                all_n++
+                all_vals[all_n] = val
+            }
+            END {
+                if (all_n == 0) exit
+
+                if (all_n == 1) {
+                    n = 1
+                    sum = all_vals[1]
+                    min = all_vals[1]
+                    max = all_vals[1]
+                } else {
+                    n = 0
+                    sum = 0.0
+                    for (i = 2; i <= all_n; i++) {
+                        v = all_vals[i]
+                        n++
+                        sum += v
+                        if (n == 1 || v < min) min = v
+                        if (n == 1 || v > max) max = v
+                    }
+                }
+
+                if (n > 0) {
+                    avg = sum / n
+                    printf "n=%d avg=%f min=%f max=%f\n", n, avg, min, max
+                }
+            }
+        ' "$logf" 2>/dev/null || true
+    )
+
+    [ -n "$fps_stats" ] || return 1
+
+    DISPLAY_FPS_COUNT=$(printf '%s\n' "$fps_stats" | awk '{print $1}' | sed 's/^n=//')
+    DISPLAY_FPS_AVG=$(printf '%s\n' "$fps_stats" | awk '{print $2}' | sed 's/^avg=//')
+    DISPLAY_FPS_MIN=$(printf '%s\n' "$fps_stats" | awk '{print $3}' | sed 's/^min=//')
+    DISPLAY_FPS_MAX=$(printf '%s\n' "$fps_stats" | awk '{print $4}' | sed 's/^max=//')
+
+    case "$DISPLAY_FPS_COUNT" in ''|*[!0-9]*) DISPLAY_FPS_COUNT=0 ;; esac
+    [ -n "$DISPLAY_FPS_AVG" ] || DISPLAY_FPS_AVG="-"
+    [ -n "$DISPLAY_FPS_MIN" ] || DISPLAY_FPS_MIN="-"
+    [ -n "$DISPLAY_FPS_MAX" ] || DISPLAY_FPS_MAX="-"
+
+    return 0
+}
+
+# Detect display build flavour dynamically from available EGL vendor JSON files.
+# Exports:
+#   DISPLAY_BUILD_FLAVOUR, base or overlay
+#   DISPLAY_EGL_VENDOR_JSON, matched vendor JSON path, empty when not found
+# Return:
+#   0 always, detection is best-effort and defaults to base
+display_detect_build_flavour() {
+    DISPLAY_BUILD_FLAVOUR="base"
+    DISPLAY_EGL_VENDOR_JSON=""
+
+    for d in /usr/share/glvnd/egl_vendor.d /etc/glvnd/egl_vendor.d; do
+        [ -d "$d" ] || continue
+
+        for f in "$d"/*adreno*.json "$d"/*EGL_adreno*.json; do
+            [ -e "$f" ] || continue
+            if [ -f "$f" ]; then
+                DISPLAY_EGL_VENDOR_JSON="$f"
+                DISPLAY_BUILD_FLAVOUR="overlay"
+                export DISPLAY_BUILD_FLAVOUR
+                export DISPLAY_EGL_VENDOR_JSON
+                return 0
+            fi
+        done
+    done
+
+    export DISPLAY_BUILD_FLAVOUR
+    export DISPLAY_EGL_VENDOR_JSON
+    return 0
+}
+
+# Log display snapshots and require at least one connected DRM display.
+# This helper keeps display gating dynamic, no connector names or fixed paths are hardcoded.
+# Arguments:
+#   $1, testcase name for log messages
+#   $2, optional modetest line cap, default 200
+# Exports:
+#   DISPLAY_CONNECTED_SUMMARY, sysfs display summary, or none
+# Return:
+#   0 when at least one connected display is found
+#   1 when no connected DRM display is found
+display_log_snapshot_and_require_connector() {
+    ds_testname="$1"
+    ds_modetest_cap="${2:-200}"
+
+    DISPLAY_CONNECTED_SUMMARY="none"
+    export DISPLAY_CONNECTED_SUMMARY
+
+    if command -v display_debug_snapshot >/dev/null 2>&1; then
+        display_debug_snapshot "pre-display-check"
+    fi
+
+    if command -v modetest >/dev/null 2>&1; then
+        log_info "----- modetest -M msm -ac, capped at ${ds_modetest_cap} lines -----"
+        modetest -M msm -ac 2>&1 | sed -n "1,${ds_modetest_cap}p" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            log_info "[modetest] $line"
+        done
+        log_info "----- End modetest -M msm -ac -----"
+    else
+        log_warn "modetest not found in PATH, skipping modetest snapshot"
+    fi
+
+    if command -v display_connected_summary >/dev/null 2>&1; then
+        DISPLAY_CONNECTED_SUMMARY="$(display_connected_summary 2>/dev/null || true)"
+        export DISPLAY_CONNECTED_SUMMARY
+    fi
+
+    if [ -z "$DISPLAY_CONNECTED_SUMMARY" ] || [ "$DISPLAY_CONNECTED_SUMMARY" = "none" ]; then
+        log_warn "No connected DRM display found, skipping ${ds_testname}"
+        return 1
+    fi
+
+    log_info "Connected display, ${DISPLAY_CONNECTED_SUMMARY}"
+    return 0
+}
+
+# Return success when a Weston process is running.
+weston_has_running_process() {
+    if command -v weston_is_running >/dev/null 2>&1; then
+        if weston_is_running >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x weston >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Print Weston runtime diagnostics, including systemd unit state, process list, and env.
+# Arguments:
+# $1, snapshot label
+weston_log_runtime_snapshot() {
+    wlr_label="$1"
+    wlr_pids=""
+    wlr_state=""
+
+    log_info "----- Weston runtime snapshot, ${wlr_label} -----"
+
+    if command -v systemd_service_exists >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+        if systemd_service_exists weston.service; then
+            wlr_state="$(systemctl is-active weston.service 2>/dev/null || true)"
+            if [ "$wlr_state" = "failed" ]; then
+                log_warn "systemd weston.service, state=${wlr_state}"
+            else
+                log_info "systemd weston.service, state=${wlr_state:-unknown}"
+            fi
+        fi
+
+        if systemd_service_exists weston.socket; then
+            wlr_state="$(systemctl is-active weston.socket 2>/dev/null || true)"
+            if [ "$wlr_state" = "failed" ]; then
+                log_warn "systemd weston.socket, state=${wlr_state}"
+            else
+                log_info "systemd weston.socket, state=${wlr_state:-unknown}"
+            fi
+        fi
+    fi
+
+    if command -v weston_log_service_runtime_context >/dev/null 2>&1; then
+        weston_log_service_runtime_context || true
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        wlr_pids="$(pgrep -x weston 2>/dev/null || true)"
+    fi
+
+    if [ -n "$wlr_pids" ]; then
+        log_info "weston PIDs, $(printf '%s' "$wlr_pids" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+        if command -v ps >/dev/null 2>&1; then
+            printf '%s\n' "$wlr_pids" | while IFS= read -r pid; do
+                if [ -n "$pid" ]; then
+                    ps -o pid= -o user= -o group= -o args= -p "$pid" 2>/dev/null | while IFS= read -r line; do
+                        log_info "[ps] $line"
+                    done
+                fi
+            done
+        fi
+    else
+        log_warn "No weston process found"
+    fi
+
+    log_info "Env now, XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"
+    log_info "----- End Weston runtime snapshot, ${wlr_label} -----"
+}
+
+# Print the configured systemd user for weston.service.
+weston_systemd_service_user() {
+    wsu_user=""
+
+    if ! command -v systemd_service_exists >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! systemd_service_exists weston.service; then
+        return 1
+    fi
+
+    wsu_user="$(systemctl show -p User --value weston.service 2>/dev/null || true)"
+    if [ -n "$wsu_user" ]; then
+        printf '%s\n' "$wsu_user"
+        return 0
+    fi
+
+    return 1
+}
+
+# Prefer the Wayland socket that belongs to the systemd-managed Weston user.
+# Fall back to generic discovery only when needed.
+weston_preferred_socket() {
+    wps_user=""
+    wps_uid=""
+    wps_dir=""
+    wps_sock=""
+
+    if wps_user="$(weston_systemd_service_user 2>/dev/null)"; then
+        wps_uid="$(id -u "$wps_user" 2>/dev/null || true)"
+        if [ -n "$wps_uid" ]; then
+            wps_dir="/run/user/$wps_uid"
+            if [ -d "$wps_dir" ]; then
+                for wps_sock in "$wps_dir"/wayland-*; do
+                    if [ -S "$wps_sock" ]; then
+                        printf '%s\n' "$wps_sock"
+                        return 0
+                    fi
+                done
+            fi
+        fi
+    fi
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        discover_wayland_socket_anywhere 2>/dev/null | head -n 1
+        return 0
+    fi
+
+    return 1
+}
+
+# Restart the systemd-managed Weston runtime cleanly.
+# This is the preferred relaunch path when weston.service exists.
+weston_restart_systemd_runtime() {
+    wrs_wait="${1:-10}"
+    wrs_user=""
+    wrs_uid=""
+    wrs_dir=""
+
+    if ! command -v systemd_service_exists >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! systemd_service_exists weston.service; then
+        return 1
+    fi
+
+    log_info "Relaunch path, restarting systemd-managed Weston runtime"
+
+    if systemd_service_exists weston.socket; then
+        log_info "Stopping weston.socket before relaunch"
+        systemctl stop weston.socket >/dev/null 2>&1 || true
+    fi
+
+    log_info "Stopping weston.service before relaunch"
+    systemctl stop weston.service >/dev/null 2>&1 || true
+
+    log_info "Resetting failed Weston systemd state before relaunch"
+    systemctl reset-failed weston.service weston.socket >/dev/null 2>&1 || true
+
+    wrs_user="$(weston_systemd_service_user 2>/dev/null || true)"
+    if [ -n "$wrs_user" ]; then
+        wrs_uid="$(id -u "$wrs_user" 2>/dev/null || true)"
+        if [ -n "$wrs_uid" ]; then
+            wrs_dir="/run/user/$wrs_uid"
+            log_info "Preferred Weston service user, ${wrs_user}"
+            log_info "Preferred Weston runtime directory, ${wrs_dir}"
+        fi
+    fi
+
+    if systemd_service_exists weston.socket; then
+        log_info "Starting weston.socket"
+        systemctl start weston.socket >/dev/null 2>&1 || true
+    fi
+
+    log_info "Starting weston.service"
+    if ! systemctl start weston.service >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if command -v weston_wait_ready >/dev/null 2>&1; then
+        weston_wait_ready "$wrs_wait" || true
+    fi
+
+    if systemctl is-failed --quiet weston.service 2>/dev/null; then
+        return 1
+    fi
+
+    if ! weston_has_running_process; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Log the runtime context derived from weston.service user configuration.
+weston_log_service_runtime_context() {
+    wls_user=""
+    wls_uid=""
+    wls_dir=""
+    wls_sock_found=0
+    wls_sock=""
+
+    if ! command -v weston_systemd_service_user >/dev/null 2>&1; then
+        log_warn "weston_systemd_service_user helper not available"
+        return 1
+    fi
+
+    wls_user="$(weston_systemd_service_user 2>/dev/null || true)"
+    if [ -z "$wls_user" ]; then
+        log_warn "Could not determine Weston service user"
+        return 1
+    fi
+
+    log_info "Weston service user, ${wls_user}"
+
+    if id "$wls_user" >/dev/null 2>&1; then
+        wls_uid="$(id -u "$wls_user" 2>/dev/null || true)"
+        log_info "Weston service UID, ${wls_uid:-<unknown>}"
+    else
+        log_warn "Weston service user does not exist on target, ${wls_user}"
+        return 1
+    fi
+
+    if [ -n "$wls_uid" ]; then
+        wls_dir="/run/user/$wls_uid"
+        log_info "Weston preferred runtime directory, ${wls_dir}"
+
+        if [ -d "$wls_dir" ]; then
+            log_info "Weston runtime directory exists, ${wls_dir}"
+            find "$wls_dir" -prune -print 2>/dev/null | while IFS= read -r line; do
+                log_info "[runtime-dir] $line"
+            done
+
+            for wls_sock in "$wls_dir"/wayland-*; do
+                if [ -S "$wls_sock" ]; then
+                    if [ "$wls_sock_found" -eq 0 ]; then
+                        log_info "Wayland sockets under preferred runtime directory:"
+                    fi
+                    log_info "[socket] ${wls_sock}"
+                    wls_sock_found=1
+                fi
+            done
+
+            if [ "$wls_sock_found" -eq 0 ]; then
+                log_info "No Wayland sockets found under preferred runtime directory, ${wls_dir}"
+            fi
+        else
+            log_warn "Weston runtime directory does not exist, ${wls_dir}"
+        fi
+    fi
+
+    return 0
+}
+
+# Prepare a usable Weston and Wayland runtime dynamically for a display test.
+# Validation mode:
+# runtime, only verify Weston runtime readiness, process and socket
+# client, also verify a real Wayland client path through wayland_connection_ok
+# Relaunch policy:
+# default is disabled
+# when enabled, failed Weston systemd state is cleaned before relaunch
+# Arguments:
+# $1, testcase name for log messages
+# $2, wait timeout in seconds, default 10
+# $3, validation mode, runtime or client, default runtime
+# $4, allow relaunch, 1 enables relaunch, 0 disables it, default 0
+# Exports:
+# DISPLAY_WAYLAND_SOCKET, final adopted Wayland socket path
+# DISPLAY_RUNTIME_MODEL, per-user, global, or custom
+# Return:
+# 0 when runtime is ready and usable
+# 1 when no Wayland socket is found on base, connected display is present, Weston runtime is expected
+# 2 when no Wayland socket is found on overlay after optional relaunch handling
+# 3 when runtime validation fails, or Weston process is missing and relaunch is disabled
+weston_prepare_runtime() {
+    wr_testname="$1"
+    wr_wait_secs="${2:-10}"
+    wr_validate_mode="${3:-runtime}"
+    wr_allow_relaunch="${4:-0}"
+
+    DISPLAY_WAYLAND_SOCKET=""
+    DISPLAY_RUNTIME_MODEL="unknown"
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    if [ -z "${DISPLAY_BUILD_FLAVOUR:-}" ]; then
+        display_detect_build_flavour
+    fi
+
+    if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+        weston_log_runtime_snapshot "${wr_testname}: start"
+    elif command -v wayland_debug_snapshot >/dev/null 2>&1; then
+        wayland_debug_snapshot "${wr_testname}: start"
+    fi
+
+    wr_sock=""
+    wr_new_sock=""
+    wr_service_failed=0
+    wr_need_relaunch=0
+    wr_passive_recovered=0
+
+    if command -v systemd_service_exists >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+        if systemd_service_exists weston.service; then
+            if systemctl is-failed --quiet weston.service 2>/dev/null; then
+                wr_service_failed=1
+            fi
+        fi
+    fi
+
+    if weston_has_running_process; then
+        if [ "$wr_allow_relaunch" -eq 1 ]; then
+            log_info "Relaunch not required, Weston already running"
+        fi
+    else
+        wr_need_relaunch=1
+    fi
+
+    # Passive recovery path:
+    #
+    # Some base images expose an active weston.socket or /run/wayland-* socket
+    # even when weston.service is currently failed and no Weston process is
+    # running. A short Wayland client probe can trigger socket activation and
+    # recover Weston without requiring ALLOW_RELAUNCH=1.
+    #
+    # This avoids false failures like:
+    # weston.service is in failed state
+    # weston.socket is active
+    # no weston process found
+    #
+    # while still failing later if the socket/client probe cannot recover the
+    # runtime.
+    if [ "$wr_service_failed" -eq 1 ] || ! weston_has_running_process; then
+        log_warn "Weston runtime is not fully healthy, attempting passive Wayland socket recovery"
+
+        if command -v weston_adopt_existing_runtime_and_probe >/dev/null 2>&1; then
+            if weston_adopt_existing_runtime_and_probe "${wr_testname}: passive-recovery"; then
+                log_info "Passive Wayland socket probe succeeded"
+
+                if command -v weston_wait_ready >/dev/null 2>&1; then
+                    if ! weston_wait_ready "$wr_wait_secs"; then
+                        log_warn "Weston did not report fully ready after passive recovery wait"
+                    fi
+                fi
+
+                if weston_has_running_process; then
+                    wr_need_relaunch=0
+                    wr_passive_recovered=1
+                fi
+
+                if command -v systemd_service_exists >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+                    if systemd_service_exists weston.service; then
+                        if systemctl is-failed --quiet weston.service 2>/dev/null; then
+                            wr_service_failed=1
+                        else
+                            wr_service_failed=0
+                        fi
+                    fi
+                fi
+            else
+                log_warn "Passive Wayland socket recovery did not recover Weston runtime"
+            fi
+        else
+            log_warn "weston_adopt_existing_runtime_and_probe helper not found, skipping passive recovery"
+        fi
+    fi
+
+    if [ "$wr_passive_recovered" -eq 1 ]; then
+        if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+            weston_log_runtime_snapshot "${wr_testname}: after-passive-recovery"
+        elif command -v wayland_debug_snapshot >/dev/null 2>&1; then
+            wayland_debug_snapshot "${wr_testname}: after-passive-recovery"
+        fi
+    fi
+
+    if [ "$wr_service_failed" -eq 1 ]; then
+        if [ "$wr_allow_relaunch" -eq 1 ]; then
+            wr_need_relaunch=1
+            log_warn "weston.service is in failed state, cleanup and relaunch will be attempted"
+        else
+            log_warn "weston.service is in failed state, runtime relaunch is disabled"
+
+            if weston_has_running_process && weston_runtime_socket_exists; then
+                log_warn "Continuing because Weston process and Wayland socket are usable despite failed systemd state"
+                wr_service_failed=0
+                wr_need_relaunch=0
+            else
+                log_fail "weston.service is in failed state and passive runtime recovery did not make Weston usable"
+                return 3
+            fi
+        fi
+    fi
+
+    if [ "$wr_need_relaunch" -eq 1 ]; then
+        if [ "$wr_allow_relaunch" -ne 1 ]; then
+            if [ "$wr_service_failed" -eq 1 ]; then
+                log_fail "weston.service is in failed state, runtime relaunch is disabled"
+            else
+                log_fail "No weston process found, runtime relaunch is disabled"
+            fi
+            return 3
+        fi
+
+        log_warn "Preparing Weston runtime relaunch, cleaning stale systemd state first"
+
+        if command -v systemd_service_exists >/dev/null 2>&1 && systemd_service_exists weston.service; then
+            if ! weston_restart_systemd_runtime "$wr_wait_secs"; then
+                if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+                    weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+                fi
+                log_fail "Weston relaunch attempt failed, systemd-managed Weston could not be recovered"
+                return 3
+            fi
+        elif command -v weston_restore_runtime >/dev/null 2>&1; then
+            log_info "Attempting weston_restore_runtime"
+            if ! weston_restore_runtime "$wr_wait_secs"; then
+                if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+                    weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+                fi
+                log_fail "Weston relaunch attempt failed, weston_restore_runtime returned non-zero"
+                return 3
+            fi
+        elif [ "$DISPLAY_BUILD_FLAVOUR" = "overlay" ] && command -v overlay_start_weston_drm >/dev/null 2>&1; then
+            log_info "Attempting overlay_start_weston_drm"
+
+            if command -v weston_force_primary_1080p60_if_not_60 >/dev/null 2>&1; then
+                log_info "Pre-configuring primary output to about 60Hz before starting Weston, best effort"
+                if ! weston_force_primary_1080p60_if_not_60; then
+                    log_warn "Primary output pre-configuration failed, continuing with Weston start"
+                fi
+            fi
+
+            if ! overlay_start_weston_drm; then
+                if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+                    weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+                fi
+                log_fail "Weston relaunch attempt failed, overlay_start_weston_drm returned non-zero"
+                return 3
+            fi
+
+            if command -v weston_wait_ready >/dev/null 2>&1; then
+                if ! weston_wait_ready "$wr_wait_secs"; then
+                    log_warn "weston_wait_ready did not confirm readiness after overlay_start_weston_drm"
+                fi
+            fi
+        else
+            log_fail "No Weston relaunch helper is available"
+            return 3
+        fi
+
+        if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+            weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+        fi
+
+        if command -v systemd_service_exists >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+            if systemd_service_exists weston.service; then
+                if systemctl is-failed --quiet weston.service 2>/dev/null; then
+                    log_fail "weston.service is still in failed state after relaunch attempt"
+                    return 3
+                fi
+            fi
+        fi
+
+        if ! weston_has_running_process; then
+            log_fail "Weston relaunch did not result in a running process"
+            return 3
+        fi
+    fi
+
+    if ! weston_has_running_process; then
+        log_fail "Wayland runtime validation failed, Weston process is not running"
+        return 3
+    fi
+
+    if command -v weston_preferred_socket >/dev/null 2>&1; then
+        wr_sock="$(weston_preferred_socket 2>/dev/null || true)"
+    elif command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        wr_sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)"
+    fi
+
+    if [ -n "$wr_sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        log_info "Found existing Wayland socket, ${wr_sock}"
+        if ! adopt_wayland_env_from_socket "$wr_sock"; then
+            log_warn "Failed to adopt environment from ${wr_sock}"
+        fi
+    fi
+
+    if [ -z "$wr_sock" ] && command -v weston_wait_ready >/dev/null 2>&1; then
+        log_info "No usable Wayland socket yet, waiting briefly for Weston runtime"
+        if weston_wait_ready "$wr_wait_secs"; then
+            if command -v weston_preferred_socket >/dev/null 2>&1; then
+                wr_sock="$(weston_preferred_socket 2>/dev/null || true)"
+            elif command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                wr_sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)"
+            fi
+
+            if [ -n "$wr_sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                log_info "Weston runtime became ready, ${wr_sock}"
+                if ! adopt_wayland_env_from_socket "$wr_sock"; then
+                    log_warn "Failed to adopt environment from ${wr_sock} after wait"
+                fi
+            fi
+        fi
+    fi
+
+    if command -v weston_preferred_socket >/dev/null 2>&1; then
+        wr_new_sock="$(weston_preferred_socket 2>/dev/null || true)"
+        if [ -n "$wr_new_sock" ]; then
+            wr_sock="$wr_new_sock"
+        fi
+    elif command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        wr_new_sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1 || true)"
+        if [ -n "$wr_new_sock" ]; then
+            wr_sock="$wr_new_sock"
+        fi
+    fi
+
+    if [ -z "$wr_sock" ]; then
+        if [ "$DISPLAY_BUILD_FLAVOUR" = "base" ]; then
+            log_fail "No Wayland socket found on base build, connected display is present, Weston runtime is expected"
+            return 1
+        fi
+
+        log_fail "No Wayland socket found on overlay build after optional relaunch handling"
+        return 2
+    fi
+
+    case "$wr_sock" in
+        /run/user/*/wayland-*)
+            DISPLAY_RUNTIME_MODEL="per-user"
+            ;;
+        /run/wayland-*)
+            DISPLAY_RUNTIME_MODEL="global"
+            ;;
+        *)
+            DISPLAY_RUNTIME_MODEL="custom"
+            ;;
+    esac
+
+    DISPLAY_WAYLAND_SOCKET="$wr_sock"
+    export DISPLAY_RUNTIME_MODEL
+    export DISPLAY_WAYLAND_SOCKET
+
+    log_info "Wayland runtime model, ${DISPLAY_RUNTIME_MODEL}"
+    log_info "Wayland socket, ${DISPLAY_WAYLAND_SOCKET}"
+    log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
+    log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+
+    if [ "$wr_validate_mode" = "client" ]; then
+        if command -v wayland_connection_ok >/dev/null 2>&1; then
+            if ! wayland_connection_ok; then
+                log_fail "Wayland client probe failed, runtime is not usable"
+                return 3
+            fi
+            log_info "Wayland client probe, OK"
+        else
+            log_warn "wayland_connection_ok helper not found, continuing with runtime-only checks"
+        fi
+    else
+        if ! weston_has_running_process; then
+            log_fail "Wayland runtime validation failed, Weston process is not running"
+            return 3
+        fi
+
+        if command -v weston_runtime_socket_exists >/dev/null 2>&1; then
+            if ! weston_runtime_socket_exists; then
+                log_fail "Wayland runtime validation failed, socket is not present after adoption"
+                return 3
+            fi
+        fi
+
+        if command -v systemd_service_exists >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+            if systemd_service_exists weston.service; then
+                if systemctl is-failed --quiet weston.service 2>/dev/null; then
+                    log_fail "Wayland runtime validation failed, weston.service is in failed state"
+                    return 3
+                fi
+            fi
+        fi
+
+        if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+            weston_log_runtime_snapshot "${wr_testname}: final"
+        fi
+
+        log_info "Wayland runtime validation, OK"
+    fi
+
+    return 0
+}
+
+# Ensure Qualcomm graphics package set is available when package recovery is supported.
+#
+# This helper is intentionally display/graphics specific only for choosing the
+# package-set name and temporary Debusine source. Generic package-manager details
+# such as apt/rpm/opkg behavior, DKMS header checks, package-set upgrade, and
+# source installation are handled by lib_pkg_provider.sh.
+#
+# Args:
+#   $1 - package-set name, default: graphics
+#   $2 - Debusine source, default: qli-staging
+#   $3 - Debusine suite, default: auto
+#
+# Return:
+#   0 - package-set ready, skipped cleanly, or no mapping for this provider
+#   1 - package-set recovery failed
+display_ensure_graphics_package_set() {
+    graphics_set_name="${1:-graphics}"
+    graphics_source="${2:-qli-staging}"
+    graphics_suite="${3:-auto}"
+
+    if [ -z "${TOOLS:-}" ] || [ ! -f "$TOOLS/lib_pkg_provider.sh" ]; then
+        log_warn "Package provider helper not found; continuing without graphics package recovery"
+        return 0
+    fi
+
+    # shellcheck disable=SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+
+    # Load provider config first. Otherwise pkg_provider.conf can overwrite
+    # caller-provided/default values such as apt_debusine_source.
+    pkg_provider_init || true
+
+    old_graphics_source="${PKG_APT_DEBUSINE_SOURCE:-none}"
+    old_graphics_suite="${PKG_APT_DEBUSINE_SUITE:-auto}"
+
+    case "$old_graphics_source" in
+        ""|none|disabled)
+            PKG_APT_DEBUSINE_SOURCE="$graphics_source"
+            ;;
+    esac
+
+    case "$old_graphics_suite" in
+        "")
+            PKG_APT_DEBUSINE_SUITE="$graphics_suite"
+            ;;
+    esac
+
+    # If this helper changed the apt source/suite after a previous package op,
+    # force apt update again so the new source becomes visible.
+    if [ "${PKG_APT_DEBUSINE_SOURCE:-none}" != "$old_graphics_source" ] ||
+       [ "${PKG_APT_DEBUSINE_SUITE:-auto}" != "$old_graphics_suite" ]; then
+        rm -f "${PKG_APT_UPDATED_MARK:-/tmp/qcom_testkit_apt_updated}" 2>/dev/null || true
+    fi
+
+    pkg_log_info "Graphics package recovery source, source=${PKG_APT_DEBUSINE_SOURCE:-none} suite=${PKG_APT_DEBUSINE_SUITE:-auto} set=${graphics_set_name}"
+
+    pkg_ensure_package_set "$graphics_set_name"
+}
+
+###############################################################################
+# GLVND EGL vendor selection
+###############################################################################
+
+# Select a single GLVND EGL vendor for the current process and its children.
+#
+# Usage:
+#   display_select_egl_vendor mesa
+#   display_select_egl_vendor adreno
+#   display_select_egl_vendor native
+display_select_egl_vendor() {
+    dsev_mode="${1:-native}"
+    dsev_json=""
+    dsev_mesa_json="${DISPLAY_MESA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+    dsev_adreno_json="${DISPLAY_ADRENO_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_adreno.json}"
+
+    case "$dsev_mode" in
+        native)
+            unset __EGL_VENDOR_LIBRARY_FILENAMES
+            log_info "Using native GLVND EGL vendor discovery"
+            return 0
+            ;;
+        mesa)
+            dsev_json="$dsev_mesa_json"
+            ;;
+        adreno)
+            dsev_json="$dsev_adreno_json"
+            ;;
+        *)
+            log_error "Unsupported EGL vendor mode: $dsev_mode"
+            return 1
+            ;;
+    esac
+
+    if [ ! -f "$dsev_json" ] || [ ! -r "$dsev_json" ]; then
+        log_error "EGL vendor JSON is unavailable: $dsev_json"
+        return 1
+    fi
+
+    if ! grep -q '"library_path"[[:space:]]*:' "$dsev_json" 2>/dev/null; then
+        log_error "Invalid EGL vendor JSON, library_path missing: $dsev_json"
+        return 1
+    fi
+
+    __EGL_VENDOR_LIBRARY_FILENAMES="$dsev_json"
+    export __EGL_VENDOR_LIBRARY_FILENAMES
+
+    log_info "Selected EGL vendor mode: $dsev_mode"
+    log_info "Selected EGL vendor JSON: $__EGL_VENDOR_LIBRARY_FILENAMES"
+    return 0
+}
+
+###############################################################################
+# Display-manager DRM ownership helpers
+###############################################################################
+
+# Stop an active display service and record enough state to restore it.
+#
+# Usage:
+#   display_stop_service_for_drm SERVICE DRM_DEVICE STATE_FILE
+#
+# The state file is created only when this helper actually stops the service.
+display_stop_service_for_drm() {
+    dssfd_service="${1:-display-manager.service}"
+    dssfd_drm_device="${2:-}"
+    dssfd_state_file="$3"
+    dssfd_wait=0
+
+    [ -n "$dssfd_state_file" ] || return 1
+    rm -f "$dssfd_state_file"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "Display-manager handling skipped because systemctl is unavailable"
+        return 0
+    fi
+
+    if ! systemctl is-active --quiet "$dssfd_service"; then
+        log_info "No active display manager requires stopping"
+        return 0
+    fi
+
+    log_info "Stopping display manager to release DRM master: $dssfd_service"
+
+    if [ -n "$dssfd_drm_device" ] &&
+       command -v fuser >/dev/null 2>&1; then
+        fuser -v "$dssfd_drm_device" 2>&1 |
+            while IFS= read -r dssfd_line; do
+                [ -n "$dssfd_line" ] || continue
+                log_info "[DRM-OWNER] $dssfd_line"
+            done
+    fi
+
+    printf '%s\n' "$dssfd_service" >"$dssfd_state_file"
+
+    if ! systemctl stop "$dssfd_service"; then
+        if systemctl is-active --quiet "$dssfd_service"; then
+            rm -f "$dssfd_state_file"
+        fi
+
+        log_error "Failed to stop display manager: $dssfd_service"
+        return 1
+    fi
+
+    while [ "$dssfd_wait" -lt 10 ]; do
+        if ! systemctl is-active --quiet "$dssfd_service"; then
+            break
+        fi
+
+        sleep 1
+        dssfd_wait=$((dssfd_wait + 1))
+    done
+
+    if systemctl is-active --quiet "$dssfd_service"; then
+        rm -f "$dssfd_state_file"
+        log_error "Display manager is still active after stop: $dssfd_service"
+        return 1
+    fi
+
+    if [ -n "$dssfd_drm_device" ] &&
+       command -v fuser >/dev/null 2>&1; then
+        dssfd_wait=0
+
+        while [ "$dssfd_wait" -lt 5 ]; do
+            if ! fuser "$dssfd_drm_device" >/dev/null 2>&1; then
+                break
+            fi
+
+            sleep 1
+            dssfd_wait=$((dssfd_wait + 1))
+        done
+
+        if fuser "$dssfd_drm_device" >/dev/null 2>&1; then
+            log_warn "DRM device still has open users after stopping display manager: $dssfd_drm_device"
+
+            fuser -v "$dssfd_drm_device" 2>&1 |
+                while IFS= read -r dssfd_line; do
+                    [ -n "$dssfd_line" ] || continue
+                    log_info "[DRM-OWNER] $dssfd_line"
+                done
+        fi
+    fi
+
+    log_pass "Display manager stopped; DRM master is available for validation"
+    return 0
+}
+
+# Restore a display service previously stopped by display_stop_service_for_drm.
+display_restore_service_from_state() {
+    drsfs_state_file="$1"
+    drsfs_service=""
+
+    [ -n "$drsfs_state_file" ] || return 0
+    [ -s "$drsfs_state_file" ] || return 0
+
+    drsfs_service="$(sed -n '1p' "$drsfs_state_file" 2>/dev/null || true)"
+    [ -n "$drsfs_service" ] || return 0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_warn "Cannot restore display manager because systemctl is unavailable"
+        return 1
+    fi
+
+    if systemctl is-active --quiet "$drsfs_service"; then
+        rm -f "$drsfs_state_file"
+        log_info "Display manager is already active: $drsfs_service"
+        return 0
+    fi
+
+    log_info "Restoring display manager: $drsfs_service"
+
+    if ! systemctl start "$drsfs_service" >/dev/null 2>&1; then
+        log_error "Failed to restore display manager: $drsfs_service"
+        return 1
+    fi
+
+    rm -f "$drsfs_state_file"
+    log_pass "Display manager restored: $drsfs_service"
+    return 0
+}
+

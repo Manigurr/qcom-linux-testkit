@@ -11,29 +11,106 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        shell: sh
+
     steps:
       - name: Checkout source
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install ShellCheck from apt
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck=0.9.0-1
+          shellcheck --version
 
       - name: Run ShellCheck on changed .sh files in PR
         if: github.event_name == 'pull_request'
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
         run: |
-          echo "Checking only changed shell files in PR..."
-          git fetch origin ${{ github.base_ref }}
-          FILES=$(git diff --diff-filter=d --name-only origin/${{ github.base_ref }} -- '*.sh')
-          if [ -n "$FILES" ]; then
-            echo "$FILES" | tr '\n' '\0' | xargs -0 -r shellcheck -S warning -e SC1091,SC2230,SC3043
-          else
-            echo "No shell files to lint."
+          set -eu
+
+          if [ -z "$BASE_BRANCH" ]; then
+            echo "BASE_BRANCH is empty"
+            exit 1
           fi
 
-      - name: Run ShellCheck on all .sh files (main or manual trigger)
+          if ! git check-ref-format --branch "$BASE_BRANCH" >/dev/null 2>&1; then
+            echo "Invalid base branch name: $BASE_BRANCH"
+            exit 1
+          fi
+
+          git fetch --no-tags origin "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+
+          MERGE_BASE="$(git merge-base HEAD "refs/remotes/origin/${BASE_BRANCH}")"
+          files_list="$(mktemp)"
+          trap 'rm -f "$files_list"' EXIT
+
+          git diff --diff-filter=d --name-only -z "${MERGE_BASE}"...HEAD -- '*.sh' > "$files_list"
+
+          if [ ! -s "$files_list" ]; then
+            echo "No shell files to lint."
+            exit 0
+          fi
+
+          echo "Checking changed shell files:"
+          tr '\0' '\n' < "$files_list"
+
+          xargs -0 -r sh -c '
+            run_shellcheck() {
+              lint_file_path="$1"
+
+              echo "ShellCheck strict mode: $lint_file_path"
+              shellcheck -s sh -e SC1091,SC2230,SC3043 -- "$lint_file_path"
+            }
+
+            rc=0
+
+            for lint_file_path do
+              if ! run_shellcheck "$lint_file_path"; then
+                rc=1
+              fi
+            done
+
+            exit "$rc"
+          ' sh < "$files_list"
+
+      - name: Run ShellCheck on all .sh files (push/manual)
         if: github.event_name != 'pull_request'
         run: |
+          set -eu
+
+          files_list="$(mktemp)"
+          trap 'rm -f "$files_list"' EXIT
+
           echo "Linting all shell files in repository..."
-          find . -type f -name '*.sh' -print0 | xargs -0 -r shellcheck -S warning -e SC1091,SC2230,SC3043
+          find . -type f -name '*.sh' -print0 > "$files_list"
+
+          if [ ! -s "$files_list" ]; then
+            echo "No shell files to lint."
+            exit 0
+          fi
+
+          xargs -0 -r sh -c '
+            run_shellcheck() {
+              lint_file_path="$1"
+
+              echo "ShellCheck strict mode: $lint_file_path"
+              shellcheck -s sh -e SC1091,SC2230,SC3043 -- "$lint_file_path"
+            }
+
+            rc=0
+
+            for lint_file_path do
+              if ! run_shellcheck "$lint_file_path"; then
+                rc=1
+              fi
+            done
+
+            exit "$rc"
+          ' sh < "$files_list"
+

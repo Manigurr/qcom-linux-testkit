@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause#
+# SPDX-License-Identifier: BSD-3-Clause
 # Camera NHX validation
 
 TESTNAME="Camera_NHX"
@@ -51,10 +51,8 @@ RUN_LOG="$LOG_DIR/${TESTNAME}_${TS}.log"
 SUMMARY_TXT="$OUT_DIR/${TESTNAME}_summary_${TS}.txt"
 DMESG_DIR="$LOG_DIR/dmesg_${TS}"
 
-# NHX helper output directory (IMPORTANT: lib_camera.sh expects a directory, not a file)
 NHX_OUTDIR="$OUT_DIR/nhx_${TS}"
 
-# dump list & checksum artifacts (produced by dump validation helper)
 DUMPS_LIST="$NHX_OUTDIR/nhx_dumps.list"
 CHECKSUMS_TXT="$NHX_OUTDIR/nhx_checksums.txt"
 CHECKSUMS_PREV="$OUT_DIR/${TESTNAME}_checksums.prev.txt"
@@ -65,13 +63,93 @@ if [ -z "$MARKER" ]; then
   : >"$MARKER" 2>/dev/null || true
 fi
 
-cleanup() { rm -f "$MARKER" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+CAM_SERVER_PRESENT=0
+CAM_SERVER_STOPPED_FOR_TEST=0
+
+NHX_JSON="${NHX_JSON:-}"
+NHX_TARGET="${NHX_TARGET:-}"
+NHX_JSON_RESOLVED=""
+NHX_JSON_ARG=""
+
+# shellcheck disable=SC2317
+cleanup() {
+  if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ] && [ "$CAM_SERVER_PRESENT" -eq 1 ]; then
+    systemd_service_start_safe "cam-server" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${MARKER:-}" ]; then
+    rm -f "$MARKER"
+  fi
+}
+
+trap 'cleanup' EXIT INT TERM
+
+usage() {
+  cat <<EOF
+Usage: $0 [--json JSON_FILE] [--target TARGET] [--help]
+
+Options:
+  --json JSON_FILE NHX JSON file to pass to nhx.sh.
+                     Can be absolute, relative to Camera_NHX/, or relative
+                     to target folder when --target is provided.
+  --target TARGET Target folder name: Kodiak, Lemans, Monaco, Talos.
+                     Used to resolve/stage --json under /etc/camera/test/NHX.
+  --help Show this help.
+
+Examples:
+  $0
+  $0 --json Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX.json
+  $0 --json Snapshot_YUVNV12_MaxResolution_NHX.json --target Kodiak
+  NHX_JSON=Talos/Video_YUVNV12_MaxResolution_NHX.json $0
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json)
+      if [ "$#" -lt 2 ]; then
+        echo "[ERROR] --json requires an argument" >&2
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
+      NHX_JSON="$2"
+      shift 2
+      ;;
+    --json=*)
+      NHX_JSON="${1#--json=}"
+      shift
+      ;;
+    --target)
+      if [ "$#" -lt 2 ]; then
+        echo "[ERROR] --target requires an argument" >&2
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
+      NHX_TARGET="$2"
+      shift 2
+      ;;
+    --target=*)
+      NHX_TARGET="${1#--target=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      echo "$TESTNAME SKIP" >"$RES_FILE"
+      exit 0
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1" >&2
+      usage >&2
+      echo "$TESTNAME SKIP" >"$RES_FILE"
+      exit 0
+      ;;
+  esac
+done
 
 # -----------------------------------------------------------------------------
-# Deps check (functestlib.sh provides check_dependencies)
+# Deps check
 # -----------------------------------------------------------------------------
-deps_list="date awk sed grep tee wc ls find stat rm tr head tail dmesg sort opkg fdtdump mkfifo sha256sum md5sum cksum diff cp"
+deps_list="date awk sed grep tee wc ls find stat rm tr head tail dmesg sort fdtdump mkfifo sha256sum md5sum cksum diff cp mkdir"
 if ! check_dependencies "$deps_list"; then
   log_skip "$TESTNAME SKIP missing one or more dependencies: $deps_list"
   echo "$TESTNAME SKIP" >"$RES_FILE"
@@ -86,21 +164,12 @@ fi
 
 # -----------------------------------------------------------------------------
 # CAMX prechecks
-# Sequence:
-# 1) DT check
-# 2) fdtdump camera nodes sample
-# 3) driver load checks
-# 4) packages present
-# 5) sensor presence warn-only
 # -----------------------------------------------------------------------------
 log_info "Checking CAMX proprietary prerequisites before running NHX"
 
-# -----------------------------
-# 1) DT check
-# -----------------------------
 log_info "DT check"
 
-PATTERNS="qcom,cam qcom,camera camera_kt cam-req-mgr cam-cpas cam-jpeg cam-ife cam-icp cam-sensor camera0-thermal"
+PATTERNS="qcom,cam-sensor qcom,cam-gmsl-sensor qcom,cam-gmsl-deserializer qcom,eeprom qcom,cci qcom,csiphy qcom,cam-tpg1031 qcom,camera qcom,cam camera_kt cam-req-mgr cam-cpas cam-jpeg cam-ife cam-icp camera0-thermal"
 found_any=0
 missing_list=""
 
@@ -110,7 +179,6 @@ for pat in $PATTERNS; do
     printf '%s\n' "$out"
     found_any=1
   else
-    # Explicit append logic (reviewer-friendly; avoids &&/|| ambiguity)
     if [ -n "$missing_list" ]; then
       missing_list="$missing_list, $pat"
     else
@@ -125,12 +193,9 @@ if [ "$found_any" -ne 1 ]; then
   exit 0
 fi
 
-# -----------------------------
-# 2) fdtdump camera nodes sample
-# -----------------------------
 log_info "fdtdump camera nodes sample"
 
-FDT_MATCHES="$(camx_fdtdump_has_cam_nodes 2>/dev/null || true)"
+FDT_MATCHES="$(camx_fdtdump_has_cam_nodes 2>/dev/null)"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   if [ "$rc" -eq 2 ]; then
@@ -143,36 +208,30 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 printf '%s\n' "$FDT_MATCHES" | while IFS= read -r l; do
-  [ -n "$l" ] && log_info " $l"
+  if [ -n "$l" ]; then
+    log_info " $l"
+  fi
 done
 
-# -----------------------------
-# 3) driver load checks
-# -----------------------------
 log_info "driver load checks"
 
 CAM_MOD=""
 
-if command -v lsmod >/dev/null 2>&1; then
-  CAM_MOD="$(lsmod 2>/dev/null | awk '{print $1}' \
-    | grep -E '^(camera_qc|camera_qcm|camera_qcs)' \
-    | head -n 1 || true)"
+if command -v camx_pick_camera_module >/dev/null 2>&1; then
+  CAM_MOD="$(camx_pick_camera_module 2>/dev/null || true)"
+fi
+
+if [ -z "$CAM_MOD" ] && command -v lsmod >/dev/null 2>&1; then
+  CAM_MOD="$(lsmod 2>/dev/null | awk '{print $1}' | grep -E '^(camera_qc|camera_qcm|camera_qcs)' | head -n 1 || true)"
 fi
 
 if [ -z "$CAM_MOD" ]; then
-  kver="$(uname -r 2>/dev/null || true)"
-  if [ -n "$kver" ] && [ -d "/lib/modules/$kver" ]; then
-    ko="$(find "/lib/modules/$kver" -type f \( -name 'camera_qc*.ko' -o -name 'camera_qcm*.ko' -o -name 'camera_qcs*.ko' \) \
-      2>/dev/null | head -n 1 || true)"
-    CAM_MOD="$(basename "${ko:-}" .ko)"
-  fi
-fi
-
-if [ -z "$CAM_MOD" ]; then
-  log_skip "$TESTNAME SKIP could not determine camera module name"
+  log_skip "$TESTNAME SKIP could not determine board-specific camera module"
   echo "$TESTNAME SKIP" >"$RES_FILE"
   exit 0
 fi
+
+log_info "Board-specific camera module selected $CAM_MOD"
 
 CAM_KO="$(find_kernel_module "$CAM_MOD" 2>/dev/null || true)"
 if [ -z "$CAM_KO" ] || [ ! -f "$CAM_KO" ]; then
@@ -197,7 +256,6 @@ if [ -z "$ICP_FW" ] || [ ! -f "$ICP_FW" ]; then
 fi
 log_info "ICP firmware found $ICP_FW"
 
-# dmesg collection and error scan
 module_regex='CAM_(ERR|WARN|FATAL)'
 exclude_regex='dummy regulator|supply [^ ]+ not found|using dummy regulator'
 
@@ -216,12 +274,10 @@ FW_DL_OK=0
 FW_DONE_OK=0
 
 if [ -n "$FW_BASENAME" ] && [ -r "$DM_SNAP" ]; then
-  if grep -F "CAM_INFO: CAM-ICP: cam_a5_download_fw" "$DM_SNAP" 2>/dev/null \
-     | grep -F "$FW_BASENAME" >/dev/null 2>&1; then
+  if grep -F "CAM_INFO: CAM-ICP: cam_a5_download_fw" "$DM_SNAP" 2>/dev/null | grep -F "$FW_BASENAME" >/dev/null 2>&1; then
     FW_DL_OK=1
   fi
-  if grep -F "CAM_INFO: CAM-ICP: cam_icp_mgr_hw_open" "$DM_SNAP" 2>/dev/null \
-     | grep -F "FW download done successfully" >/dev/null 2>&1; then
+  if grep -F "CAM_INFO: CAM-ICP: cam_icp_mgr_hw_open" "$DM_SNAP" 2>/dev/null | grep -F "FW download done successfully" >/dev/null 2>&1; then
     FW_DONE_OK=1
   fi
 fi
@@ -238,19 +294,17 @@ fi
 bind_cnt=0
 if [ -r "$DM_SNAP" ]; then
   bind_cnt="$(grep -ciE 'cam_req_mgr.*bound|bound.*cam_req_mgr' "$DM_SNAP" 2>/dev/null || echo 0)"
-  case "$bind_cnt" in ''|*[!0-9]*) bind_cnt=0 ;; esac
+  case "$bind_cnt" in
+    ''|*[!0-9]*) bind_cnt=0 ;;
+  esac
 fi
 
-if [ "$bind_cnt" -lt 5 ]; then
-  log_skip "$TESTNAME SKIP CAMX bind graph not observed"
-  echo "$TESTNAME SKIP" >"$RES_FILE"
-  exit 0
+if [ "$bind_cnt" -lt 1 ]; then
+  log_warn "CAMX bind graph not observed in pre-NHX dmesg snapshot"
+else
+  log_info "CAMX bind graph observed in pre-NHX dmesg snapshot count=$bind_cnt"
 fi
-log_info "CAMX bind graph observed"
 
-# -----------------------------
-# 4) packages present
-# -----------------------------
 log_info "packages present"
 
 CAMX_PKGS="$(camx_opkg_list_camx 2>/dev/null || true)"
@@ -262,24 +316,22 @@ fi
 
 log_info "CAMX packages detected"
 printf '%s\n' "$CAMX_PKGS" | while IFS= read -r l; do
-  [ -n "$l" ] && log_info " $l"
+  if [ -n "$l" ]; then
+    log_info " $l"
+  fi
 done
 
-# -----------------------------
-# 5) sensor presence warn-only
-# -----------------------------
 log_info "sensor presence warn-only NHX may still work without cam sensors"
 
 SENSOR_COUNT="$(libcam_list_sensors_count 2>/dev/null || true)"
-case "$SENSOR_COUNT" in ''|*[!0-9]*) SENSOR_COUNT=0 ;; esac
+case "$SENSOR_COUNT" in
+  ''|*[!0-9]*) SENSOR_COUNT=0 ;;
+esac
 log_info "cam list detected $SENSOR_COUNT cameras"
 if [ "$SENSOR_COUNT" -lt 1 ]; then
   log_warn "No sensors reported by cam list continuing"
 fi
 
-# -----------------------------------------------------------------------------
-# Pick checksum tool (prefer helper in lib_camera.sh)
-# -----------------------------------------------------------------------------
 CKSUM_TOOL=""
 if command -v nhx_pick_cksum_tool >/dev/null 2>&1; then
   CKSUM_TOOL="$(nhx_pick_cksum_tool)"
@@ -300,50 +352,163 @@ log_info "NHX_OUTDIR=$NHX_OUTDIR"
 log_info "CKSUM_TOOL=${CKSUM_TOOL:-none}"
 
 # -----------------------------------------------------------------------------
+# cam-server stop before NHX
+# -----------------------------------------------------------------------------
+if systemd_service_exists "cam-server"; then
+  CAM_SERVER_PRESENT=1
+
+  CAM_SERVER_TS_BEFORE_STOP='5 minutes ago'
+
+  log_info "cam-server status before stop"
+  systemd_service_status_log "cam-server BEFORE stop (status only)" "$RUN_LOG" "cam-server" || true
+
+  log_info "cam-server stdout before stop"
+  systemd_service_stdout_since "cam-server BEFORE stop (stdout recent)" \
+    "$RUN_LOG" "$CAM_SERVER_TS_BEFORE_STOP" "cam-server.service" || true
+
+  log_info "Stopping cam-server before nhx.sh"
+  if systemd_service_stop_safe "cam-server"; then
+    CAM_SERVER_STOPPED_FOR_TEST=1
+    CAM_SERVER_TS_AFTER_STOP="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    log_info "cam-server status after stop"
+    systemd_service_status_log "cam-server AFTER stop (status only)" "$RUN_LOG" "cam-server" || true
+
+    log_info "cam-server stdout after stop"
+    systemd_service_stdout_since "cam-server AFTER stop (stdout since stop marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_STOP" "cam-server.service" || true
+  else
+    log_warn "Failed to stop cam-server before nhx.sh"
+  fi
+else
+  log_info "cam-server service not present, continuing"
+fi
+
+# -----------------------------------------------------------------------------
 # Run NHX
 # -----------------------------------------------------------------------------
 : >"$MARKER" 2>/dev/null || touch "$MARKER"
 
-log_info "Launching nhx.sh"
-
-if command -v run_cmd_live_to_log >/dev/null 2>&1; then
-  run_cmd_live_to_log "$RUN_LOG" nhx.sh
-  NHX_RC=$?
-else
-  FIFO="/tmp/${TESTNAME}.fifo.$$"
-  rm -f "$FIFO" 2>/dev/null || true
-
-  if ! mkfifo "$FIFO"; then
-    log_fail "$TESTNAME FAIL mkfifo failed"
-    echo "$TESTNAME FAIL" >"$RES_FILE"
+if [ -n "$NHX_JSON" ]; then
+  if ! command -v nhx_resolve_json_file >/dev/null 2>&1; then
+    log_skip "$TESTNAME SKIP nhx_resolve_json_file helper not available"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
   fi
 
-  ( tee "$RUN_LOG" <"$FIFO"; rm -f "$FIFO" 2>/dev/null || true ) &
-  TEEPID=$!
+  if ! command -v nhx_stage_json_for_launcher >/dev/null 2>&1; then
+    log_skip "$TESTNAME SKIP nhx_stage_json_for_launcher helper not available"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
 
-  nhx.sh >"$FIFO" 2>&1
-  NHX_RC=$?
+  NHX_JSON_RESOLVED="$(nhx_resolve_json_file "$SCRIPT_DIR" "$NHX_JSON" "$NHX_TARGET" 2>/dev/null)"
+  nhx_resolve_rc=$?
 
-  wait "$TEEPID" 2>/dev/null || true
+  if [ "$nhx_resolve_rc" -eq 2 ]; then
+    log_skip "$TESTNAME SKIP requested NHX JSON matched multiple target folders; pass --target: $NHX_JSON"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
+
+  if [ -z "$NHX_JSON_RESOLVED" ]; then
+    log_skip "$TESTNAME SKIP requested NHX JSON not found: $NHX_JSON target=${NHX_TARGET:-<unset>}"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
+
+  NHX_JSON_ARG="$(nhx_stage_json_for_launcher "$SCRIPT_DIR" "$NHX_JSON_RESOLVED" "$NHX_TARGET" 2>/dev/null || true)"
+
+  if [ -z "$NHX_JSON_ARG" ]; then
+    log_skip "$TESTNAME SKIP failed to stage NHX JSON for nhx.sh: $NHX_JSON_RESOLVED"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
+
+  log_info "Launching nhx.sh with JSON source: $NHX_JSON_RESOLVED"
+  log_info "Launching nhx.sh with JSON argument: $NHX_JSON_ARG"
+
+  if command -v run_cmd_live_to_log >/dev/null 2>&1; then
+    run_cmd_live_to_log "$RUN_LOG" nhx.sh "$NHX_JSON_ARG"
+    NHX_RC=$?
+  else
+    FIFO="/tmp/${TESTNAME}.fifo.$$"
+    rm -f "$FIFO" 2>/dev/null || true
+
+    if ! mkfifo "$FIFO"; then
+      log_fail "$TESTNAME FAIL mkfifo failed"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
+    ( tee "$RUN_LOG" <"$FIFO"; rm -f "$FIFO" 2>/dev/null || true ) &
+    TEEPID=$!
+
+    nhx.sh "$NHX_JSON_ARG" >"$FIFO" 2>&1
+    NHX_RC=$?
+
+    wait "$TEEPID" 2>/dev/null || true
+  fi
+else
+  log_info "Launching nhx.sh with default SoC-specific JSON"
+
+  if command -v run_cmd_live_to_log >/dev/null 2>&1; then
+    run_cmd_live_to_log "$RUN_LOG" nhx.sh
+    NHX_RC=$?
+  else
+    FIFO="/tmp/${TESTNAME}.fifo.$$"
+    rm -f "$FIFO" 2>/dev/null || true
+
+    if ! mkfifo "$FIFO"; then
+      log_fail "$TESTNAME FAIL mkfifo failed"
+      echo "$TESTNAME FAIL" >"$RES_FILE"
+      exit 0
+    fi
+
+    ( tee "$RUN_LOG" <"$FIFO"; rm -f "$FIFO" 2>/dev/null || true ) &
+    TEEPID=$!
+
+    nhx.sh >"$FIFO" 2>&1
+    NHX_RC=$?
+
+    wait "$TEEPID" 2>/dev/null || true
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-# Dump validation (delegate to lib_camera.sh helper)
-# IMPORTANT: helper expects an output DIRECTORY, not a file path.
+# cam-server start after NHX
+# -----------------------------------------------------------------------------
+if [ "$CAM_SERVER_STOPPED_FOR_TEST" -eq 1 ]; then
+  log_info "Starting cam-server after nhx.sh"
+  if systemd_service_start_safe "cam-server"; then
+    CAM_SERVER_STOPPED_FOR_TEST=0
+    CAM_SERVER_TS_AFTER_START="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    log_info "cam-server status after start"
+    systemd_service_status_log "cam-server AFTER start (status only)" "$RUN_LOG" "cam-server" || true
+
+    log_info "cam-server stdout after start"
+    systemd_service_stdout_since "cam-server AFTER start (stdout since start marker)" \
+      "$RUN_LOG" "$CAM_SERVER_TS_AFTER_START" "cam-server.service" || true
+  else
+    log_warn "Failed to start cam-server after nhx.sh"
+  fi
+else
+  log_info "cam-server was not stopped for test, skipping restart"
+fi
+
+# -----------------------------------------------------------------------------
+# Dump validation
 # -----------------------------------------------------------------------------
 DUMP_VALIDATION_FAIL=0
 
-# Ensure output directory exists regardless of helper/fallback
 mkdir -p "$NHX_OUTDIR" 2>/dev/null || true
 
 if command -v nhx_validate_dumps_and_checksums >/dev/null 2>&1; then
-  # nhx_validate_dumps_and_checksums <dump_dir> <marker_file> <out_dir> <out_checksums> <prev_checksums>
   if ! nhx_validate_dumps_and_checksums "$DUMP_DIR" "$MARKER" "$NHX_OUTDIR" "$CHECKSUMS_TXT" "$CHECKSUMS_PREV"; then
     DUMP_VALIDATION_FAIL=1
   fi
 
-  # If helper generated a different list name, keep our expected path working.
   if [ ! -s "$DUMPS_LIST" ]; then
     if [ -s "$NHX_OUTDIR/nhx_dumps.list" ]; then
       DUMPS_LIST="$NHX_OUTDIR/nhx_dumps.list"
@@ -354,7 +519,6 @@ if command -v nhx_validate_dumps_and_checksums >/dev/null 2>&1; then
     fi
   fi
 else
-  # fallback: old behavior
   : >"$DUMPS_LIST" 2>/dev/null || true
 
   grep -F "Saving image to file:" "$RUN_LOG" \
@@ -363,7 +527,9 @@ else
     | sort -u >"$DUMPS_LIST" 2>/dev/null || true
 
   DUMP_COUNT="$(wc -l <"$DUMPS_LIST" 2>/dev/null | awk '{print $1}')"
-  [ -n "$DUMP_COUNT" ] || DUMP_COUNT=0
+  if [ -z "$DUMP_COUNT" ]; then
+    DUMP_COUNT=0
+  fi
 
   if [ "$DUMP_COUNT" -eq 0 ]; then
     log_info "No dump paths found in log scanning dump dir for new files"
@@ -373,15 +539,11 @@ else
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# Compute dump count (based on DUMPS_LIST produced by helper/fallback)
-# -----------------------------------------------------------------------------
 DUMP_COUNT="$(wc -l <"$DUMPS_LIST" 2>/dev/null | awk '{print $1}')"
-[ -n "$DUMP_COUNT" ] || DUMP_COUNT=0
+if [ -z "$DUMP_COUNT" ]; then
+  DUMP_COUNT=0
+fi
 
-# -----------------------------------------------------------------------------
-# Validate dumps (summary-side size scan; checksum is already done by helper)
-# -----------------------------------------------------------------------------
 ZERO_OR_MISSING=0
 TOTAL_BYTES=0
 
@@ -390,6 +552,10 @@ TOTAL_BYTES=0
   echo "$TESTNAME Summary"
   echo "Timestamp: $TS"
   echo "nhx.sh exit code: $NHX_RC"
+  echo "NHX JSON requested: ${NHX_JSON:-<default>}"
+  echo "NHX target requested: ${NHX_TARGET:-<unset>}"
+  echo "NHX JSON resolved: ${NHX_JSON_RESOLVED:-<default>}"
+  echo "NHX JSON argument: ${NHX_JSON_ARG:-<default>}"
   echo "Dump directory: $DUMP_DIR"
   echo "Dump files detected: $DUMP_COUNT"
   echo "Log file: $RUN_LOG"
@@ -410,7 +576,6 @@ if [ "$DUMP_COUNT" -gt 0 ]; then
   } >>"$SUMMARY_TXT"
 
   while IFS= read -r f; do
-    # Clear, reviewer-friendly empty-line skip
     [ -z "$f" ] && continue
 
     if [ ! -f "$f" ]; then
@@ -419,11 +584,10 @@ if [ "$DUMP_COUNT" -gt 0 ]; then
       continue
     fi
 
-    SZ="$(stat -c %s "$f" 2>/dev/null)"
-    if [ -z "$SZ" ]; then
-      SZ="$(wc -c <"$f" 2>/dev/null | awk '{print $1}')"
-    fi
-    [ -n "$SZ" ] || SZ=0
+    SZ="$(nhx_dump_size_bytes "$f" 2>/dev/null || printf '%s\n' "0")"
+    case "$SZ" in
+      ''|*[!0-9]*) SZ=0 ;;
+    esac
 
     if [ "$SZ" -le 0 ]; then
       ZERO_OR_MISSING=$((ZERO_OR_MISSING + 1))

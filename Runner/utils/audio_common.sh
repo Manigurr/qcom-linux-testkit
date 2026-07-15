@@ -1,7 +1,14 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause# Common audio helpers for PipeWire / PulseAudio runners.
+# SPDX-License-Identifier: BSD-3-Clause
+# Common audio helpers for PipeWire / PulseAudio runners.
 # Requires: functestlib.sh (log_* helpers, extract_tar_from_url, scan_dmesg_errors)
+
+# Check whether a command exists in PATH.
+# Used by bootstrap helpers before attempting backend startup.
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
 
 # ---------- Backend detection & daemon checks ----------
 detect_audio_backend() {
@@ -17,6 +24,22 @@ detect_audio_backend() {
   fi
   echo ""
   return 1
+}
+
+audio_proc_running() {
+  name="$1"
+  [ -z "$name" ] && return 1
+
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x "$name" >/dev/null 2>&1; return $?
+  fi
+
+  if command -v pidof >/dev/null 2>&1; then
+    pidof "$name" >/dev/null 2>&1; return $?
+  fi
+
+  # shellcheck disable=SC2009
+  ps 2>/dev/null | grep -w "$name" | grep -v grep >/dev/null 2>&1
 }
 
 check_audio_daemon() {
@@ -76,26 +99,162 @@ audio_download_with_any() {
         return 1
     fi
 }
+
+audio_has_runnable_discovery_clips() {
+  clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
+  found_any=0
+
+  if [ ! -d "$clips_dir" ]; then
+    return 1
+  fi
+
+  for audio_clip_path in "$clips_dir"/*.wav; do
+    if [ ! -f "$audio_clip_path" ]; then
+      continue
+    fi
+
+    found_any=1
+    audio_clip_file="$(basename "$audio_clip_path")"
+    if generate_clip_testcase_name "$audio_clip_file" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  if [ "$found_any" -eq 1 ]; then
+    return 1
+  fi
+
+  return 1
+}
+
 # audio_fetch_assets_from_url <url>
 # Prefer functestlib's extract_tar_from_url; otherwise download + extract.
 audio_fetch_assets_from_url() {
-    url="$1"
-    if command -v extract_tar_from_url >/dev/null 2>&1; then
-        extract_tar_from_url "$url"
-        return $?
+  url="$1"
+  clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
+  marker_file="${AUDIO_EXTRACT_MARKER:-$clips_dir/.audioclips_extracted}"
+  work_dir="${SCRIPT_DIR:-$(pwd)}"
+  ts="$(date +%s 2>/dev/null || echo 0)"
+  archive_path="$work_dir/AudioClips.$$.${ts}.tar.gz"
+  fetch_log="$work_dir/AudioClips_fetch.$$.${ts}.log"
+  fetch_attempts="${AUDIO_FETCH_RETRIES:-2}"
+  fetch_retry_delay="${AUDIO_FETCH_RETRY_DELAY:-3}"
+  fetch_attempt=1
+
+  if [ -z "$url" ]; then
+    log_error "audio_fetch_assets_from_url: URL is empty"
+    return 1
+  fi
+
+  if [ ! -d "$clips_dir" ]; then
+    if ! mkdir -p "$clips_dir"; then
+      log_error "Failed to create clips directory: $clips_dir"
+      return 1
     fi
-    fname="$(basename "$url")"
-    log_info "Fetching assets: $url"
-    if ! audio_download_with_any "$url" "$fname"; then
-        log_warn "Download failed: $url"
-        return 1
+  fi
+
+  if [ -f "$marker_file" ]; then
+    if audio_has_runnable_discovery_clips; then
+      log_pass "AudioClips.tar.gz has already been extracted (marker present, runnable clips available)."
+      log_info "Already extracted. Skipping download."
+      return 0
     fi
-    tar -xzf "$fname" >/dev/null 2>&1 || tar -xf "$fname" >/dev/null 2>&1 || {
-        log_warn "Extraction failed: $fname"
-        return 1
-    }
-    return 0
+    log_warn "Extraction marker present but runnable clips not found; continuing with download/re-extract path"
+  fi
+
+  while [ "$fetch_attempt" -le "$fetch_attempts" ]; do
+    rm -f "$archive_path" >/dev/null 2>&1 || true
+    rm -f "$fetch_log" >/dev/null 2>&1 || true
+
+    download_ok=0
+
+    if command -v curl >/dev/null 2>&1; then
+      log_info "exec: curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
+      if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$archive_path" "$url" >"$fetch_log" 2>&1; then
+        download_ok=1
+      else
+        log_warn "curl download failed on attempt ${fetch_attempt}/${fetch_attempts}; showing last lines from $fetch_log"
+        tail -n 20 "$fetch_log" 2>/dev/null || true
+      fi
+    fi
+
+    if [ "$download_ok" -ne 1 ]; then
+      if command -v wget >/dev/null 2>&1; then
+        log_info "exec: wget --tries=3 --timeout=20 -O \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
+        if wget --tries=3 --timeout=20 -O "$archive_path" "$url" >"$fetch_log" 2>&1; then
+          download_ok=1
+        else
+          log_warn "wget download failed on attempt ${fetch_attempt}/${fetch_attempts}; showing last lines from $fetch_log"
+          tail -n 20 "$fetch_log" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    if [ "$download_ok" -eq 1 ]; then
+      break
+    fi
+
+    if [ "$fetch_attempt" -lt "$fetch_attempts" ]; then
+      log_warn "Download attempt ${fetch_attempt}/${fetch_attempts} failed; retrying after ${fetch_retry_delay}s"
+      sleep "$fetch_retry_delay"
+    fi
+
+    fetch_attempt=$((fetch_attempt + 1))
+  done
+
+  if [ "$download_ok" -ne 1 ]; then
+    log_error "Failed to download audio clips using available download tools"
+    log_error "Fetch log preserved at: $fetch_log"
+    rm -f "$archive_path" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if [ ! -s "$archive_path" ]; then
+    log_error "Downloaded archive is missing or empty: $archive_path"
+    log_error "Fetch log preserved at: $fetch_log"
+    rm -f "$archive_path" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  log_info "exec: tar -xzf \"$archive_path\" -C \"$clips_dir\""
+  if ! tar -xzf "$archive_path" -C "$clips_dir" >>"$fetch_log" 2>&1; then
+    log_error "Failed to extract audio clips archive into $clips_dir"
+    log_error "Fetch log preserved at: $fetch_log"
+    rm -f "$archive_path" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  rm -f "$archive_path" >/dev/null 2>&1 || true
+
+  # Normalize nested archive layout like AudioClips/AudioClips/*.wav -> AudioClips/*.wav
+  if [ -d "$clips_dir/AudioClips" ]; then
+    log_warn "Detected nested AudioClips directory after extraction.. normalizing layout"
+    for nested_item in "$clips_dir/AudioClips"/*; do
+      [ -e "$nested_item" ] || continue
+      nested_name=$(basename "$nested_item")
+      if [ ! -e "$clips_dir/$nested_name" ]; then
+        if ! mv "$nested_item" "$clips_dir/"; then
+          log_error "Failed to normalize extracted clips layout"
+          log_error "Fetch log preserved at: $fetch_log"
+          return 1
+        fi
+      fi
+    done
+    rmdir "$clips_dir/AudioClips" >/dev/null 2>&1 || true
+  fi
+
+  if ! audio_has_runnable_discovery_clips; then
+    log_error "Extraction completed, but no runnable discovery clips were found in $clips_dir"
+    log_error "Fetch log preserved at: $fetch_log"
+    return 1
+  fi
+
+  : > "$marker_file" || true
+  log_info "Audio clips download/extract validation completed"
+  log_info "Fetch log saved at: $fetch_log"
+  return 0
 }
+
 # audio_ensure_clip_ready <clip-path> [tarball-url]
 # Return codes:
 #   0 = clip exists/ready
@@ -131,15 +290,23 @@ scan_audio_dmesg() {
 }
 
 dump_mixers() {
-  out="$1"
+  audio_dump_out="$1"
   {
     echo "---- wpctl status ----"
-    command -v wpctl >/dev/null 2>&1 && wpctl status 2>&1 || echo "(wpctl not found)"
+    if command -v wpctl >/dev/null 2>&1; then
+      audio_exec_with_timeout 2s wpctl status 2>&1 || echo "(wpctl status failed/timeout)"
+    else
+      echo "(wpctl not found)"
+    fi
+ 
     echo "---- pactl list ----"
-    command -v pactl >/dev/null 2>&1 && pactl list 2>&1 || echo "(pactl not found)"
-  } >"$out" 2>/dev/null
+    if command -v pactl >/dev/null 2>&1; then
+      audio_exec_with_timeout 3s pactl list 2>&1 || echo "(pactl list failed/timeout)"
+    else
+      echo "(pactl not found)"
+    fi
+  } >"$audio_dump_out" 2>/dev/null
 }
-
 # Returns child exit code (124 when killed by timeout). If tmo<=0, runs the
 # command directly (no watchdog).
 
@@ -178,88 +345,233 @@ audio_timeout_run() {
       wait "$pid" 2>/dev/null
       return 143
     fi
-    sleep 1; t=$(expr $t + 1)
+    sleep 1; t=$((t + 1))
   done
   wait "$pid"; return $?
 }
 
-# Function: setup_overlay_audio_environment
-# Purpose: Configure audio environment for overlay builds (audioreach-based)
-# Returns: 0 on success, 1 on failure
-# Usage: Call early in audio test initialization, before backend detection
-
-setup_overlay_audio_environment() {
-    # Detect overlay build
-    if ! lsmod 2>/dev/null | awk '$1 ~ /^audioreach/ { found=1; exit } END { exit !found }'; then
-        log_info "Base build detected (no audioreach modules), skipping overlay setup"
-        return 0
-    fi
-    
-    log_info "Overlay build detected (audioreach modules present), configuring environment..."
-    
-    # Check root permissions
-    if [ "$(id -u)" -ne 0 ]; then
-        log_fail "Overlay audio setup requires root permissions"
-        return 1
-    fi
-    
-    # Configure DMA heap permissions
-    if [ -e /dev/dma_heap/system ]; then
-        log_info "Setting permissions on /dev/dma_heap/system"
-        chmod 666 /dev/dma_heap/system || {
-            log_fail "Failed to chmod /dev/dma_heap/system"
-            return 1
-        }
-    else
-        log_warn "/dev/dma_heap/system not found, skipping chmod"
-    fi
-    
-    # Check systemctl availability
-    if ! command -v systemctl >/dev/null 2>&1; then
-        log_fail "systemctl not available, cannot restart pipewire"
-        return 1
-    fi
-    
-    # Restart PipeWire
-    log_info "Restarting pipewire service..."
-    if ! systemctl restart pipewire 2>/dev/null; then
-        log_fail "Failed to restart pipewire service"
-        return 1
-    fi
-    
-    # Wait for PipeWire with polling (max 60s, check every 2s)
-    log_info "Waiting for pipewire to be ready..."
-    max_wait=60
-    elapsed=0
-    poll_interval=2
-    
-    while [ $elapsed -lt $max_wait ]; do
-        # Check if pipewire process is running
-        if pgrep -x pipewire >/dev/null 2>&1; then
-            # Verify wpctl can communicate
-            if command -v wpctl >/dev/null 2>&1 && wpctl status >/dev/null 2>&1; then
-                log_pass "PipeWire is ready (took ${elapsed}s)"
-                return 0
-            fi
-        fi
-        
-        sleep $poll_interval
-        elapsed=$(expr $elapsed + $poll_interval)
-        
-        if [ "$(expr $elapsed % 10)" -eq 0 ]; then
-          log_info "Still waiting for pipewire... (${elapsed}s/${max_wait}s)"
-        fi
-    done
-    
-    # Timeout reached
-    log_fail "PipeWire failed to become ready within ${max_wait}s"
-    log_fail "Check 'systemctl status pipewire' and 'journalctl -u pipewire' for details"
-    return 1
-}
+audio_restart_services_best_effort() {
+  uid="$(id -u 2>/dev/null || echo 0)"
+  rt="${XDG_RUNTIME_DIR:-/run/user/$uid}"
  
+  # Ensure runtime dir exists (some LAVA/minimal images may not have it)
+  if [ ! -d "$rt" ] && [ -n "$rt" ]; then
+    mkdir -p "$rt" 2>/dev/null || true
+    chmod 700 "$rt" 2>/dev/null || true
+  fi
+  [ -d "$rt" ] && export XDG_RUNTIME_DIR="$rt"
+ 
+  # systemd user + system (best effort, bounded time)
+  if command -v systemctl >/dev/null 2>&1; then
+    # optional reloads (some images need this after overlay / unit changes)
+    audio_exec_with_timeout 10s systemctl --user daemon-reload >/dev/null 2>&1 || true
+    audio_exec_with_timeout 10s systemctl daemon-reload >/dev/null 2>&1 || true
+ 
+    audio_exec_with_timeout 10s systemctl --user restart pipewire pipewire-pulse wireplumber pulseaudio >/dev/null 2>&1 || true
+    audio_exec_with_timeout 10s systemctl restart pipewire pipewire-pulse wireplumber pulseaudio >/dev/null 2>&1 || true
+  fi
+ 
+  # If control-plane is OK already, stop here (accept PW or PA)
+  if audio_pw_ctl_ok 2>/dev/null || audio_pa_ctl_ok 2>/dev/null; then
+    return 0
+  fi
+ 
+  # hard reset (works without systemd/user session)
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -x wireplumber >/dev/null 2>&1 || true
+    pkill -x pipewire-pulse >/dev/null 2>&1 || true
+    pkill -x pipewire >/dev/null 2>&1 || true
+    pkill -x pulseaudio >/dev/null 2>&1 || true
+  elif command -v killall >/dev/null 2>&1; then
+    killall -q wireplumber pipewire-pulse pipewire pulseaudio 2>/dev/null || true
+  fi
+ 
+  sleep 1
+ 
+  # stale sockets/locks
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    rm -f "$XDG_RUNTIME_DIR/pipewire-0" \
+          "$XDG_RUNTIME_DIR/pipewire-0.lock" \
+          "$XDG_RUNTIME_DIR/pulse/native" \
+          "$XDG_RUNTIME_DIR/pulse/pid" \
+          "$XDG_RUNTIME_DIR/pulse/cookie" \
+          2>/dev/null || true
+  fi
+ 
+  # respawn (best effort, ShellCheck-clean)
+  if command -v pipewire >/dev/null 2>&1; then
+    pipewire >/dev/null 2>&1 &
+  fi
+ 
+  if command -v wireplumber >/dev/null 2>&1; then
+    wireplumber >/dev/null 2>&1 &
+  elif command -v pipewire-media-session >/dev/null 2>&1; then
+    pipewire-media-session >/dev/null 2>&1 &
+  fi
+ 
+  if command -v pipewire-pulse >/dev/null 2>&1; then
+    pipewire-pulse >/dev/null 2>&1 &
+  fi
+ 
+  if command -v pulseaudio >/dev/null 2>&1; then
+    pulseaudio --start >/dev/null 2>&1 || true
+  fi
+ 
+  return 0
+}
+
+# Restart PipeWire through systemd without blocking forever in `systemctl restart`.
+# Polls the unit state until the restart job settles or times out.
+audio_restart_pipewire_service() {
+  aprs_label="$1"
+  aprs_timeout="${PIPEWIRE_SYSTEMCTL_TIMEOUT:-180}"
+  aprs_start_s="$(date +%s 2>/dev/null || echo 0)"
+  aprs_next_log=10
+
+  if [ -z "$aprs_label" ]; then
+    aprs_label="1/1"
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log_fail "systemctl not available, cannot restart pipewire"
+    return 1
+  fi
+
+  log_info "exec: systemctl restart pipewire (attempt ${aprs_label})"
+  if ! systemctl restart pipewire >/dev/null 2>&1; then
+    log_warn "Failed to queue pipewire restart job on attempt ${aprs_label}"
+    return 1
+  fi
+
+  while :; do
+    aprs_now_s="$(date +%s 2>/dev/null || echo 0)"
+    aprs_elapsed=$((aprs_now_s - aprs_start_s))
+    if [ "$aprs_elapsed" -lt 0 ]; then
+      aprs_elapsed=0
+    fi
+
+    if [ "$aprs_elapsed" -ge "$aprs_timeout" ]; then
+      aprs_active_state="$(systemctl show -p ActiveState --value pipewire 2>/dev/null || echo unknown)"
+      aprs_sub_state="$(systemctl show -p SubState --value pipewire 2>/dev/null || echo unknown)"
+      aprs_job_state="$(systemctl show -p Job --value pipewire 2>/dev/null || echo unknown)"
+      log_warn "PipeWire restart attempt ${aprs_label} timed out after ${aprs_timeout}s (state=${aprs_active_state}/${aprs_sub_state}, job=${aprs_job_state})"
+      return 1
+    fi
+
+    aprs_active_state="$(systemctl show -p ActiveState --value pipewire 2>/dev/null || echo unknown)"
+    aprs_sub_state="$(systemctl show -p SubState --value pipewire 2>/dev/null || echo unknown)"
+    aprs_result_state="$(systemctl show -p Result --value pipewire 2>/dev/null || echo unknown)"
+    aprs_job_state="$(systemctl show -p Job --value pipewire 2>/dev/null || echo unknown)"
+
+    case "$aprs_job_state" in
+      ""|0)
+        aprs_job_done=1
+        ;;
+      *)
+        aprs_job_done=0
+        ;;
+    esac
+
+    if [ "$aprs_active_state" = "active" ] && [ "$aprs_sub_state" = "running" ] && [ "$aprs_job_done" -eq 1 ]; then
+      return 0
+    fi
+
+    if [ "$aprs_active_state" = "failed" ]; then
+      log_warn "PipeWire entered failed state on attempt ${aprs_label} (state=${aprs_active_state}/${aprs_sub_state}, result=${aprs_result_state})"
+      return 1
+    fi
+
+    if [ "$aprs_result_state" = "failed" ]; then
+      log_warn "PipeWire restart job failed on attempt ${aprs_label} (state=${aprs_active_state}/${aprs_sub_state}, result=${aprs_result_state})"
+      return 1
+    fi
+
+    if [ "$aprs_elapsed" -ge "$aprs_next_log" ]; then
+      log_info "Still waiting for pipewire restart job... (state=${aprs_active_state}/${aprs_sub_state} job=${aprs_job_state} ${aprs_elapsed}s/${aprs_timeout}s)"
+      aprs_next_log=$((aprs_next_log + 10))
+    fi
+
+    sleep 1
+  done
+}
+
+# Function: setup_overlay_audio_environment
+# Purpose: Validate overlay audio prerequisites without mutating system state.
+# Returns: 0 on success, 1 on prerequisite failure
+# Usage: Call early in audio test initialization, before backend detection.
+#
+# Distro is expected to provide correct dma_heap permissions and PipeWire
+# readiness. This helper intentionally does not chmod /dev/dma_heap/system
+# and does not restart PipeWire, so distro regressions are not hidden by tests.
+setup_overlay_audio_environment() {
+  PIPEWIRE_READY_TIMEOUT="${PIPEWIRE_READY_TIMEOUT:-120}"
+ 
+  if ! command -v lsmod >/dev/null 2>&1; then
+    log_fail "lsmod command not available, cannot detect overlay audio modules"
+    return 1
+  fi
+ 
+  audio_modules="$(lsmod 2>/dev/null)" || {
+    log_fail "lsmod failed, cannot detect overlay audio modules"
+    return 1
+  }
+ 
+  if ! printf '%s\n' "$audio_modules" | awk '$1 ~ /^audioreach/ { found=1; exit } END { exit !found }'; then
+    log_info "Base build detected, no audioreach modules, skipping overlay setup"
+    return 0
+  fi
+ 
+  log_info "Overlay build detected, validating distro-provided audio prerequisites"
+ 
+  if [ ! -e /dev/dma_heap/system ]; then
+    log_fail "/dev/dma_heap/system is missing"
+    log_fail "Distro should provide dma_heap system node for overlay audio"
+    return 1
+  fi
+ 
+  if command -v stat >/dev/null 2>&1; then
+    dma_heap_mode="$(stat -c '%a' /dev/dma_heap/system 2>/dev/null || echo unknown)"
+    dma_heap_owner="$(stat -c '%U:%G' /dev/dma_heap/system 2>/dev/null || echo unknown)"
+    log_info "/dev/dma_heap/system mode, ${dma_heap_mode}, owner, ${dma_heap_owner}"
+  else
+    log_info "stat command not available, skipping /dev/dma_heap/system mode and owner dump"
+  fi
+ 
+  if [ -r /dev/dma_heap/system ] && [ -w /dev/dma_heap/system ]; then
+    log_pass "/dev/dma_heap/system is accessible"
+  else
+    log_fail "/dev/dma_heap/system is present but not accessible"
+    log_fail "Distro should provide correct dma_heap permissions, test will not chmod it"
+    return 1
+  fi
+ 
+  log_info "Waiting for PipeWire readiness, timeout ${PIPEWIRE_READY_TIMEOUT}s"
+  if audio_wait_audio_ready "$PIPEWIRE_READY_TIMEOUT" pipewire; then
+    log_pass "PipeWire is ready"
+  else
+    log_fail "PipeWire is not ready within ${PIPEWIRE_READY_TIMEOUT}s"
+    log_fail "Distro should start PipeWire correctly, test will not restart it during overlay setup"
+    return 1
+  fi
+ 
+  log_pass "Overlay audio prerequisites are ready"
+  return 0
+}
+
+# ---------- PipeWire control helpers (bounded; never hang) ----------
+pwctl_inspect_safe() {
+  # Prints wpctl inspect <id> on stdout; returns nonzero on timeout/failure.
+  id="$1"
+  [ -n "$id" ] || return 1
+  command -v wpctl >/dev/null 2>&1 || return 1
+  audio_exec_with_timeout 2s wpctl inspect "$id" 2>/dev/null
+}
+
 # ---------- PipeWire: sinks (playback) ----------
 pw_default_speakers() {
-  _block="$(wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p')"
+  st="$(pwctl_status_safe 2>/dev/null)" || { printf '%s\n' ""; return 0; }
+ 
+  _block="$(printf '%s\n' "$st" | sed -n '/Sinks:/,/Sources:/p')"
   _id="$(printf '%s\n' "$_block" \
         | grep -i -E 'speaker|headphone' \
         | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' \
@@ -274,62 +586,89 @@ pw_default_speakers() {
 }
 
 pw_default_null() {
-  wpctl status 2>/dev/null \
-  | sed -n '/Sinks:/,/Sources:/p' \
-  | grep -i -E 'null|dummy|loopback|monitor' \
-  | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' \
-  | head -n1
+  st="$(pwctl_status_safe 2>/dev/null)" || return 0
+  printf '%s\n' "$st" \
+    | sed -n '/Sinks:/,/Sources:/p' \
+    | grep -i -E 'null|dummy|loopback|monitor' \
+    | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' \
+    | head -n1
 }
 
 pw_sink_name_safe() {
-  id="$1"; [ -n "$id" ] || { echo ""; return 1; }
-  name="$(wpctl inspect "$id" 2>/dev/null | grep -m1 'node.description' | cut -d'"' -f2)"
-  [ -n "$name" ] || name="$(wpctl inspect "$id" 2>/dev/null | grep -m1 'node.name' | cut -d'"' -f2)"
-  if [ -z "$name" ]; then
-    name="$(wpctl status 2>/dev/null \
+  id="$1"
+  if [ -z "$id" ]; then
+    echo ""
+    return 1
+  fi
+
+  pw_inspect_text="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
+  pw_sink_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.description' | cut -d'"' -f2)"
+  if [ -z "$pw_sink_label" ]; then
+    pw_sink_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.name' | cut -d'"' -f2)"
+  fi
+
+  if [ -z "$pw_sink_label" ]; then
+    pw_status_text="$(pwctl_status_safe 2>/dev/null || true)"
+    pw_sink_label="$(printf '%s\n' "$pw_status_text" \
       | sed -n '/Sinks:/,/Sources:/p' \
       | grep -E "^[^0-9]*${id}[.][[:space:]]" \
       | sed 's/^[^0-9]*[0-9][0-9]*[.][[:space:]][[:space:]]*//' \
       | sed 's/[[:space:]]*\[vol:.*$//' \
-      | head -n1)"
+      | head -n 1)"
   fi
-  printf '%s\n' "$name"
+
+  printf '%s\n' "$pw_sink_label"
 }
 
 pw_sink_name() { pw_sink_name_safe "$@"; } # back-compat alias
-pw_set_default_sink() { [ -n "$1" ] && wpctl set-default "$1" >/dev/null 2>&1; }
+pw_set_default_sink() {
+  [ -n "$1" ] || return 1
+  audio_exec_with_timeout 2s wpctl set-default "$1" >/dev/null 2>&1
+}
 
 # ---------- PipeWire: sources (record) ----------
 pw_default_mic() {
-  blk="$(wpctl status 2>/dev/null | sed -n '/Sources:/,/^$/p')"
+  st="$(pwctl_status_safe 2>/dev/null)" || { printf '%s\n' ""; return 0; }
+ 
+  blk="$(printf '%s\n' "$st" | sed -n '/Sources:/,/^$/p')"
   id="$(printf '%s\n' "$blk" | grep -i 'mic' | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n1)"
   [ -n "$id" ] || id="$(printf '%s\n' "$blk" | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n1)"
   printf '%s\n' "$id"
 }
 
 pw_default_null_source() {
-  blk="$(wpctl status 2>/dev/null | sed -n '/Sources:/,/^$/p')"
+  st="$(pwctl_status_safe 2>/dev/null)" || { printf '%s\n' ""; return 0; }
+ 
+  blk="$(printf '%s\n' "$st" | sed -n '/Sources:/,/^$/p')"
   id="$(printf '%s\n' "$blk" | grep -i 'null\|dummy' | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n1)"
   printf '%s\n' "$id"
 }
 
-pw_set_default_source() { [ -n "$1" ] && wpctl set-default "$1" >/dev/null 2>&1; }
-
 pw_source_label_safe() {
-  id="$1"; [ -n "$id" ] || { echo ""; return 1; }
-  label="$(wpctl inspect "$id" 2>/dev/null | grep -m1 'node.description' | cut -d'"' -f2)"
-  [ -n "$label" ] || label="$(wpctl inspect "$id" 2>/dev/null | grep -m1 'node.name' | cut -d'"' -f2)"
-  if [ -z "$label" ]; then
-    label="$(wpctl status 2>/dev/null \
+  id="$1"
+  if [ -z "$id" ]; then
+    echo ""
+    return 1
+  fi
+
+  pw_inspect_text="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
+  pw_source_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.description' | cut -d'"' -f2)"
+  if [ -z "$pw_source_label" ]; then
+    pw_source_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.name' | cut -d'"' -f2)"
+  fi
+
+  if [ -z "$pw_source_label" ]; then
+    pw_status_text="$(pwctl_status_safe 2>/dev/null || true)"
+    pw_source_label="$(printf '%s\n' "$pw_status_text" \
       | sed -n '/Sources:/,/Filters:/p' \
       | grep -E "^[^0-9]*${id}[.][[:space:]]" \
       | sed 's/^[^0-9]*[0-9][0-9]*[.][[:space:]][[:space:]]*//' \
       | sed 's/[[:space:]]*\[vol:.*$//' \
-      | head -n1)"
+      | head -n 1)"
   fi
-  printf '%s\n' "$label"
-}
 
+  printf '%s\n' "$pw_source_label"
+}
 # ---------- PulseAudio: sinks (playback) ----------
 pa_default_speakers() {
   def="$(pactl info 2>/dev/null | sed -n 's/^Default Sink:[[:space:]]*//p' | head -n1)"
@@ -407,7 +746,7 @@ audio_evidence_pw_streaming() {
   # Try wpctl (fast); fall back to log scan if AUDIO_LOGCTX is available
   if command -v wpctl >/dev/null 2>&1; then
     # Count Input/Output streams in RUNNING state
-    wpctl status 2>/dev/null | grep -Eq 'RUNNING' && { echo 1; return; }
+    pwctl_status_safe 2>/dev/null | grep -Eq 'RUNNING' && { echo 1; return; }
   fi
   # Fallback to log
   if [ -n "${AUDIO_LOGCTX:-}" ] && [ -r "$AUDIO_LOGCTX" ]; then
@@ -598,7 +937,7 @@ audio_parse_secs() {
   in="$*"
   norm=$(printf '%s' "$in" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
   [ -n "$norm" ] || return 1
- 
+
   case "$norm" in
     *:*)
       IFS=':' set -- "$norm"
@@ -609,7 +948,8 @@ audio_parse_secs() {
         *) return 1 ;;
       esac
       h_val=${h:-0}; m_val=${m:-0}; s_val=${s:-0}
-      result=$(expr $h_val \* 3600 + $m_val \* 60 + $s_val)
+
+      result=$((h_val * 3600 + m_val * 60 + s_val))
       printf '%s\n' "$result"
       return 0
       ;;
@@ -618,9 +958,9 @@ audio_parse_secs() {
         [0-9]*s|[0-9]*sec|[0-9]*secs|[0-9]*second|[0-9]*seconds)
           n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$n"; return 0 ;;
         [0-9]*m|[0-9]*min|[0-9]*mins|[0-9]*minute|[0-9]*minutes)
-          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$(expr $n \* 60)"; return 0 ;;
+          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$((n * 60))"; return 0 ;;
         [0-9]*h|[0-9]*hr|[0-9]*hrs|[0-9]*hour|[0-9]*hours)
-          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$(expr $n \* 3600)"; return 0 ;;
+          n=$(printf '%s' "$norm" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'); printf '%s\n' "$((n * 3600))"; return 0 ;;
         *)
           tokens=$(printf '%s' "$norm" | sed 's/\([0-9][0-9]*[a-z][a-z]*\)/\1 /g')
           total=0; ok=0
@@ -629,11 +969,11 @@ audio_parse_secs() {
             u=$(printf '%s' "$t" | sed -n 's/^[0-9][0-9]*\([a-z][a-z]*\)$/\1/p')
             case "$u" in
               s|sec|secs|second|seconds) add=$n ;;
-              m|min|mins|minute|minutes) add=$(expr $n \* 60) ;;
-              h|hr|hrs|hour|hours)       add=$(expr $n \* 3600) ;;
+              m|min|mins|minute|minutes) add=$((n * 60)) ;;
+              h|hr|hrs|hour|hours) add=$((n * 3600)) ;;
               *) return 1 ;;
             esac
-            total=$(expr $total + $add); ok=1
+            total=$((total + add)); ok=1
           done
           [ "$ok" -eq 1 ] 2>/dev/null || return 1
           printf '%s\n' "$total"
@@ -646,46 +986,150 @@ audio_parse_secs() {
       return 0
       ;;
   esac
-  return 1
 }
 
 # --- Local watchdog that always honors the first argument (e.g. "15" or "15s") ---
 audio_exec_with_timeout() {
   dur="$1"; shift
+ 
   # normalize: allow "15" or "15s"
   case "$dur" in
     ""|"0") dur_norm=0 ;;
     *s) dur_norm="${dur%s}" ;;
     *) dur_norm="$dur" ;;
   esac
- 
-  # numeric? if not, treat as no-timeout
   case "$dur_norm" in *[!0-9]*|"") dur_norm=0 ;; esac
  
-  if [ "$dur_norm" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
-    timeout "$dur_norm" "$@"; return $?
+  # no watchdog
+  if [ "$dur_norm" -le 0 ] 2>/dev/null; then
+    "$@"
+    return $?
   fi
  
-  if [ "$dur_norm" -gt 0 ] 2>/dev/null; then
-    # portable fallback watchdog
-    "$@" &
-    pid=$!
-    (
-      sleep "$dur_norm"
-      kill -TERM "$pid" 2>/dev/null || true
+  # Run in background and enforce our own bounded timeout (don't rely on external timeout)
+  "$@" &
+  pid=$!
+ 
+  start="$(date +%s 2>/dev/null || echo 0)"
+  deadline=$((start + dur_norm))
+ 
+  # Wait until exit or deadline
+  while kill -0 "$pid" 2>/dev/null; do
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [ "$now" -ge "$deadline" ] 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+ 
+  # Timed out: try terminate/kill, but never block forever
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null || true
+ 
+    # bounded grace wait (handles normal killable cases)
+    grace=0
+    while kill -0 "$pid" 2>/dev/null && [ "$grace" -lt 3 ]; do
       sleep 1
-      kill -KILL "$pid" 2>/dev/null || true
-    ) &
-    w=$!
-    wait "$pid"; rc=$?
-    kill -TERM "$w" 2>/dev/null || true
-    # map "killed by watchdog" to 124 (GNU timeout convention)
-    [ "$rc" -eq 143 ] && rc=124
+      grace=$((grace + 1))
+    done
+ 
+    # Still alive -> likely D-state. Do NOT wait forever.
+    if kill -0 "$pid" 2>/dev/null; then
+      return 124
+    fi
+ 
+    wait "$pid" 2>/dev/null
+    rc=$?
+    [ "$rc" -eq 143 ] 2>/dev/null && rc=124
     return "$rc"
   fi
  
-  # no timeout
-  "$@"
+  # Exited naturally before timeout
+  wait "$pid" 2>/dev/null
+  return $?
+}
+
+# Wait until the requested audio backend becomes usable.
+# Uses real elapsed time, not loop count, so slow ctl probes do not skew timeout logs.
+audio_wait_audio_ready() {
+  max_s="${1:-${PIPEWIRE_READY_TIMEOUT:-120}}"
+  backend_name="${2:-auto}"
+  start_s="$(date +%s 2>/dev/null || echo 0)"
+  next_log=10
+
+  while :; do
+    now_s="$(date +%s 2>/dev/null || echo 0)"
+    elapsed=$((now_s - start_s))
+    if [ "$elapsed" -lt 0 ]; then
+      elapsed=0
+    fi
+
+    if [ "$elapsed" -ge "$max_s" ]; then
+      break
+    fi
+
+    case "$backend_name" in
+      pipewire)
+        if audio_backend_ready pipewire; then
+          return 0
+        fi
+        ;;
+      pulseaudio)
+        if audio_backend_ready pulseaudio; then
+          return 0
+        fi
+        ;;
+      auto|"")
+        if audio_backend_ready pipewire; then
+          return 0
+        fi
+        if audio_backend_ready pulseaudio; then
+          return 0
+        fi
+        if [ -d /dev/snd ] || [ -e /proc/asound/cards ]; then
+          return 0
+        fi
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+
+    if [ "$elapsed" -ge "$next_log" ]; then
+      log_info "Still waiting for ${backend_name:-audio}... (${elapsed}s/${max_s}s)"
+      next_log=$((next_log + 10))
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
+# --- bounded wpctl helpers (never hang) ---
+pwctl_status_safe() {
+  # Prints wpctl status to stdout on success, returns nonzero on failure/timeout.
+  out="$(audio_exec_with_timeout 2s wpctl status 2>/dev/null)"
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s\n' "$out"
+}
+ 
+audio_pw_ctl_ok() {
+  pwctl_status_safe >/dev/null 2>&1
+}
+
+audio_pa_ctl_ok() {
+  command -v pactl >/dev/null 2>&1 || return 1
+  audio_exec_with_timeout 2s pactl info >/dev/null 2>&1
+}
+# If you have an existing pw_set_default_source(), replace it with this bounded version.
+pw_set_default_source() {
+  id="$1"
+  [ -n "$id" ] || return 1
+  audio_exec_with_timeout 2s wpctl set-default "$id" >/dev/null 2>&1
 }
 
 # --------------------------------------------------------------------
@@ -779,17 +1223,21 @@ alsa_pick_virtual_pcm() {
 audio_check_clips_available() {
   formats="$1"
   durations="$2"
-  
+
+  if [ -z "$formats" ] || [ -z "$durations" ]; then
+    return 1
+  fi
+
   for fmt in $formats; do
     for dur in $durations; do
       clip="$(resolve_clip "$fmt" "$dur")"
-      # If resolve_clip returns empty string or clip doesn't exist/is empty
       if [ -z "$clip" ] || [ ! -s "$clip" ]; then
-        return 1  # At least one clip missing or empty
+        return 1
       fi
     done
   done
-  return 0  # All clips present and non-empty
+
+  return 0
 }
 
 # ---------- New Clip Discovery Functions (for 20-clip enhancement) ----------
@@ -908,6 +1356,7 @@ parse_clip_metadata() {
   fi
   
   # Split extracted fields (rate bits channels)
+  # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
   set -- $metadata
   rate="$1"; bits="$2"; channels="$3"
   
@@ -932,6 +1381,7 @@ generate_clip_testcase_name() {
   metadata="$(parse_clip_metadata "$filename")" || return 1
   
   # Extract values using positional parameters and prefix stripping
+  # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
   set -- $metadata
   rate="${1#rate=}"
   bits="${2#bits=}"
@@ -1001,6 +1451,7 @@ validate_clip_name() {
   if [ -n "$config_num" ]; then
     # Generic config name - map to clip by index (1-based)
     # Count total clips first using POSIX-compliant approach
+    # shellcheck disable=SC2086 # Intentional field splitting of generated key=value triplet.
     set -- $available_clips
     idx=$#
     
@@ -1013,7 +1464,7 @@ validate_clip_name() {
     # Get clip by index (1-based) using POSIX-compliant approach
     current_idx=0
     for clip in $available_clips; do
-      current_idx=$(expr $current_idx + 1)
+      current_idx=$((current_idx + 1))
       if [ "$current_idx" -eq "$config_num" ]; then
         printf '%s\n' "$clip"
         return 0
@@ -1035,6 +1486,7 @@ validate_clip_name() {
   done
   
   # No match found - count available clips for helpful message using POSIX-compliant approach
+  # shellcheck disable=SC2086 # Intentional field splitting of space-separated clip list.
   set -- $available_clips
   idx=$#
   
@@ -1398,4 +1850,1169 @@ discover_and_filter_record_configs() {
   # No filter - return all configs
   printf '%s\n' "$available_configs"
   return 0
+}
+
+# Generic backend readiness wrapper used by run.sh.
+# Reuses existing daemon/control-plane helpers instead of duplicating probe logic.
+audio_backend_ready() {
+  case "$1" in
+    pipewire)
+      if check_audio_daemon pipewire >/dev/null 2>&1; then
+        if audio_pw_ctl_ok >/dev/null 2>&1; then
+          return 0
+        fi
+      fi
+      return 1
+      ;;
+    pulseaudio)
+      if check_audio_daemon pulseaudio >/dev/null 2>&1; then
+        if audio_pa_ctl_ok >/dev/null 2>&1; then
+          return 0
+        fi
+      fi
+      return 1
+      ;;
+    alsa)
+      if command -v arecord >/dev/null 2>&1; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Track background daemon PIDs started by this script.
+# These PIDs are later cleaned up on exit.
+audio_add_started_pid() {
+  if [ -n "$1" ]; then
+    if [ -n "${AUDIO_STARTED_PIDS:-}" ]; then
+      AUDIO_STARTED_PIDS="$AUDIO_STARTED_PIDS $1"
+    else
+      AUDIO_STARTED_PIDS="$1"
+    fi
+    export AUDIO_STARTED_PIDS
+  fi
+}
+
+# Stop any audio daemons started by manual bootstrap.
+# Also removes the temporary runtime directory if this script created it.
+audio_cleanup_started_daemons() {
+  for pid in ${AUDIO_STARTED_PIDS:-}; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  if [ "${AUDIO_CREATED_RUNTIME_DIR:-0}" -eq 1 ] 2>/dev/null; then
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      rmdir "$XDG_RUNTIME_DIR" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+# Ensure XDG_RUNTIME_DIR is available for PipeWire/PulseAudio in minimal userspace.
+# Reuses an existing writable runtime dir when possible, otherwise creates one under /tmp.
+audio_ensure_runtime_dir() {
+  uid_now="$(id -u 2>/dev/null || echo 0)"
+
+  if [ -n "${AUDIO_RUNTIME_DIR:-}" ]; then
+    run_dir="$AUDIO_RUNTIME_DIR"
+  elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
+    return 0
+  elif [ -d "/run/user/$uid_now" ] && [ -w "/run/user/$uid_now" ]; then
+    run_dir="/run/user/$uid_now"
+  else
+    run_dir="/tmp/audio-runtime-$uid_now"
+    AUDIO_CREATED_RUNTIME_DIR=1
+    export AUDIO_CREATED_RUNTIME_DIR
+  fi
+
+  if [ ! -d "$run_dir" ]; then
+    mkdir -p "$run_dir" || return 1
+  fi
+
+  chmod 700 "$run_dir" >/dev/null 2>&1 || true
+  XDG_RUNTIME_DIR="$run_dir"
+  export XDG_RUNTIME_DIR
+  return 0
+}
+
+# Start a background process and redirect its output to a log file.
+# Returns the spawned PID so the caller can track and clean it up later.
+audio_start_bg_logged() {
+  bg_log="$1"
+  shift
+  "$@" >>"$bg_log" 2>&1 &
+  echo "$!"
+}
+
+# Manually start PipeWire and its session manager in minimal ramdisk userspace.
+# Reuses existing daemon/control-plane helpers to validate readiness.
+audio_manual_start_pipewire() {
+  pipewire_log="$LOGDIR/pipewire-bootstrap.log"
+  session_log="$LOGDIR/pipewire-session.log"
+  pulse_log="$LOGDIR/pipewire-pulse.log"
+
+  if check_audio_daemon pipewire >/dev/null 2>&1; then
+    if audio_pw_ctl_ok >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  if ! have_cmd pipewire; then
+    return 1
+  fi
+
+  if ! audio_ensure_runtime_dir; then
+    log_error "Failed to prepare XDG_RUNTIME_DIR for PipeWire"
+    return 1
+  fi
+
+  export HOME="${HOME:-/tmp}"
+
+  pw_pid="$(audio_start_bg_logged "$pipewire_log" pipewire)"
+  audio_add_started_pid "$pw_pid"
+  sleep 2
+
+  if have_cmd pipewire-media-session; then
+    sm_pid="$(audio_start_bg_logged "$session_log" pipewire-media-session)"
+    audio_add_started_pid "$sm_pid"
+  elif have_cmd wireplumber; then
+    sm_pid="$(audio_start_bg_logged "$session_log" wireplumber)"
+    audio_add_started_pid "$sm_pid"
+  else
+    log_warn "No PipeWire session manager found (wireplumber / pipewire-media-session)"
+  fi
+
+  if have_cmd pipewire-pulse; then
+    pp_pid="$(audio_start_bg_logged "$pulse_log" pipewire-pulse)"
+    audio_add_started_pid "$pp_pid"
+  fi
+
+  AUDIO_BACKEND="pipewire"
+  export AUDIO_BACKEND
+
+  audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+
+  if check_audio_daemon pipewire >/dev/null 2>&1; then
+    if audio_pw_ctl_ok >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Manually start PulseAudio in minimal ramdisk userspace.
+# Reuses existing daemon/control-plane helpers to validate readiness.
+audio_manual_start_pulseaudio() {
+  pulseaudio_log="$LOGDIR/pulseaudio-bootstrap.log"
+  uid_now="$(id -u 2>/dev/null || echo 0)"
+
+  if check_audio_daemon pulseaudio >/dev/null 2>&1; then
+    if audio_pa_ctl_ok >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  if ! have_cmd pulseaudio; then
+    return 1
+  fi
+
+  if ! audio_ensure_runtime_dir; then
+    log_error "Failed to prepare XDG_RUNTIME_DIR for PulseAudio"
+    return 1
+  fi
+
+  export HOME="${HOME:-/tmp}"
+
+  if [ "$uid_now" -eq 0 ] 2>/dev/null; then
+    pa_pid="$(audio_start_bg_logged "$pulseaudio_log" pulseaudio --system --daemonize=no --disallow-exit --exit-idle-time=-1)"
+  else
+    pa_pid="$(audio_start_bg_logged "$pulseaudio_log" pulseaudio --daemonize=no --exit-idle-time=-1)"
+  fi
+  audio_add_started_pid "$pa_pid"
+
+  AUDIO_BACKEND="pulseaudio"
+  export AUDIO_BACKEND
+
+  audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+
+  if check_audio_daemon pulseaudio >/dev/null 2>&1; then
+    if [ -z "${PULSE_SERVER:-}" ]; then
+      if [ -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+        PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+        export PULSE_SERVER
+      elif [ -S /run/pulse/native ]; then
+        PULSE_SERVER="unix:/run/pulse/native"
+        export PULSE_SERVER
+      elif [ -S /var/run/pulse/native ]; then
+        PULSE_SERVER="unix:/var/run/pulse/native"
+        export PULSE_SERVER
+      fi
+    fi
+
+    if audio_pa_ctl_ok >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Choose which backend to bootstrap when none is explicitly running yet.
+# Prefers PipeWire first, then PulseAudio, based on available binaries/tools.
+audio_choose_bootstrap_backend() {
+  if [ -n "${AUDIO_BACKEND:-}" ]; then
+    echo "$AUDIO_BACKEND"
+    return 0
+  fi
+
+  if have_cmd pipewire; then
+    if have_cmd pw-play || have_cmd pw-record || have_cmd wpctl || have_cmd pw-cli; then
+      echo "pipewire"
+      return 0
+    fi
+  fi
+
+  if have_cmd pulseaudio; then
+    if have_cmd paplay || have_cmd parecord || have_cmd pactl; then
+      echo "pulseaudio"
+      return 0
+    fi
+  fi
+
+  echo ""
+  return 1
+}
+
+# Return success only when the given systemd unit actually exists on this target.
+audio_systemd_unit_exists() {
+  unit_name="$1"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if systemctl list-unit-files "$unit_name" --no-legend 2>/dev/null | awk 'NF { found=1 } END { exit !found }'; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Return success only when the requested backend is genuinely managed by systemd here.
+# This avoids assuming that "systemctl exists" means "pipewire/pulseaudio service exists".
+audio_backend_is_systemd_managed() {
+  backend_name="$1"
+
+  case "$backend_name" in
+    pipewire)
+      if audio_systemd_unit_exists "pipewire.service" \
+        || audio_systemd_unit_exists "pipewire.socket" \
+        || audio_systemd_unit_exists "pipewire-pulse.service" \
+        || audio_systemd_unit_exists "pipewire-pulse.socket"; then
+        return 0
+      fi
+      return 1
+      ;;
+    pulseaudio)
+      if audio_systemd_unit_exists "pulseaudio.service" \
+        || audio_systemd_unit_exists "pulseaudio.socket"; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Decide whether manual bootstrap is allowed, then start the best available backend.
+# In auto mode, bootstrap is allowed when:
+# 1) there is no normal systemd userspace, or
+# 2) the chosen backend is not systemd-managed on this target.
+audio_bootstrap_backend_if_needed() {
+  start_allowed=0
+  requested_backend="${AUDIO_BACKEND:-}"
+  chosen_backend=""
+  backend_probe=""
+
+  case "${AUDIO_BOOTSTRAP_MODE:-auto}" in
+    true|1|yes)
+      start_allowed=1
+      ;;
+    auto)
+      backend_probe="$requested_backend"
+      if [ -z "$backend_probe" ]; then
+        backend_probe="$(audio_choose_bootstrap_backend 2>/dev/null || echo "")"
+      fi
+
+      if [ -n "$backend_probe" ]; then
+        if ! audio_should_use_service_recovery "$backend_probe"; then
+          start_allowed=1
+        fi
+      fi
+      ;;
+    false|0|no)
+      start_allowed=0
+      ;;
+    *)
+      log_warn "Unknown AUDIO_BOOTSTRAP_MODE='${AUDIO_BOOTSTRAP_MODE:-}', treating as auto"
+      backend_probe="$requested_backend"
+      if [ -z "$backend_probe" ]; then
+        backend_probe="$(audio_choose_bootstrap_backend 2>/dev/null || echo "")"
+      fi
+      if [ -n "$backend_probe" ]; then
+        if ! audio_should_use_service_recovery "$backend_probe"; then
+          start_allowed=1
+        fi
+      fi
+      ;;
+  esac
+
+  if [ "$start_allowed" -ne 1 ]; then
+    return 1
+  fi
+
+  chosen_backend="$(audio_choose_bootstrap_backend)"
+  if [ -z "$chosen_backend" ]; then
+    log_warn "No backend binaries available for manual bootstrap"
+    return 1
+  fi
+
+  log_info "Attempting manual audio backend bootstrap: $chosen_backend"
+
+  if [ "$chosen_backend" = "pipewire" ]; then
+    if audio_manual_start_pipewire; then
+      AUDIO_BACKEND="pipewire"
+      export AUDIO_BACKEND
+      return 0
+    fi
+
+    if [ -z "$requested_backend" ]; then
+      if have_cmd pulseaudio && have_cmd paplay; then
+        log_warn "PipeWire bootstrap failed, trying PulseAudio fallback"
+        if audio_manual_start_pulseaudio; then
+          AUDIO_BACKEND="pulseaudio"
+          export AUDIO_BACKEND
+          return 0
+        fi
+      fi
+    fi
+  elif [ "$chosen_backend" = "pulseaudio" ]; then
+    if audio_manual_start_pulseaudio; then
+      AUDIO_BACKEND="pulseaudio"
+      export AUDIO_BACKEND
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+audio_backend_has_service_unit() {
+  case "$1" in
+    pipewire)
+      if audio_systemd_unit_exists "pipewire.service"; then
+        return 0
+      fi
+      return 1
+      ;;
+    pulseaudio)
+      if audio_systemd_unit_exists "pulseaudio.service"; then
+        return 0
+      fi
+      if audio_systemd_unit_exists "pulseaudio.socket"; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+audio_should_use_service_recovery() {
+  backend_name="$1"
+
+  if [ ! -d /run/systemd/system ]; then
+    return 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if audio_backend_has_service_unit "$backend_name"; then
+    return 0
+  fi
+
+  return 1
+}
+
+audio_playback_alsa_prepare() {
+  ap_ucm_card=""
+
+  if [ "${SINK_CHOICE:-speakers}" = "null" ]; then
+    return 0
+  fi
+
+  if command -v alsaucm >/dev/null 2>&1; then
+    ap_ucm_card="$(alsaucm listcards 2>/dev/null | awk 'NR==2 {sub(/^[[:space:]]+/, "", $0); print; exit}')"
+    if [ -n "$ap_ucm_card" ]; then
+      alsaucm -n -b - <<EOF >/dev/null 2>&1
+open $ap_ucm_card
+reset
+set _verb HiFi
+set _enadev Speaker
+EOF
+    fi
+  fi
+
+  if command -v amixer >/dev/null 2>&1; then
+    if amixer -c 0 scontrols 2>/dev/null | grep -F "PRIMARY_MI2S_RX Audio Mixer MultiMedia1" >/dev/null 2>&1; then
+      amixer -c 0 cset name='PRIMARY_MI2S_RX Audio Mixer MultiMedia1' 1 >/dev/null 2>&1 || true
+    fi
+    if amixer -c 0 scontrols 2>/dev/null | grep -F "stream0.vol_ctrl0 MultiMedia1 Playback Volu" >/dev/null 2>&1; then
+      amixer -c 0 cset name='stream0.vol_ctrl0 MultiMedia1 Playback Volu' 65535 >/dev/null 2>&1 || true
+    fi
+  fi
+
+  return 0
+}
+
+audio_playback_pick_alsa_sink() {
+  ap_dev=""
+
+  if [ "${SINK_CHOICE:-speakers}" = "null" ]; then
+    echo "null"
+    return 0
+  fi
+
+  if command -v aplay >/dev/null 2>&1; then
+    ap_dev="$(aplay -L 2>/dev/null | awk '/^default:CARD=/{print $1; exit}')"
+    if [ -n "$ap_dev" ]; then
+      echo "$ap_dev"
+      return 0
+    fi
+
+    ap_dev="$(aplay -L 2>/dev/null | awk '/^sysdefault:CARD=/{print $1; exit}')"
+    if [ -n "$ap_dev" ]; then
+      echo "$ap_dev"
+      return 0
+    fi
+
+    ap_dev="$(aplay -l 2>/dev/null | sed -n 's/^card[[:space:]]*\([0-9][0-9]*\):.*device[[:space:]]*\([0-9][0-9]*\):.*/plughw:\1,\2/p' | head -n 1)"
+    if [ -n "$ap_dev" ]; then
+      echo "$ap_dev"
+      return 0
+    fi
+  fi
+
+  echo ""
+  return 1
+}
+
+audio_playback_alsa_probe() {
+  ap_probe_dev="$(audio_playback_pick_alsa_sink)"
+  if [ -z "$ap_probe_dev" ]; then
+    return 1
+  fi
+
+  audio_playback_alsa_prepare >/dev/null 2>&1 || true
+
+  if audio_exec_with_timeout 5s aplay -D "$ap_probe_dev" -t raw -f S16_LE -r 48000 -c 2 -d 1 /dev/zero >/dev/null 2>&1; then
+    AUDIO_ALSA_PLAYBACK_DEVICE="$ap_probe_dev"
+    export AUDIO_ALSA_PLAYBACK_DEVICE
+    return 0
+  fi
+
+  return 1
+}
+
+audio_record_alsa_prepare_capture() {
+  ar_ucm_card=""
+
+  if command -v alsaucm >/dev/null 2>&1; then
+    ar_ucm_card="$(alsaucm listcards 2>/dev/null | awk 'NR==2 {sub(/^[[:space:]]+/, "", $0); print; exit}')"
+    if [ -n "$ar_ucm_card" ]; then
+      alsaucm -n -b - <<EOF >/dev/null 2>&1
+open $ar_ucm_card
+reset
+set _verb HiFi
+set _enadev Mic
+EOF
+    fi
+  fi
+
+  if command -v amixer >/dev/null 2>&1; then
+    if amixer -c 0 scontrols 2>/dev/null | grep -F "MultiMedia2 Mixer TERTIARY_MI2S_TX" >/dev/null 2>&1; then
+      amixer -c 0 cset name='MultiMedia2 Mixer TERTIARY_MI2S_TX' 1 >/dev/null 2>&1 || true
+    fi
+  fi
+
+  return 0
+}
+
+audio_record_pick_alsa_capture() {
+  ar_dev=""
+
+  if command -v arecord >/dev/null 2>&1; then
+    ar_dev="$(arecord -l 2>/dev/null | sed -n 's/^card[[:space:]]*\([0-9][0-9]*\):.*device[[:space:]]*\([0-9][0-9]*\):.*/hw:\1,\2/p' | head -n 1)"
+    if [ -n "$ar_dev" ]; then
+      echo "$ar_dev"
+      return 0
+    fi
+  fi
+
+  ar_dev="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null | head -n 1)"
+  if [ -n "$ar_dev" ]; then
+    echo "$ar_dev"
+    return 0
+  fi
+
+  echo ""
+  return 1
+}
+
+audio_record_alsa_capture_probe() {
+  ar_probe_dev="$(audio_record_pick_alsa_capture)"
+  if [ -z "$ar_probe_dev" ]; then
+    return 1
+  fi
+
+  audio_record_alsa_prepare_capture >/dev/null 2>&1 || true
+
+  ar_probe_out="$(mktemp /tmp/audio_record_probe.XXXXXX.wav 2>/dev/null || echo /tmp/audio_record_probe.$$)"
+  rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+
+  for ar_probe_combo in "S16_LE 16000 1" "S16_LE 48000 1" "S16_LE 48000 2"; do
+    ar_fmt="$(printf '%s\n' "$ar_probe_combo" | awk '{print $1}')"
+    ar_rate="$(printf '%s\n' "$ar_probe_combo" | awk '{print $2}')"
+    ar_ch="$(printf '%s\n' "$ar_probe_combo" | awk '{print $3}')"
+
+    if audio_exec_with_timeout 5s arecord -D "$ar_probe_dev" -f "$ar_fmt" -r "$ar_rate" -c "$ar_ch" -d 1 "$ar_probe_out" >/dev/null 2>&1; then
+      if [ -s "$ar_probe_out" ]; then
+        AUDIO_ALSA_CAPTURE_DEVICE="$ar_probe_dev"
+        export AUDIO_ALSA_CAPTURE_DEVICE
+        rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+        return 0
+      fi
+    fi
+    rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+
+    case "$ar_probe_dev" in
+      hw:*)
+        ar_alt_dev="plughw:${ar_probe_dev#hw:}"
+        if audio_exec_with_timeout 5s arecord -D "$ar_alt_dev" -f "$ar_fmt" -r "$ar_rate" -c "$ar_ch" -d 1 "$ar_probe_out" >/dev/null 2>&1; then
+          if [ -s "$ar_probe_out" ]; then
+            AUDIO_ALSA_CAPTURE_DEVICE="$ar_alt_dev"
+            export AUDIO_ALSA_CAPTURE_DEVICE
+            rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+            return 0
+          fi
+        fi
+        rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done
+
+  rm -f "$ar_probe_out" >/dev/null 2>&1 || true
+  return 1
+}
+
+audio_probe_alsa_capture_profile() {
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_DEVICE=""
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_FORMAT=""
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_RATE=""
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_CHANNELS=""
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_REASON=""
+
+  if ! command -v arecord >/dev/null 2>&1; then
+    # shellcheck disable=SC2034
+    AUDIO_ALSA_CAPTURE_REASON="arecord not available"
+    return 1
+  fi
+
+  probe_tmp=""
+  if command -v mktemp >/dev/null 2>&1; then
+    probe_tmp="$(mktemp /tmp/audio_record_probe.XXXXXX.wav 2>/dev/null || true)"
+  fi
+  if [ -z "$probe_tmp" ]; then
+    probe_tmp="/tmp/audio_record_probe.$$.$(date +%s 2>/dev/null || echo 0).wav"
+  fi
+
+  probe_cleanup() {
+    if [ -n "$probe_tmp" ] && [ -f "$probe_tmp" ]; then
+      rm -f "$probe_tmp" >/dev/null 2>&1 || true
+    fi
+  }
+
+  probe_devices=""
+  cand="$(alsa_pick_capture 2>/dev/null || true)"
+  if [ -n "$cand" ]; then
+    probe_devices="$cand"
+    case "$cand" in
+      hw:*)
+        probe_devices="$probe_devices plughw:${cand#hw:}"
+        ;;
+      plughw:*)
+        probe_devices="$probe_devices hw:${cand#plughw:}"
+        ;;
+    esac
+  fi
+
+  extra_devices="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null)"
+  if [ -n "$extra_devices" ]; then
+    for dev in $extra_devices; do
+      seen=0
+      for existing in $probe_devices; do
+        if [ "$existing" = "$dev" ]; then
+          seen=1
+          break
+        fi
+      done
+      if [ "$seen" -eq 0 ]; then
+        probe_devices="$probe_devices $dev"
+        case "$dev" in
+          hw:*)
+            probe_devices="$probe_devices plughw:${dev#hw:}"
+            ;;
+        esac
+      fi
+    done
+  fi
+
+  if [ -z "$probe_devices" ]; then
+    # shellcheck disable=SC2034
+    AUDIO_ALSA_CAPTURE_REASON="no ALSA capture device candidates found"
+    probe_cleanup
+    return 1
+  fi
+
+  for dev in $probe_devices; do
+    for combo in \
+      "S16_LE 48000 1" \
+      "S16_LE 16000 1" \
+      "S16_LE 48000 2" \
+      "S16_LE 16000 2" \
+      "S24_LE 48000 2"
+    do
+      fmt="$(printf '%s\n' "$combo" | awk '{print $1}')"
+      rate="$(printf '%s\n' "$combo" | awk '{print $2}')"
+      ch="$(printf '%s\n' "$combo" | awk '{print $3}')"
+
+      : > "$probe_tmp"
+
+      if audio_exec_with_timeout 5s \
+        arecord -q -D "$dev" -f "$fmt" -r "$rate" -c "$ch" -d 1 "$probe_tmp" >/dev/null 2>&1
+      then
+        bytes="$(file_size_bytes "$probe_tmp" 2>/dev/null || echo 0)"
+        if [ "${bytes:-0}" -gt 44 ] 2>/dev/null; then
+          # Used later by sourced run.sh
+          # shellcheck disable=SC2034
+          AUDIO_ALSA_CAPTURE_DEVICE="$dev"
+          # shellcheck disable=SC2034
+          AUDIO_ALSA_CAPTURE_FORMAT="$fmt"
+          # shellcheck disable=SC2034
+          AUDIO_ALSA_CAPTURE_RATE="$rate"
+          # shellcheck disable=SC2034
+          AUDIO_ALSA_CAPTURE_CHANNELS="$ch"
+          # shellcheck disable=SC2034
+          AUDIO_ALSA_CAPTURE_REASON=""
+          probe_cleanup
+          return 0
+        fi
+      fi
+    done
+  done
+
+  # Used later by sourced run.sh
+  # shellcheck disable=SC2034
+  AUDIO_ALSA_CAPTURE_REASON="no ALSA capture profile could be opened"
+  probe_cleanup
+  return 1
+}
+
+###############################################################################
+# ALSA sound card registration helpers
+###############################################################################
+audio_card_log_alsa_inventory() {
+  log_info "----- ALSA sound inventory -----"
+
+  if [ -f /proc/asound/cards ]; then
+    log_info "/proc/asound/cards:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-cards] $line"
+    done < /proc/asound/cards
+  else
+    log_warn "/proc/asound/cards is missing"
+  fi
+
+  if [ -f /proc/asound/devices ]; then
+    log_info "/proc/asound/devices:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-devices] $line"
+    done < /proc/asound/devices
+  else
+    log_warn "/proc/asound/devices is missing"
+  fi
+
+  if [ -f /proc/asound/pcm ]; then
+    log_info "/proc/asound/pcm:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-pcm] $line"
+    done < /proc/asound/pcm
+  else
+    log_warn "/proc/asound/pcm is missing"
+  fi
+
+  if [ -d /dev/snd ]; then
+    log_info "/dev/snd:"
+    for audio_snd_path in /dev/snd/*; do
+      [ -e "$audio_snd_path" ] || continue
+
+      if command -v stat >/dev/null 2>&1; then
+        audio_snd_mode="$(stat -c '%A' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        audio_snd_owner="$(stat -c '%U:%G' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        audio_snd_type="$(stat -c '%F' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        log_info "[dev-snd] ${audio_snd_mode} ${audio_snd_owner} ${audio_snd_type} ${audio_snd_path}"
+      else
+        log_info "[dev-snd] ${audio_snd_path}"
+      fi
+    done
+  else
+    log_warn "/dev/snd is missing"
+  fi
+
+  if [ -d /sys/class/sound ]; then
+    log_info "/sys/class/sound:"
+    for audio_sound_path in /sys/class/sound/*; do
+      [ -e "$audio_sound_path" ] || continue
+
+      audio_sound_target=""
+      if [ -L "$audio_sound_path" ] && command -v readlink >/dev/null 2>&1; then
+        audio_sound_target="$(readlink "$audio_sound_path" 2>/dev/null || true)"
+      fi
+
+      if command -v stat >/dev/null 2>&1; then
+        audio_sound_mode="$(stat -c '%A' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+        audio_sound_owner="$(stat -c '%U:%G' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+        audio_sound_type="$(stat -c '%F' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+
+        if [ -n "$audio_sound_target" ]; then
+          log_info "[sys-sound] ${audio_sound_mode} ${audio_sound_owner} ${audio_sound_type} ${audio_sound_path} -> ${audio_sound_target}"
+        else
+          log_info "[sys-sound] ${audio_sound_mode} ${audio_sound_owner} ${audio_sound_type} ${audio_sound_path}"
+        fi
+      else
+        if [ -n "$audio_sound_target" ]; then
+          log_info "[sys-sound] ${audio_sound_path} -> ${audio_sound_target}"
+        else
+          log_info "[sys-sound] ${audio_sound_path}"
+        fi
+      fi
+    done
+  else
+    log_warn "/sys/class/sound is missing"
+  fi
+
+  if command -v aplay >/dev/null 2>&1; then
+    log_info "aplay -l:"
+    aplay -l 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[aplay] $line"
+    done
+  else
+    log_info "aplay not available, skipping aplay -l dump"
+  fi
+
+  if command -v arecord >/dev/null 2>&1; then
+    log_info "arecord -l:"
+    arecord -l 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[arecord] $line"
+    done
+  else
+    log_info "arecord not available, skipping arecord -l dump"
+  fi
+
+  log_info "----- End ALSA sound inventory -----"
+}
+
+# Print registered ALSA cards as:
+# card_index|card_id|description
+audio_card_get_registered_cards() {
+  if [ ! -f /proc/asound/cards ]; then
+    return 1
+  fi
+
+  awk '
+    /^[[:space:]]*[0-9]+[[:space:]]+\[/ {
+      idx = $1
+      id = $0
+      desc = $0
+
+      sub(/^[^[]*\[/, "", id)
+      sub(/\].*$/, "", id)
+
+      sub(/^[^:]*:[[:space:]]*/, "", desc)
+
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", id)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc)
+
+      print idx "|" id "|" desc
+    }
+  ' /proc/asound/cards
+}
+
+# Return 0 if the card line is dummy/loopback-only.
+audio_card_is_dummy_or_generic() {
+  card_line="$1"
+
+  printf '%s\n' "$card_line" | grep -Eiq 'dummy|loopback|aloop|snd-dummy'
+}
+
+# Print only non-dummy registered cards.
+audio_card_get_valid_cards() {
+  audio_card_get_registered_cards 2>/dev/null | while IFS= read -r card_line || [ -n "$card_line" ]; do
+    [ -n "$card_line" ] || continue
+
+    if audio_card_is_dummy_or_generic "$card_line"; then
+      continue
+    fi
+
+    printf '%s\n' "$card_line"
+  done
+}
+
+# Count non-dummy registered cards.
+audio_card_count_valid_cards() {
+  count="$(audio_card_get_valid_cards 2>/dev/null | wc -l | awk '{print $1}')"
+
+  if [ -z "$count" ]; then
+    count=0
+  fi
+
+  printf '%s\n' "$count"
+}
+
+# Print valid cards matching a case-insensitive substring.
+# Empty match means all valid cards.
+audio_card_find_matching_cards() {
+  match="$1"
+
+  if [ -z "$match" ]; then
+    audio_card_get_valid_cards
+    return $?
+  fi
+
+  audio_card_get_valid_cards 2>/dev/null | awk -v pat="$match" '
+    BEGIN {
+      pat = tolower(pat)
+    }
+    {
+      line = tolower($0)
+      if (index(line, pat) > 0) {
+        print $0
+      }
+    }
+  '
+}
+
+# Return 0 if current DT/sysfs suggests audio card registration is expected.
+audio_card_dt_audio_expected() {
+  if [ -d /sys/class/sound ]; then
+    for card_path in /sys/class/sound/card*; do
+      if [ -e "$card_path" ]; then
+        return 0
+      fi
+    done
+  fi
+
+  if [ ! -d /proc/device-tree ]; then
+    return 1
+  fi
+
+  if find /proc/device-tree -type d \( \
+      -name "sound" -o \
+      -name "*sound*" -o \
+      -name "*audio*" \
+    \) 2>/dev/null | grep -q .; then
+    return 0
+  fi
+
+  compat_match_file="$(mktemp "${TMPDIR:-/tmp}/audio_compat_match.XXXXXX" 2>/dev/null || printf '%s\n' "${TMPDIR:-/tmp}/audio_compat_match.$$")"
+  : > "$compat_match_file" 2>/dev/null || return 1
+
+  find /proc/device-tree -name compatible -type f 2>/dev/null |
+  while IFS= read -r compat_file || [ -n "$compat_file" ]; do
+    [ -n "$compat_file" ] || continue
+
+    if tr '\000' '\n' < "$compat_file" 2>/dev/null | grep -Eiq 'qcom,.*(sound|audio|snd|lpass|wsa|rx-macro|tx-macro|va-macro|codec|swr|soundwire)'; then
+      printf '%s\n' "$compat_file" > "$compat_match_file"
+      break
+    fi
+  done
+
+  if [ -s "$compat_match_file" ]; then
+    rm -f "$compat_match_file" 2>/dev/null || true
+    return 0
+  fi
+
+  rm -f "$compat_match_file" 2>/dev/null || true
+  return 1
+}
+
+# Wait for at least one valid ALSA card, optionally matching AUDIO_CARD_MATCH.
+audio_card_wait_for_cards() {
+  wait_secs="$1"
+  card_match="$2"
+  elapsed=0
+
+  case "$wait_secs" in
+    ''|*[!0-9]*)
+      wait_secs=30
+      ;;
+  esac
+
+  log_info "Waiting up to ${wait_secs}s for ALSA sound card registration"
+
+  while [ "$elapsed" -le "$wait_secs" ]; do
+    if [ -n "$card_match" ]; then
+      if audio_card_find_matching_cards "$card_match" | grep -q .; then
+        return 0
+      fi
+    else
+      card_count="$(audio_card_count_valid_cards)"
+      if [ "$card_count" -gt 0 ] 2>/dev/null; then
+        return 0
+      fi
+    fi
+
+    if [ "$elapsed" -eq "$wait_secs" ]; then
+      break
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+
+    case "$elapsed" in
+      5|10|15|20|25|30|45|60)
+        log_info "Still waiting for ALSA card registration, elapsed=${elapsed}s"
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+# Validate /dev/snd/controlC<N> for every matched valid card.
+audio_card_validate_control_nodes() {
+  cards_file="$1"
+  failed=0
+
+  if [ ! -s "$cards_file" ]; then
+    log_fail "No matched ALSA cards provided for control node validation"
+    return 1
+  fi
+
+  while IFS='|' read -r card_idx card_id card_desc || [ -n "$card_idx" ]; do
+    [ -n "$card_idx" ] || continue
+
+    control_node="/dev/snd/controlC${card_idx}"
+
+    if [ -e "$control_node" ]; then
+      log_pass "ALSA control node present for card ${card_idx}, ${control_node}, id='${card_id}', desc='${card_desc}'"
+    else
+      log_fail "Missing ALSA control node for card ${card_idx}, expected ${control_node}, id='${card_id}', desc='${card_desc}'"
+      failed=1
+    fi
+  done < "$cards_file"
+
+  if [ "$failed" -eq 0 ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Validate PCM entries for every matched valid card.
+# mode:
+# any - require any PCM for the card
+# playback - require playback PCM
+# capture - require capture PCM
+audio_card_validate_pcm_nodes() {
+  cards_file="$1"
+  mode="$2"
+  failed=0
+  total_checked=0
+  pcm_tmp_file=""
+
+  if [ -z "$mode" ]; then
+    mode="any"
+  fi
+
+  case "$mode" in
+    any|playback|capture)
+      ;;
+    *)
+      log_warn "Invalid PCM validation mode '${mode}', using any"
+      mode="any"
+      ;;
+  esac
+
+  if [ ! -s "$cards_file" ]; then
+    log_fail "No matched ALSA cards provided for PCM validation"
+    return 1
+  fi
+
+  if [ ! -f /proc/asound/pcm ]; then
+    log_fail "/proc/asound/pcm is missing"
+    return 1
+  fi
+
+  pcm_tmp_file="$(mktemp "${TMPDIR:-/tmp}/audio_pcm_lines.XXXXXX" 2>/dev/null || printf '%s\n' "${TMPDIR:-/tmp}/audio_pcm_lines.$$")"
+  : > "$pcm_tmp_file" 2>/dev/null || return 1
+
+  while IFS='|' read -r card_idx card_id card_desc || [ -n "$card_idx" ]; do
+    [ -n "$card_idx" ] || continue
+
+    case "$card_idx" in
+      ''|*[!0-9]*)
+        log_warn "Invalid ALSA card index '${card_idx}', skipping PCM validation for this entry"
+        continue
+        ;;
+    esac
+
+    card_prefix="$(printf '%02d' "$card_idx" 2>/dev/null || printf '%s' "$card_idx")"
+    card_has_pcm=0
+    card_has_mode=0
+    card_checked=0
+
+    grep "^${card_prefix}-" /proc/asound/pcm 2>/dev/null > "$pcm_tmp_file" || true
+
+    if [ ! -s "$pcm_tmp_file" ]; then
+      log_fail "PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+      failed=1
+      continue
+    fi
+
+    while IFS= read -r pcm_line || [ -n "$pcm_line" ]; do
+      [ -n "$pcm_line" ] || continue
+
+      card_has_pcm=1
+
+      pcm_dev="$(printf '%s\n' "$pcm_line" | sed -n 's/^[0-9][0-9]-\([0-9][0-9]\):.*/\1/p')"
+      [ -n "$pcm_dev" ] || continue
+
+      pcm_dev_num="$(printf '%s\n' "$pcm_dev" | sed 's/^0*//')"
+      if [ -z "$pcm_dev_num" ]; then
+        pcm_dev_num=0
+      fi
+
+      if printf '%s\n' "$pcm_line" | grep -qi 'playback'; then
+        if [ "$mode" = "any" ] || [ "$mode" = "playback" ]; then
+          card_has_mode=1
+          card_checked=$((card_checked + 1))
+          total_checked=$((total_checked + 1))
+          pcm_node="/dev/snd/pcmC${card_idx}D${pcm_dev_num}p"
+
+          if [ -e "$pcm_node" ]; then
+            if [ "$mode" = "any" ]; then
+              log_pass "Advertised playback PCM node present, ${pcm_node}, card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            fi
+          else
+            log_fail "Advertised playback PCM node missing, expected ${pcm_node}, line='${pcm_line}', card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            failed=1
+          fi
+        fi
+      fi
+
+      if printf '%s\n' "$pcm_line" | grep -qi 'capture'; then
+        if [ "$mode" = "any" ] || [ "$mode" = "capture" ]; then
+          card_has_mode=1
+          card_checked=$((card_checked + 1))
+          total_checked=$((total_checked + 1))
+          pcm_node="/dev/snd/pcmC${card_idx}D${pcm_dev_num}c"
+
+          if [ -e "$pcm_node" ]; then
+            if [ "$mode" = "any" ]; then
+              log_pass "Advertised capture PCM node present, ${pcm_node}, card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            fi
+          else
+            log_fail "Advertised capture PCM node missing, expected ${pcm_node}, line='${pcm_line}', card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            failed=1
+          fi
+        fi
+      fi
+    done < "$pcm_tmp_file"
+
+    if [ "$mode" = "any" ]; then
+      if [ "$card_has_pcm" -eq 1 ]; then
+        log_pass "PCM entry present for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    elif [ "$mode" = "playback" ]; then
+      if [ "$card_has_mode" -eq 1 ]; then
+        log_pass "Playback PCM validation passed for card ${card_idx}, count=${card_checked}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "Playback PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    elif [ "$mode" = "capture" ]; then
+      if [ "$card_has_mode" -eq 1 ]; then
+        log_pass "Capture PCM validation passed for card ${card_idx}, count=${card_checked}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "Capture PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    fi
+  done < "$cards_file"
+
+  rm -f "$pcm_tmp_file" 2>/dev/null || true
+
+  if [ "$total_checked" -eq 0 ]; then
+    log_warn "No advertised PCM device nodes were validated from /proc/asound/pcm, mode=${mode}"
+  else
+    log_info "Validated advertised PCM device nodes, mode=${mode}, count=${total_checked}"
+  fi
+
+  if [ "$failed" -eq 0 ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Audio-card focused dmesg scan.
+audio_card_dmesg_scan() {
+  outdir="$1"
+
+  if [ -z "$outdir" ]; then
+    outdir="."
+  fi
+
+  audio_dmesg_modules="snd|asoc|audio|lpass|q6|q6afe|q6asm|q6adm|apr|glink|wsa|rx-macro|tx-macro|va-macro|soundwire|swr|codec|remoteproc"
+  audio_dmesg_benign="dummy regulator|probe deferred|deferred probe pending"
+
+  if command -v scan_dmesg_errors >/dev/null 2>&1; then
+    scan_dmesg_errors \
+      "$outdir" \
+      "$audio_dmesg_modules" \
+      "$audio_dmesg_benign" || true
+  else
+    log_warn "scan_dmesg_errors helper not available, skipping audio dmesg scan"
+  fi
 }

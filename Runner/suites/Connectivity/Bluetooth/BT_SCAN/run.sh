@@ -1,6 +1,8 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause# BT_SCAN – Bluetooth scanning validation (non-expect version)
+# SPDX-License-Identifier: BSD-3-Clause#
+# BT_SCAN – Bluetooth scanning validation (non-expect version)
+
 # ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
   cd "$(dirname "$0")" || exit 1
@@ -37,6 +39,9 @@ fi
 BT_ADAPTER="${BT_ADAPTER-}"
 BT_SCAN_TARGET_MAC="${BT_SCAN_TARGET_MAC-}"
 BT_TARGET_MAC="${BT_TARGET_MAC-}"
+BT_SCAN_SECONDS="${BT_SCAN_SECONDS:-15}"
+BT_SCAN_RETRIES="${BT_SCAN_RETRIES:-3}"
+BT_SCAN_RETRY_DELAY="${BT_SCAN_RETRY_DELAY:-2}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -46,6 +51,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --target-mac)
             BT_TARGET_MAC="$2"
+            shift 2
+            ;;
+        --scan-seconds)
+            BT_SCAN_SECONDS="$2"
+            shift 2
+            ;;
+        --scan-retries)
+            BT_SCAN_RETRIES="$2"
+            shift 2
+            ;;
+        --scan-retry-delay)
+            BT_SCAN_RETRY_DELAY="$2"
             shift 2
             ;;
         *)
@@ -68,9 +85,12 @@ rm -f "$res_file"
 
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME Testcase"
-log_info "Checking dependency: bluetoothctl"
+log_info "Checking dependencies: bluetoothctl pgrep"
 
-check_dependencies bluetoothctl pgrep
+if ! check_dependencies bluetoothctl pgrep; then
+    echo "$TESTNAME SKIP" > "$res_file"
+    exit 0
+fi
 
 # -----------------------------
 # 1. Ensure bluetoothd is running
@@ -106,6 +126,14 @@ elif findhcisysfs >/dev/null 2>&1; then
     ADAPTER="$(findhcisysfs 2>/dev/null || true)"
 else
     ADAPTER=""
+fi
+
+if [ -n "$ADAPTER" ]; then
+    if [ -n "$BT_ADAPTER" ]; then
+        bt_log_selected_adapter "$ADAPTER" "BT_ADAPTER/CLI"
+    else
+        bt_log_selected_adapter "$ADAPTER" "auto-detect"
+    fi
 fi
 
 if [ -n "$ADAPTER" ]; then
@@ -153,50 +181,46 @@ else
 fi
 
 # -----------------------------
-# 6. Scan ON via helper
+# 6. Scan using common Bluetooth helper
 # -----------------------------
-log_info "Testing scan ON..."
-if ! bt_set_scan on "$ADAPTER"; then
-    log_warn "bt_set_scan(on) returned non-zero will still inspect devices list."
-fi
+log_info "Testing Bluetooth scan..."
+log_info "Scan config: BT_SCAN_SECONDS=${BT_SCAN_SECONDS} BT_SCAN_RETRIES=${BT_SCAN_RETRIES} BT_SCAN_RETRY_DELAY=${BT_SCAN_RETRY_DELAY}"
 
-# Optional: single Discovering snapshot after scan-on window
-dstate_on="$(bt_get_discovering 2>/dev/null || true)"
-[ -z "$dstate_on" ] && dstate_on="unknown"
-log_info "Discovering state after scan ON window: $dstate_on"
+SCAN_SECONDS="$BT_SCAN_SECONDS"
+SCAN_ATTEMPTS="$BT_SCAN_RETRIES"
+SCAN_RETRY_DELAY="$BT_SCAN_RETRY_DELAY"
+MAC_ID="$TARGET_MAC"
+BT_ADAPTER="$ADAPTER"
 
-# -----------------------------
-# 7. Get devices list after scan ON
-# -----------------------------
-devices_out="$(
-    bluetoothctl devices 2>/dev/null \
-        | sanitize_bt_output
-)"
+export SCAN_SECONDS
+export SCAN_ATTEMPTS
+export SCAN_RETRY_DELAY
+export MAC_ID
+export BT_ADAPTER
 
-if [ -n "$TARGET_MAC" ]; then
-    mac_up=$(printf '%s\n' "$TARGET_MAC" | tr '[:lower:]' '[:upper:]')
-    if printf '%s\n' "$devices_out" \
-        | awk '/^Device /{print toupper($2)}' \
-        | grep -q "$mac_up"
-    then
+if bt_scan_devices "$TARGET_MAC"; then
+    dstate_on="$(bt_get_discovering 2>/dev/null || true)"
+    [ -z "$dstate_on" ] && dstate_on="unknown"
+    log_info "Discovering state after scan attempts: $dstate_on"
+
+    if [ -n "$TARGET_MAC" ]; then
         log_pass "Target MAC $TARGET_MAC detected."
     else
-        log_fail "Target MAC $TARGET_MAC missing after scan ON window."
-        echo "$TESTNAME FAIL" > "$res_file"
-        exit 0
+        log_pass "At least one Bluetooth device discovered."
     fi
 else
-    if [ -n "$devices_out" ]; then
-        log_info "Devices seen by bluetoothctl after scan ON:"
-        printf '%s\n' "$devices_out" | while IFS= read -r line; do
-            [ -n "$line" ] && log_info " $line"
-        done
-        log_pass "At least one device discovered."
+    dstate_on="$(bt_get_discovering 2>/dev/null || true)"
+    [ -z "$dstate_on" ] && dstate_on="unknown"
+    log_info "Discovering state after failed scan attempts: $dstate_on"
+
+    if [ -n "$TARGET_MAC" ]; then
+        log_fail "Target MAC $TARGET_MAC missing after scan attempts."
     else
-        log_fail "No devices discovered in bluetoothctl devices after scan ON."
-        echo "$TESTNAME FAIL" > "$res_file"
-        exit 0
+        log_fail "No Bluetooth devices discovered after scan attempts."
     fi
+
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 0
 fi
 
 # -----------------------------
@@ -204,32 +228,19 @@ fi
 # -----------------------------
 log_info "Testing scan OFF..."
 if ! bt_set_scan off "$ADAPTER"; then
-    log_warn "bt_set_scan(off) returned non-zero continuing with Discovering check."
+    # bt_set_scan(off) can be flaky on minimal images; rely on poll helper
+    log_warn "bt_set_scan(off) returned non-zero; continuing with scan-off polling."
 fi
 
-SCAN_OFF_OK=0
-ITER=10
-i=1
-while [ "$i" -le "$ITER" ]; do
-    dstate_off="$(bt_get_discovering 2>/dev/null || true)"
-    [ -z "$dstate_off" ] && dstate_off="unknown"
-
-    log_info "Discovering state during scan OFF wait (iteration $i/$ITER): $dstate_off"
-
-    if [ "$dstate_off" = "no" ]; then
-        SCAN_OFF_OK=1
-        break
-    fi
-
-    sleep 2
-    i=$((i + 1))
-done
-
-if [ "$SCAN_OFF_OK" -eq 1 ]; then
-    log_pass "Discovering=no observed after scan OFF polling."
+# Use lib helper to avoid repetitive log spam and handle 'unknown' cleanly.
+if bt_scan_poll_off 10 1; then
+    # On minimal/ramdisk images bt_scan_poll_off may treat persistent 'unknown' as non-fatal.
+    log_pass "Scan OFF cleanup completed."
 else
-    log_warn "Discovering did not transition to 'no' after scan OFF window."
+    # If you keep bt_scan_poll_off strict, this may still warn; not a test failure.
+    log_warn "Scan OFF cleanup did not confirm Discovering=no (non-fatal)."
 fi
 
 echo "$TESTNAME PASS" > "$res_file"
 exit 0
+

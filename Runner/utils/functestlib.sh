@@ -147,34 +147,603 @@ check_dependencies() {
         # shellcheck disable=SC2086
         set -- $1
     fi
-
+ 
     missing=0
     missing_cmds=""
-
+ 
+    if [ -n "${TOOLS:-}" ] && [ -f "$TOOLS/lib_pkg_provider.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$TOOLS/lib_pkg_provider.sh"
+    fi
+ 
     for cmd in "$@"; do
         [ -n "$cmd" ] || continue
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            log_warn "Required command '$cmd' not found in PATH."
-            missing=1
-            missing_cmds="$missing_cmds $cmd"
+ 
+        if command -v "$cmd" >/dev/null 2>&1; then
+            continue
         fi
+ 
+        if command -v pkg_check_dependencies_recover_enabled >/dev/null 2>&1; then
+            if pkg_check_dependencies_recover_enabled; then
+                if pkg_ensure_command "$cmd"; then
+                    if command -v "$cmd" >/dev/null 2>&1; then
+                        continue
+                    fi
+                fi
+            fi
+        fi
+ 
+        log_warn "Required command '$cmd' not found in PATH."
+        missing=1
+        missing_cmds="$missing_cmds $cmd"
     done
-
+ 
     if [ "$missing" -ne 0 ]; then
         testname="${TESTNAME:-UnknownTest}"
         log_skip "$testname SKIP missing dependencies$missing_cmds"
         if [ -n "${TESTNAME:-}" ]; then
             echo "$TESTNAME SKIP" > "./$TESTNAME.res" 2>/dev/null || true
         fi
-
-        # Default: exit like today. Allow opt-out for callers that want a return code.
+ 
+        # Preserve existing escape hatch for callers that expect return code.
         if [ "${CHECK_DEPS_NO_EXIT:-0}" = "1" ]; then
             return 1
         fi
+ 
         exit 0
     fi
+ 
+    return 0
+}
+
+
+
+# Return the first matching interrupt line with usable fields.
+get_first_interrupt_line_by_name() {
+    irq_name="$1"
+
+    get_interrupt_line_by_name "$irq_name" | awk 'NF > 2 { print; exit }'
+}
+
+# Return the /proc/interrupts field number for a CPU counter.
+#
+# Header fields:
+# CPU0 CPU1 CPU2 ...
+#
+# Interrupt line fields:
+# IRQ: count0 count1 count2 ...
+#
+# Therefore the data field is header field + 1.
+get_interrupt_cpu_field() {
+    cpu_index="$1"
+
+    awk -v target="CPU${cpu_index}" '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i == target) {
+                    print i + 1
+                    exit
+                }
+            }
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Extract only CPU counter fields from an interrupt line.
+#
+# Keep this helper name because existing irq-style tests already call it.
+# This is a library API and may be called only from external run.sh files.
+# shellcheck disable=SC2317
+extract_interrupt_cpu_counts() {
+    interrupt_line="$1"
+
+    awk -v input_line="$interrupt_line" '
+        BEGIN {
+            gsub(/^[[:space:]]+/, "", input_line)
+            split(input_line, vals, /[[:space:]]+/)
+        }
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^CPU[0-9]+$/) {
+                    field = i + 1
+                    if (vals[field] ~ /^[0-9]+$/) {
+                        print vals[field]
+                    }
+                }
+            }
+            exit
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Count extracted interrupt CPU counters.
+#
+# Keep this helper name because existing irq-style tests already call it.
+# This is a library API and may be called only from external run.sh files.
+# shellcheck disable=SC2317
+count_interrupt_cpu_counts() {
+    interrupt_values="$1"
+
+    printf '%s\n' "$interrupt_values" |
+    awk 'NF { count++ } END { print count + 0 }'
+}
+
+# Return one interrupt count for one CPU.
+get_interrupt_cpu_count() {
+    irq_name="$1"
+    cpu_index="$2"
+
+    irq_field="$(get_interrupt_cpu_field "$cpu_index")"
+    irq_line="$(get_first_interrupt_line_by_name "$irq_name")"
+
+    if [ -z "$irq_field" ] || [ -z "$irq_line" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$irq_line" | awk -v field="$irq_field" '{ print $field }'
+}
+
+# Compute interrupt counter delta.
+#
+# Prints:
+# final - initial
+# -1 if final < initial, usually indicating hotplug/reset/race
+interrupt_counter_delta() {
+    initial_count="$1"
+    final_count="$2"
+
+    awk -v initial="$initial_count" -v final="$final_count" '
+        BEGIN {
+            if (final >= initial) {
+                print final - initial
+            } else {
+                print -1
+            }
+        }
+    '
+}
+
+# Compare per-CPU interrupt counters from two /proc/interrupts lines.
+#
+# Arguments:
+# $1 - initial interrupt line
+# $2 - final interrupt line
+#
+# Return:
+# 0 - all parsed per-CPU counters incremented
+# 1 - fatal parse/count mismatch
+# 2 - counters parsed, but one or more CPUs did not increment yet
+#
+# Sets globals for callers:
+# INTERRUPT_COMPARE_CPU_COUNT
+# INTERRUPT_COMPARE_INITIAL_VALUES
+# INTERRUPT_COMPARE_FINAL_VALUES
+# shellcheck disable=SC2317
+interrupt_cpu_counts_incremented() {
+    initial_line="$1"
+    final_line="$2"
+
+    INTERRUPT_COMPARE_INITIAL_VALUES="$(extract_interrupt_cpu_counts "$initial_line")"
+    INTERRUPT_COMPARE_FINAL_VALUES="$(extract_interrupt_cpu_counts "$final_line")"
+
+    initial_cpu_count="$(count_interrupt_cpu_counts "$INTERRUPT_COMPARE_INITIAL_VALUES")"
+    final_cpu_count="$(count_interrupt_cpu_counts "$INTERRUPT_COMPARE_FINAL_VALUES")"
+
+    # Export result to caller, used by Interrupts/run.sh after this helper returns.
+    # shellcheck disable=SC2034
+    INTERRUPT_COMPARE_CPU_COUNT="$initial_cpu_count"
+
+    if [ "$initial_cpu_count" -eq 0 ] || [ "$final_cpu_count" -eq 0 ]; then
+        log_fail "No per-CPU interrupt counters could be parsed from /proc/interrupts"
+        return 1
+    fi
+
+    if [ "$initial_cpu_count" -ne "$final_cpu_count" ]; then
+        log_fail "Mismatch in parsed CPU interrupt counters: initial=${initial_cpu_count} final=${final_cpu_count}"
+        return 1
+    fi
+
+    cpu_index=0
+    while [ "$cpu_index" -lt "$initial_cpu_count" ]; do
+        initial_value="$(printf '%s\n' "$INTERRUPT_COMPARE_INITIAL_VALUES" | sed -n "$((cpu_index + 1))p")"
+        final_value="$(printf '%s\n' "$INTERRUPT_COMPARE_FINAL_VALUES" | sed -n "$((cpu_index + 1))p")"
+
+        if [ "$initial_value" -ge "$final_value" ]; then
+            return 2
+        fi
+
+        cpu_index=$((cpu_index + 1))
+    done
 
     return 0
+}
+
+# Poll a named interrupt until all per-CPU counters increment.
+#
+# Arguments:
+# $1 - interrupt name/pattern, for example arch_timer
+# $2 - timeout seconds
+# $3 - poll interval seconds
+#
+# Return:
+# 0 - interrupt counters incremented on all CPUs
+# 1 - fatal error / timeout
+#
+# Sets globals for callers:
+# INTERRUPT_WAIT_INITIAL_LINE
+# INTERRUPT_WAIT_FINAL_LINE
+# INTERRUPT_WAIT_IRQ_ID
+# INTERRUPT_WAIT_ELAPSED_S
+# INTERRUPT_COMPARE_CPU_COUNT
+# INTERRUPT_COMPARE_INITIAL_VALUES
+# INTERRUPT_COMPARE_FINAL_VALUES
+# shellcheck disable=SC2317
+wait_for_interrupt_cpu_count_increment() {
+    irq_name="$1"
+    timeout_s="$2"
+    poll_interval_s="$3"
+
+    if ! is_unsigned_number "$timeout_s"; then
+        log_warn "Invalid interrupt wait timeout '${timeout_s}', using 30"
+        timeout_s=30
+    fi
+
+    if ! is_unsigned_number "$poll_interval_s"; then
+        log_warn "Invalid interrupt poll interval '${poll_interval_s}', using 2"
+        poll_interval_s=2
+    fi
+
+    if [ "$poll_interval_s" -eq 0 ]; then
+        log_warn "Interrupt poll interval cannot be 0, using 1"
+        poll_interval_s=1
+    fi
+
+    INTERRUPT_WAIT_INITIAL_LINE="$(get_first_interrupt_line_by_name "$irq_name")"
+    INTERRUPT_WAIT_FINAL_LINE=""
+    INTERRUPT_WAIT_IRQ_ID=""
+    INTERRUPT_WAIT_ELAPSED_S=0
+
+    if [ -z "$INTERRUPT_WAIT_INITIAL_LINE" ]; then
+        log_fail "Could not find interrupt line matching '${irq_name}' in /proc/interrupts"
+        return 1
+    fi
+
+    INTERRUPT_WAIT_IRQ_ID="$(printf '%s\n' "$INTERRUPT_WAIT_INITIAL_LINE" | awk '{ print $1 }')"
+
+    log_info "Initial interrupt line for '${irq_name}':"
+    log_info "$INTERRUPT_WAIT_INITIAL_LINE"
+    log_info "Polling '${irq_name}' interrupt counters, timeout=${timeout_s}s interval=${poll_interval_s}s"
+
+    waited=0
+
+    while [ "$waited" -le "$timeout_s" ]; do
+        current_line="$(get_interrupt_line_by_name "$irq_name" | awk -v irq="$INTERRUPT_WAIT_IRQ_ID" '$1 == irq { print; exit }')"
+
+        if [ -n "$current_line" ]; then
+            INTERRUPT_WAIT_FINAL_LINE="$current_line"
+
+            interrupt_cpu_counts_incremented "$INTERRUPT_WAIT_INITIAL_LINE" "$INTERRUPT_WAIT_FINAL_LINE"
+            compare_rc=$?
+
+            case "$compare_rc" in
+                0)
+                    INTERRUPT_WAIT_ELAPSED_S="$waited"
+                    log_info "Final interrupt line for '${irq_name}' after ${waited}s:"
+                    log_info "$INTERRUPT_WAIT_FINAL_LINE"
+                    return 0
+                    ;;
+                1)
+                    INTERRUPT_WAIT_ELAPSED_S="$waited"
+                    return 1
+                    ;;
+                2)
+                    :
+                    ;;
+            esac
+        else
+            log_warn "Interrupt line '${irq_name}' with IRQ ${INTERRUPT_WAIT_IRQ_ID} not found while polling"
+        fi
+
+        if [ "$waited" -ge "$timeout_s" ]; then
+            break
+        fi
+
+        sleep "$poll_interval_s"
+        waited=$((waited + poll_interval_s))
+    done
+
+    # Export result to caller, used by Interrupts/run.sh after this helper returns.
+    # shellcheck disable=SC2034
+    INTERRUPT_WAIT_ELAPSED_S="$waited"
+
+    if [ -n "$INTERRUPT_WAIT_FINAL_LINE" ]; then
+        log_info "Last interrupt line for '${irq_name}' after timeout:"
+        log_info "$INTERRUPT_WAIT_FINAL_LINE"
+    fi
+
+    log_fail "Interrupt counters for '${irq_name}' did not increment on all CPUs within ${timeout_s}s"
+    return 1
+}
+
+# Run bounded workload pinned to one CPU.
+#
+# This intentionally starts:
+# 1. a busy loop
+# 2. a sleep/wakeup loop
+#
+# Return:
+# 0 - workload was launched and stopped
+# 1 - invalid input or workload could not be launched
+# 2 - taskset is missing
+run_pinned_cpu_workload() {
+    cpu_index="$1"
+    workload_seconds="$2"
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        log_warn "taskset command is not available; cannot run pinned workload on CPU$cpu_index"
+        return 2
+    fi
+
+    if ! is_unsigned_number "$cpu_index"; then
+        log_warn "Invalid CPU index for pinned workload: ${cpu_index:-<empty>}"
+        return 1
+    fi
+
+    if ! is_unsigned_number "$workload_seconds"; then
+        log_warn "Invalid workload duration for CPU$cpu_index: ${workload_seconds:-<empty>}"
+        return 1
+    fi
+
+    if ! taskset -c "$cpu_index" sh -c 'true' >/dev/null 2>&1; then
+        log_warn "CPU$cpu_index is not schedulable with taskset"
+        return 1
+    fi
+
+    taskset -c "$cpu_index" sh -c 'while :; do :; done' >/dev/null 2>&1 &
+    busy_pid=$!
+
+    taskset -c "$cpu_index" sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+    sleeper_pid=$!
+
+    sleep "$workload_seconds"
+
+    kill "$busy_pid" "$sleeper_pid" >/dev/null 2>&1
+    wait "$busy_pid" >/dev/null 2>&1
+    wait "$sleeper_pid" >/dev/null 2>&1
+
+    return 0
+}
+
+# Log CPU topology and timer/tick diagnostics.
+#
+# Diagnostic only. Never fail based on nohz_full/isolated here.
+log_cpu_irq_diagnostics() {
+    irq_name="$1"
+
+    cpu_online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+    cpu_possible_raw="$(read_first_line /sys/devices/system/cpu/possible)"
+    cpu_isolated_raw="$(read_first_line /sys/devices/system/cpu/isolated)"
+    cpu_nohz_raw="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    log_info "CPU online list: ${cpu_online_raw:-<unavailable>}"
+    log_info "CPU possible list: ${cpu_possible_raw:-<unavailable>}"
+    log_info "CPU isolated list: ${cpu_isolated_raw:-<none>}"
+    log_info "CPU nohz_full list: ${cpu_nohz_raw:-<none>}"
+
+    if [ -r /proc/self/status ]; then
+        cpu_affinity="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status | head -n 1)"
+        log_info "Current process Cpus_allowed_list: ${cpu_affinity:-<unavailable>}"
+    fi
+
+    log_info "Detected interrupt lines matching '${irq_name}':"
+    get_interrupt_line_by_name "$irq_name" |
+    while IFS= read -r irq_line || [ -n "$irq_line" ]; do
+        [ -n "$irq_line" ] || continue
+        log_info "$irq_line"
+    done
+}
+
+# Actively validate that a named per-CPU interrupt increments while each
+# online/schedulable CPU is executing pinned workload.
+#
+# Arguments:
+# $1 - interrupt name/pattern, for example arch_timer
+# $2 - workload seconds
+# $3 - retries
+# $4 - skip isolated CPUs: 1=yes, 0=no
+#
+# Sets summary globals:
+# IRQ_ACTIVE_TESTED
+# IRQ_ACTIVE_PASSED
+# IRQ_ACTIVE_FAILED
+# IRQ_ACTIVE_SKIPPED
+# IRQ_ACTIVE_SKIP_REASON
+#
+# Return:
+# 0 - all tested CPUs passed
+# 1 - interrupt missing, no CPUs testable, or at least one tested CPU failed
+# 2 - unsupported environment, for example taskset missing
+validate_per_cpu_interrupt_active() {
+    irq_name="$1"
+    workload_seconds="$2"
+    retries="$3"
+    skip_isolated="$4"
+
+    IRQ_ACTIVE_TESTED=0
+    IRQ_ACTIVE_PASSED=0
+    IRQ_ACTIVE_FAILED=0
+    IRQ_ACTIVE_SKIPPED=0
+    IRQ_ACTIVE_SKIP_REASON=""
+
+    if [ -z "$irq_name" ]; then
+        log_fail "Interrupt name is empty"
+        return 1
+    fi
+
+    if ! is_unsigned_number "$workload_seconds"; then
+        workload_seconds=5
+    fi
+
+    if ! is_unsigned_number "$retries"; then
+        retries=2
+    fi
+
+    case "$skip_isolated" in
+        0|1)
+            ;;
+        *)
+            skip_isolated=1
+            ;;
+    esac
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+        log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+        return 2
+    fi
+
+    if [ ! -r /proc/interrupts ]; then
+        log_fail "/proc/interrupts is not readable"
+        return 1
+    fi
+
+    log_cpu_irq_diagnostics "$irq_name"
+
+    active_irq_line="$(get_first_interrupt_line_by_name "$irq_name")"
+    if [ -z "$active_irq_line" ]; then
+        log_fail "$irq_name interrupt line not found in /proc/interrupts"
+        return 1
+    fi
+
+    online_cpus="$(get_online_cpus)"
+    if [ -z "$online_cpus" ]; then
+        log_fail "No online CPUs detected"
+        return 1
+    fi
+
+    log_info "Online CPUs selected for active interrupt validation:"
+    printf '%s\n' "$online_cpus" |
+    while IFS= read -r cpu_index || [ -n "$cpu_index" ]; do
+        [ -n "$cpu_index" ] || continue
+        log_info "CPU$cpu_index"
+    done
+
+    isolated_cpus="$(read_first_line /sys/devices/system/cpu/isolated)"
+    nohz_full_cpus="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    for cpu_index in $online_cpus; do
+        log_info "Testing CPU$cpu_index '$irq_name' increment under pinned workload"
+
+        if [ "$skip_isolated" -eq 1 ] && cpu_in_list "$cpu_index" "$isolated_cpus"; then
+            log_skip "CPU$cpu_index is isolated; skipping active interrupt validation"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        if cpu_in_list "$cpu_index" "$nohz_full_cpus"; then
+            log_warn "CPU$cpu_index is listed in nohz_full; passive idle-tick assumptions are invalid"
+        fi
+
+        irq_field="$(get_interrupt_cpu_field "$cpu_index")"
+        if [ -z "$irq_field" ]; then
+            log_skip "CPU$cpu_index has no matching /proc/interrupts CPU column; skipping"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        cpu_is_schedulable "$cpu_index"
+        sched_rc=$?
+
+        if [ "$sched_rc" -eq 2 ]; then
+            IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+            log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+            return 2
+        fi
+
+        if [ "$sched_rc" -ne 0 ]; then
+            log_skip "CPU$cpu_index is not schedulable with taskset; skipping"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        IRQ_ACTIVE_TESTED=$((IRQ_ACTIVE_TESTED + 1))
+        attempt=1
+        cpu_pass=0
+
+        while [ "$attempt" -le "$retries" ]; do
+            initial_count="$(get_interrupt_cpu_count "$irq_name" "$cpu_index")"
+
+            if ! is_unsigned_number "$initial_count"; then
+                log_fail "CPU$cpu_index attempt $attempt: could not read numeric initial '$irq_name' count"
+                break
+            fi
+
+            log_info "CPU$cpu_index attempt $attempt: initial count=$initial_count"
+
+            run_pinned_cpu_workload "$cpu_index" "$workload_seconds"
+            workload_rc=$?
+
+            if [ "$workload_rc" -eq 2 ]; then
+                IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+                log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+                return 2
+            fi
+
+            if [ "$workload_rc" -ne 0 ]; then
+                log_fail "CPU$cpu_index attempt $attempt: failed to run pinned workload"
+                break
+            fi
+
+            final_count="$(get_interrupt_cpu_count "$irq_name" "$cpu_index")"
+
+            if ! is_unsigned_number "$final_count"; then
+                log_fail "CPU$cpu_index attempt $attempt: could not read numeric final '$irq_name' count"
+                break
+            fi
+
+            irq_delta="$(interrupt_counter_delta "$initial_count" "$final_count")"
+
+            log_info "CPU$cpu_index attempt $attempt: final count=$final_count delta=$irq_delta"
+
+            if awk -v delta="$irq_delta" 'BEGIN { exit !(delta > 0) }'; then
+                log_pass "CPU$cpu_index: '$irq_name' incremented under pinned workload"
+                cpu_pass=1
+                break
+            fi
+
+            if [ "$irq_delta" = "-1" ]; then
+                log_warn "CPU$cpu_index: '$irq_name' count decreased, possible CPU hotplug/reset during test"
+            else
+                log_warn "CPU$cpu_index: '$irq_name' did not increment on attempt $attempt"
+            fi
+
+            attempt=$((attempt + 1))
+
+            if [ "$attempt" -le "$retries" ]; then
+                sleep 1
+            fi
+        done
+
+        if [ "$cpu_pass" -eq 1 ]; then
+            IRQ_ACTIVE_PASSED=$((IRQ_ACTIVE_PASSED + 1))
+        else
+            log_fail "CPU$cpu_index: '$irq_name' did not increment after $retries attempt(s)"
+            IRQ_ACTIVE_FAILED=$((IRQ_ACTIVE_FAILED + 1))
+        fi
+    done
+
+    log_info "IRQ_ACTIVE_SUMMARY: tested=$IRQ_ACTIVE_TESTED passed=$IRQ_ACTIVE_PASSED failed=$IRQ_ACTIVE_FAILED skipped=$IRQ_ACTIVE_SKIPPED"
+
+    if [ "$IRQ_ACTIVE_TESTED" -eq 0 ]; then
+        log_fail "No CPUs were testable for '$irq_name'"
+        return 1
+    fi
+
+    if [ "$IRQ_ACTIVE_FAILED" -eq 0 ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 # --- Test case directory lookup ---
@@ -198,27 +767,55 @@ find_test_case_script_by_name() {
     find "$base_dir" -type d -iname "$test_name" -print -quit 2>/dev/null
 }
 
-# Check each given kernel config is set to y/m in /proc/config.gz, logs result, returns 0/1.
+# Check each given kernel config in /proc/config.gz.
+# Supported inputs:
+# CONFIG_FOO
+# passes when CONFIG_FOO is enabled as y or m
+# CONFIG_BAR=y
+# CONFIG_BAZ=m
+# passes only when the exact expected value matches
+# Logs PASS or FAIL for each config and returns 0 on success, 1 on first mismatch.
 check_kernel_config() {
     cfgs=$1
-    for config_key in $cfgs; do
+
+    if [ ! -r /proc/config.gz ]; then
+        log_fail "Kernel config source /proc/config.gz is not available"
+        return 1
+    fi
+
+    for cfg in $cfgs; do
+        [ -n "$cfg" ] || continue
+
+        case "$cfg" in
+            *=*)
+                pattern="^${cfg}$"
+                pass_msg="Kernel config matches expected value, $cfg"
+                fail_msg="Kernel config does not match expected value, required $cfg"
+                ;;
+            *)
+                pattern="^${cfg}=(y|m)$"
+                pass_msg="Kernel config $cfg is enabled"
+                fail_msg="Kernel config $cfg is missing or not enabled"
+                ;;
+        esac
+
         if command -v zgrep >/dev/null 2>&1; then
-            if zgrep -qE "^${config_key}=(y|m)" /proc/config.gz 2>/dev/null; then
-                log_pass "Kernel config $config_key is enabled"
+            if zgrep -qE "$pattern" /proc/config.gz 2>/dev/null; then
+                log_pass "$pass_msg"
             else
-                log_fail "Kernel config $config_key is missing or not enabled"
+                log_fail "$fail_msg"
                 return 1
             fi
         else
-            # Fallback if zgrep is unavailable
-            if gzip -dc /proc/config.gz 2>/dev/null | grep -qE "^${config_key}=(y|m)"; then
-                log_pass "Kernel config $config_key is enabled"
+            if gzip -dc /proc/config.gz 2>/dev/null | grep -qE "$pattern"; then
+                log_pass "$pass_msg"
             else
-                log_fail "Kernel config $config_key is missing or not enabled"
+                log_fail "$fail_msg"
                 return 1
             fi
         fi
     done
+
     return 0
 }
 
@@ -2162,39 +2759,46 @@ ethLinkDetected() {
 
 ethIsLinkUp() {
     iface=$1
+    carrier=""
+    st=""
+    ld=""
+ 
     [ -n "$iface" ] || return 1
  
-    # 1) If carrier says 1, we are good (fast path)
+    # 1) If carrier says 1, we are good.
+    # Some drivers return EINVAL while MAC/PHY attach is broken or incomplete.
+    # Suppress stderr to avoid noisy LAVA stdout.
     if [ -r "/sys/class/net/$iface/carrier" ]; then
-        [ "$(cat "/sys/class/net/$iface/carrier" 2>/dev/null)" = "1" ] && return 0
-        # If carrier is 0, do NOT return yet — fall through to other hints.
+        carrier="$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || true)"
+        [ "$carrier" = "1" ] && return 0
     fi
  
-    # 2) If helper exists and says up, accept it (but don't fail early)
+    # 2) If helper exists and says up, accept it.
     if command -v is_link_up >/dev/null 2>&1; then
-        is_link_up "$iface" && return 0
+        is_link_up "$iface" >/dev/null 2>&1 && return 0
     fi
  
-    # 3) operstate can sometimes reflect link sooner than carrier in some stacks
+    # 3) operstate can sometimes reflect link sooner than carrier.
     if [ -r "/sys/class/net/$iface/operstate" ]; then
-        st=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || true)
+        st="$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || true)"
         [ "$st" = "up" ] && return 0
     fi
  
-    # 4) ip link LOWER_UP (physical) is a good signal if ip exists
+    # 4) ip link LOWER_UP is a useful physical-link signal.
     if command -v ip >/dev/null 2>&1; then
         ip link show "$iface" 2>/dev/null | grep -qw "LOWER_UP" && return 0
     fi
  
-    # 5) Last resort: ethtool parse
+    # 5) Last resort: ethtool parse.
     if command -v ethtool >/dev/null 2>&1; then
-        ld=$(ethtool "$iface" 2>/dev/null | awk -F': ' '/^[[:space:]]*Link detected:/ {print $2; exit 0}' || true)
+        ld="$(ethtool "$iface" 2>/dev/null |
+            awk -F': ' '/^[[:space:]]*Link detected:/ {print $2; exit 0}' || true)"
         [ "$ld" = "yes" ] && return 0
     fi
  
     return 1
 }
- 
+
 ethWaitLinkUp() {
     iface=$1
     timeout_s=$2
@@ -3055,6 +3659,87 @@ check_systemd_services() {
     return 0
 }
 
+# Check whether a systemd service/unit exists on the target.
+systemd_service_exists() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl cat "$svc" >/dev/null 2>&1
+}
+
+# Check whether a systemd service/unit is currently active.
+systemd_service_is_active() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl is-active --quiet "$svc"
+}
+
+# Start a systemd service/unit quietly.
+systemd_service_start_safe() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl start "$svc" >/dev/null 2>&1
+}
+
+# Stop a systemd service/unit quietly.
+systemd_service_stop_safe() {
+    svc="$1"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    systemctl stop "$svc" >/dev/null 2>&1
+}
+
+# Log status-only output for a systemd service/unit to the given logfile.
+systemd_service_status_log() {
+    label="$1"
+    logfile="$2"
+    svc="$3"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    {
+        echo "===== $label ====="
+        systemctl --no-pager --full --lines=0 status "$svc" 2>&1
+        echo "=============================="
+    } | tee -a "$logfile"
+}
+
+# Log stdout journal entries for a systemd service/unit since a given timestamp.
+systemd_service_stdout_since() {
+    label="$1"
+    logfile="$2"
+    since_ts="$3"
+    svc="$4"
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    {
+        echo "===== $label ====="
+        journalctl --no-pager -q \
+            _SYSTEMD_UNIT="$svc" \
+            _TRANSPORT=stdout \
+            --since "$since_ts" 2>&1
+        echo "=============================="
+    } | tee -a "$logfile"
+}
 # Ensure udhcpc default.script exists, create if missing
 ensure_udhcpc_script() {
     udhcpc_dir="/usr/share/udhcpc"
@@ -3200,34 +3885,78 @@ wifi_write_wpa_conf() {
 
 # Find the first available WiFi interface (wl* or wlan0), using 'ip' or 'ifconfig'.
 # Prints the interface name, or returns non-zero if not found.
+# Discover the most likely WiFi netdev using override, iw, sysfs markers,
+# nmcli, and legacy name-based fallbacks while preserving existing behavior.
 get_wifi_interface() {
     WIFI_IF=""
 
-    # Prefer 'ip' if available.
-    if command -v ip >/dev/null 2>&1; then
-        WIFI_IF=$(ip link | awk -F: '/ wl/ {print $2}' | tr -d ' ' | head -n1)
-        if [ -z "$WIFI_IF" ]; then
-            WIFI_IF=$(ip link | awk -F: '/^[0-9]+: wl/ {print $2}' | tr -d ' ' | head -n1)
-        fi
-        if [ -z "$WIFI_IF" ] && ip link show wlan0 >/dev/null 2>&1; then
-            WIFI_IF="wlan0"
-        fi
-    else
-        # Fallback to 'ifconfig' if 'ip' is missing.
-        if command -v ifconfig >/dev/null 2>&1; then
-            WIFI_IF=$(ifconfig -a 2>/dev/null | grep -o '^wl[^:]*' | head -n1)
-            if [ -z "$WIFI_IF" ] && ifconfig wlan0 >/dev/null 2>&1; then
-                WIFI_IF="wlan0"
+    if [ -n "${WIFI_IFACE:-}" ]; then
+        if command -v ip >/dev/null 2>&1; then
+            if ip link show "$WIFI_IFACE" >/dev/null 2>&1; then
+                printf '%s\n' "$WIFI_IFACE"
+                return 0
             fi
         fi
     fi
 
-    if [ -n "$WIFI_IF" ]; then
-        echo "$WIFI_IF"
-        return 0
-    else
-        return 1
+    if command -v iw >/dev/null 2>&1; then
+        WIFI_IF="$(iw dev 2>/dev/null | awk '
+            $1 == "Interface" && $2 !~ /^p2p-dev-/ {
+                print $2
+                exit
+            }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
     fi
+
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        WIFI_IF="$(basename "$n")"
+
+        if [ "$WIFI_IF" = "lo" ]; then
+            continue
+        fi
+
+        if [ -d "$n/wireless" ] || [ -e "$n/phy80211" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+    done
+
+    if command -v nmcli >/dev/null 2>&1; then
+        WIFI_IF="$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '
+            $2 == "wifi" {
+                print $1
+                exit
+            }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        WIFI_IF="$(ip -o link show 2>/dev/null | awk -F': ' '
+            $2 ~ /^wlan[0-9]+$/ { print $2; exit }
+            $2 ~ /^wl[[:alnum:]_.-]*$/ { print $2; exit }
+            $2 ~ /^ath[[:alnum:]_.-]*$/ { print $2; exit }
+        ')"
+        if [ -n "$WIFI_IF" ]; then
+            printf '%s\n' "$WIFI_IF"
+            return 0
+        fi
+
+        if ip link show wlan0 >/dev/null 2>&1; then
+            printf '%s\n' "wlan0"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 # Auto-detect eMMC block device (non-removable, not UFS)
@@ -4334,91 +5063,201 @@ ensure_network_online() {
     return 1
 }
 
+# Return the first numeric token found in input (helps when tools return multi-PID / noisy output)
+sanitize_pid() {
+    # Return first numeric token from input (single PID) or empty
+    printf '%s' "$1" \
+      | tr -d '\r' \
+      | tr -c '0-9 \n' ' ' \
+      | awk '{print $1; exit}'
+}
+
+get_pids_by_name() {
+    name="$1"
+ 
+    if [ -z "$name" ]; then
+        return 1
+    fi
+ 
+    # Print one PID per line (sanitized), for all processes whose basename matches $name
+    ps -ef 2>/dev/null | awk -v n="$name" '
+        NR==1 { next }
+        {
+            cmd=$8
+            sub(".*/", "", cmd)
+            if (cmd == n) { print $2 }
+        }' | while IFS= read -r p; do
+            p_clean=$(sanitize_pid "$p")
+            if [ -n "$p_clean" ]; then
+                printf '%s\n' "$p_clean"
+            fi
+        done
+}
+ 
+# get_one_pid_by_name <name> [all]
+#
+# Without 'all': prints the lowest (oldest) matching PID, returns 1 if none found.
+# With 'all':    prints all matching PIDs space-separated, returns 1 if none found.
+#
+# Note: /proc/<pid>/comm is truncated to 15 chars by the kernel.
+get_one_pid_by_name() {
+    gopn_name="$1"
+    gopn_mode="${2:-}"
+    gopn_pids=""
+    gopn_first_pid=""
+ 
+    for gopn_d in /proc/[0-9]*; do
+        [ -r "$gopn_d/comm" ] || continue
+        gopn_comm=$(tr -d '\r\n' <"$gopn_d/comm" 2>/dev/null)
+        [ "$gopn_comm" = "$gopn_name" ] || continue
+ 
+        gopn_pid=${gopn_d#/proc/}
+        gopn_pid=$(sanitize_pid "$gopn_pid")
+        [ -n "$gopn_pid" ] || continue
+ 
+        if [ -z "$gopn_first_pid" ] || [ "$gopn_pid" -lt "$gopn_first_pid" ]; then
+            gopn_first_pid="$gopn_pid"
+        fi
+ 
+        if [ -z "$gopn_pids" ]; then
+            gopn_pids="$gopn_pid"
+        else
+            gopn_pids="$gopn_pids $gopn_pid"
+        fi
+    done
+ 
+    [ -n "$gopn_pids" ] || return 1
+ 
+    if [ "$gopn_mode" = "all" ]; then
+        printf '%s\n' "$gopn_pids"
+    else
+        printf '%s\n' "$gopn_first_pid"
+    fi
+}
+
+# Wait until PID is alive (kill -0 succeeds) or timeout seconds elapse.
+wait_pid_alive() {
+    pid="$1"
+    timeout="${2:-10}"
+ 
+    pid=$(sanitize_pid "$pid")
+    case "$pid" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+ 
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Kill process for the given PID
 kill_process() {
     PID="$1"
     KILL_TERM_GRACE="${KILL_TERM_GRACE:-5}"
     KILL_KILL_GRACE="${KILL_KILL_GRACE:-5}"
     SELF_PID="$$"
-
+ 
+    case "$PID" in
+        ''|*[!0-9]*)
+            log_warn "Refusing to kill non-numeric PID '$PID'"
+            return 1
+            ;;
+    esac
+ 
     # Safety checks
     if [ "$PID" -eq 1 ] || [ "$PID" -eq "$SELF_PID" ]; then
         log_warn "Refusing to kill PID $PID (init or self)"
         return 1
     fi
-
-    # Check if process exists
+ 
     if ! kill -0 "$PID" 2>/dev/null; then
         log_info "Process $PID not running"
         return 0
     fi
-
+ 
     log_info "Sending SIGTERM to PID $PID"
     kill -TERM "$PID" 2>/dev/null
     sleep "$KILL_TERM_GRACE"
-
+ 
     if kill -0 "$PID" 2>/dev/null; then
         log_info "Sending SIGKILL to PID $PID"
         kill -KILL "$PID" 2>/dev/null
         sleep "$KILL_KILL_GRACE"
     fi
-
-    # Final check
+ 
     if kill -0 "$PID" 2>/dev/null; then
         log_warn "Failed to kill process $PID"
         return 1
-    else
-        log_info "Process $PID terminated successfully"
-        return 0
     fi
+ 
+    log_info "Process $PID terminated successfully"
+    return 0
 }
 
+# is_process_running <name>
+#
+# Checks whether a process with the given <name> is currently running.
+#
+# Behavior:
+#  - Returns 0 if at least one matching process exists; returns 1 otherwise.
+#  - Logs a clear status line:
+#       "Process '<name>' is running."  OR  "Process '<name>' is not running."
+#  - Uses get_one_pid_by_name "<name>" all to gather *all* matching PIDs.
+#  - If multiple instances exist, logs the PID list as a summary.
 is_process_running() {
-    if [ -z "$1" ]; then
-        log_info "Usage: is_running <process_name_or_pid>"
+    ipr_name="$1"
+ 
+    ipr_pids=$(get_one_pid_by_name "$ipr_name" all 2>/dev/null) || {
+        log_info "Process '$ipr_name' is not running."
         return 1
-    fi
+    }
  
-    input="$1"
-    case "$input" in
-    ''|*[!0-9]*)
-        # Non-numeric input: treat as process name
-        found=0
+    log_info "Process '$ipr_name' is running."
  
-        # Prefer pgrep if available (ShellCheck-friendly, efficient)
-        if command -v pgrep >/dev/null 2>&1; then
-            if pgrep -x "$input" >/dev/null 2>&1; then
-                found=1
-            fi
-        else
-            # POSIX fallback: avoid 'ps | grep' to silence SC2009
-            # Match as a separate word to mimic 'grep -w'
-            if ps -e 2>/dev/null | awk -v name="$input" '
-                $0 ~ ("(^|[[:space:]])" name "([[:space:]]|$)") { exit 0 }
-                END { exit 1 }
-            '; then
-                found=1
-            fi
-        fi
- 
-        if [ "$found" -eq 1 ]; then
-            log_info "Process '$input' is running."
-            return 0
-        else
-            log_info "Process '$input' is not running."
-            return 1
-        fi
-        ;;
-    *)
-        # Numeric input: treat as PID
-        if kill -0 "$input" 2>/dev/null; then
-            log_info "Process with PID $input is running."
-            return 0
-        else
-            log_info "Process with PID $input is not running."
-            return 1
-        fi
-        ;;
+    # Extra summary only if multiple instances exist
+    case "$ipr_pids" in
+        *" "*)
+            log_info "Process '$ipr_name' instances: $ipr_pids"
+            ;;
     esac
+ 
+    # Always print PID -> cmdline/comm for CI debug (single or multiple)
+    # ShellCheck-safe iteration: split spaces to newlines.
+    printf '%s\n' "$ipr_pids" | tr ' ' '\n' | while IFS= read -r ipr_pid; do
+        ipr_pid=$(sanitize_pid "$ipr_pid")
+        [ -n "$ipr_pid" ] || continue
+ 
+        # PID may have exited between collection and inspection
+        if [ ! -d "/proc/$ipr_pid" ]; then
+            log_info "Process '$ipr_name' PID $ipr_pid is no longer present in /proc"
+            continue
+        fi
+ 
+        ipr_cmd=""
+        if [ -r "/proc/$ipr_pid/cmdline" ]; then
+            ipr_cmd=$(tr '\000' ' ' <"/proc/$ipr_pid/cmdline" 2>/dev/null)
+        fi
+ 
+        if [ -n "$ipr_cmd" ]; then
+            log_info "Process '$ipr_name' PID $ipr_pid cmdline: $ipr_cmd"
+        else
+            ipr_comm=""
+            if [ -r "/proc/$ipr_pid/comm" ]; then
+                ipr_comm=$(tr -d '\r\n' <"/proc/$ipr_pid/comm" 2>/dev/null)
+            fi
+            log_info "Process '$ipr_name' PID $ipr_pid comm: ${ipr_comm:-unknown}"
+        fi
+    done
+ 
+    return 0
 }
 
 get_pid() {
@@ -4426,20 +5265,1186 @@ get_pid() {
         log_info "Usage: get_pid <process_name>"
         return 1
     fi
-    
+
     process_name="$1"
-    
-    # Try multiple ps variants for compatibility
-    pid=$(ps -e | awk -v name="$process_name" '$NF == name { print $1 }')
-    [ -z "$pid" ] && pid=$(ps -A | awk -v name="$process_name" '$NF == name { print $1 }')
-    [ -z "$pid" ] && pid=$(ps -aux | awk -v name="$process_name" '$11 == name { print $2 }')
-    [ -z "$pid" ] && pid=$(ps -ef | awk -v name="$process_name" '$NF == name { print $2 }')
-    
+    pid=""
+
+    # Prefer pgrep if available (fast + clean)
+    if command -v pgrep >/dev/null 2>&1; then
+        pid=$(pgrep -x "$process_name" 2>/dev/null | awk 'NR==1 {print; exit}')
+    fi
+
+    # POSIX fallback: ps
+    if [ -z "$pid" ]; then
+        pid=$(ps -e 2>/dev/null | awk -v name="$process_name" '$NF == name { print $1; exit }')
+    fi
+
     if [ -n "$pid" ]; then
-        echo "$pid"
+        printf '%s\n' "$pid"
         return 0
+    fi
+
+    log_info "Process '$process_name' not found."
+    return 1
+}
+
+# Returns the size of the given file in bytes using stat, with fallbacks for portability across systems.
+# Prints 0 and returns failure if the file does not exist or the size cannot be determined reliably.
+file_size_bytes() {
+  file_path="$1"
+  size=""
+
+  [ -f "$file_path" ] || {
+    printf '%s\n' "0"
+    return 1
+  }
+
+  # Prefer GNU stat first.
+  size="$(stat -c %s "$file_path" 2>/dev/null || true)"
+  case "$size" in
+    ''|*[!0-9]*)
+      size=""
+      ;;
+  esac
+
+  # Fall back to BSD stat only if GNU form did not work.
+  if [ -z "$size" ]; then
+    size="$(stat -f %z "$file_path" 2>/dev/null || true)"
+    case "$size" in
+      ''|*[!0-9]*)
+        size=""
+        ;;
+    esac
+  fi
+
+  # Final portable fallback.
+  if [ -z "$size" ]; then
+    size="$(wc -c <"$file_path" 2>/dev/null | awk '{print $1}')"
+    case "$size" in
+      ''|*[!0-9]*)
+        size=""
+        ;;
+    esac
+  fi
+
+  if [ -z "$size" ]; then
+    printf '%s\n' "0"
+    return 1
+  fi
+
+  printf '%s\n' "$size"
+  return 0
+}
+
+# Return the first /proc/interrupts line matching the given pattern.
+# Prints the full line and returns 0 on success, 1 if no match is found.
+get_interrupt_line_by_name() {
+    pattern="$1"
+    [ -n "$pattern" ] || return 1
+    grep "$pattern" /proc/interrupts 2>/dev/null | head -n 1
+}
+
+# Extract only numeric per-CPU interrupt counters from a /proc/interrupts line.
+# Prints one counter per line, stopping at the first non-numeric token after the IRQ field.
+extract_interrupt_cpu_counts() {
+    printf '%s\n' "$1" | awk '
+        {
+            seen_irq = 0
+            for (i = 1; i <= NF; i++) {
+                if (seen_irq == 0) {
+                    if ($i ~ /:$/) {
+                        seen_irq = 1
+                    }
+                    continue
+                }
+                if ($i ~ /^[0-9]+$/) {
+                    print $i
+                } else {
+                    break
+                }
+            }
+        }
+    '
+}
+
+# Count extracted per-CPU interrupt counters.
+# Prints the count as a decimal integer.
+count_interrupt_cpu_counts() {
+    printf '%s\n' "$1" | awk 'NF { c++ } END { print c + 0 }'
+}
+
+# ---------------------------------------------------------------------------
+# Partition / mount validation helpers
+# ---------------------------------------------------------------------------
+
+# Check whether a mountpoint exists in /proc/mounts.
+partition_mount_exists() {
+    part_path="$1"
+
+    [ -n "$part_path" ] || return 1
+    [ -r /proc/mounts ] || return 1
+
+    awk -v p="$part_path" '
+        $2 == p { found=1; exit }
+        END { exit(found ? 0 : 1) }
+    ' /proc/mounts 2>/dev/null
+}
+
+# Print the mount source for a mountpoint.
+partition_get_mount_source() {
+    part_path="$1"
+
+    [ -n "$part_path" ] || return 1
+    [ -r /proc/mounts ] || return 1
+
+    awk -v p="$part_path" '
+        $2 == p { print $1; exit }
+    ' /proc/mounts 2>/dev/null
+}
+
+# Print the filesystem type for a mountpoint.
+partition_get_mount_fstype() {
+    part_path="$1"
+
+    [ -n "$part_path" ] || return 1
+    [ -r /proc/mounts ] || return 1
+
+    awk -v p="$part_path" '
+        $2 == p { print $3; exit }
+    ' /proc/mounts 2>/dev/null
+}
+
+# Print the mount options for a mountpoint.
+partition_get_mount_options() {
+    part_path="$1"
+
+    [ -n "$part_path" ] || return 1
+    [ -r /proc/mounts ] || return 1
+
+    awk -v p="$part_path" '
+        $2 == p { print $4; exit }
+    ' /proc/mounts 2>/dev/null
+}
+
+# Log platform details using existing helpers where available.
+partition_log_platform_details() {
+    log_info "----- Partition platform details -----"
+
+    if command -v detect_platform >/dev/null 2>&1; then
+        detect_platform >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${PLATFORM_MACHINE:-}" ]; then
+        log_info "Platform machine: ${PLATFORM_MACHINE}"
+    fi
+    if [ -n "${PLATFORM_TARGET:-}" ]; then
+        log_info "Platform target: ${PLATFORM_TARGET}"
+    fi
+    if [ -n "${PLATFORM_OS_NAME:-}" ]; then
+        log_info "Platform OS: ${PLATFORM_OS_NAME}"
+    fi
+    if [ -n "${PLATFORM_KERNEL:-}" ]; then
+        log_info "Platform kernel: ${PLATFORM_KERNEL}"
     else
-        log_info "Process '$process_name' not found."
+        log_info "Platform kernel: $(uname -r 2>/dev/null)"
+    fi
+    if [ -n "${PLATFORM_ARCH:-}" ]; then
+        log_info "Platform arch: ${PLATFORM_ARCH}"
+    else
+        log_info "Platform arch: $(uname -m 2>/dev/null)"
+    fi
+
+    if command -v log_soc_info >/dev/null 2>&1; then
+        log_soc_info || true
+    fi
+
+    log_info "----- End partition platform details -----"
+}
+
+# Log mount/storage inventory for post-boot debug visibility.
+partition_log_mount_inventory() {
+    log_info "----- Partition / mount inventory -----"
+
+    if command -v findmnt >/dev/null 2>&1; then
+        log_info "findmnt output:"
+        findmnt -R / 2>/dev/null | while IFS= read -r line; do
+            [ -n "$line" ] && log_info "[findmnt] $line"
+        done
+    else
+        log_warn "findmnt not available"
+    fi
+
+    if [ -r /proc/mounts ]; then
+        log_info "/proc/mounts output:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && log_info "[mounts] $line"
+        done < /proc/mounts
+    else
+        log_warn "/proc/mounts not readable"
+    fi
+
+    if command -v lsblk >/dev/null 2>&1; then
+        log_info "lsblk output:"
+        lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT,PARTLABEL,UUID 2>/dev/null | while IFS= read -r line; do
+            [ -n "$line" ] && log_info "[lsblk] $line"
+        done
+    else
+        log_warn "lsblk not available"
+    fi
+
+    if command -v blkid >/dev/null 2>&1; then
+        log_info "blkid output:"
+        blkid 2>/dev/null | while IFS= read -r line; do
+            [ -n "$line" ] && log_info "[blkid] $line"
+        done
+    else
+        log_warn "blkid not available"
+    fi
+
+    log_info "----- End partition / mount inventory -----"
+}
+
+# Log failed mount/fs related systemd units. Return 1 if any are failed.
+partition_systemd_mount_failures() {
+    part_found_failed=0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "systemctl not available; skipping failed mount/fs unit scan"
+        return 0
+    fi
+
+    systemctl --failed --no-legend --plain 2>/dev/null | while IFS= read -r line; do
+        unit_name=$(printf '%s\n' "$line" | awk '{print $1}')
+        [ -n "$unit_name" ] || continue
+
+        case "$unit_name" in
+            *.mount|systemd-fsck*|local-fs.target|local-fs-pre.target)
+                log_warn "Failed systemd mount/fs unit: $line"
+                printf '%s\n' "$unit_name"
+                ;;
+        esac
+    done > /tmp/partition_failed_units.$$ 2>/dev/null
+
+    if [ -s /tmp/partition_failed_units.$$ ]; then
+        part_found_failed=1
+    fi
+    rm -f /tmp/partition_failed_units.$$ 2>/dev/null || true
+
+    if [ "$part_found_failed" -eq 1 ]; then
         return 1
+    fi
+
+    return 0
+}
+
+# Check overall systemd readiness.
+# Args:
+# $1 = allow_degraded (0/1, default 0)
+partition_systemd_is_ready() {
+    part_allow_degraded="${1:-0}"
+    part_state=""
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "systemctl not available; skipping systemd readiness check"
+        return 0
+    fi
+
+    part_state="$(systemctl is-system-running 2>/dev/null || true)"
+    [ -n "$part_state" ] || part_state="unknown"
+
+    case "$part_state" in
+        running)
+            log_info "systemd state: $part_state"
+            return 0
+            ;;
+        degraded)
+            if [ "$part_allow_degraded" = "1" ]; then
+                log_warn "systemd state: $part_state (accepted)"
+                return 0
+            fi
+            log_fail "systemd state: $part_state"
+            return 1
+            ;;
+        *)
+            log_fail "systemd state: $part_state"
+            return 1
+            ;;
+    esac
+}
+
+# Validate the system is boot-ready enough for partition checks.
+# Args:
+# $1 = allow_degraded (0/1, default 0)
+# $2 = require_boot_ready (0/1, default 1)
+# $3 = require_systemd (0/1, default 0)
+partition_check_boot_ready() {
+    part_allow_degraded="${1:-0}"
+    part_require_boot_ready="${2:-1}"
+    part_require_systemd="${3:-0}"
+
+    log_info "----- Boot readiness check -----"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [ "$part_require_systemd" = "1" ]; then
+            log_fail "systemctl not available but systemd readiness is required"
+            return 1
+        fi
+        log_info "systemctl not available; boot readiness check skipped"
+        return 0
+    fi
+
+    if ! partition_systemd_is_ready "$part_allow_degraded"; then
+        return 1
+    fi
+
+    if command -v systemd_service_exists >/dev/null 2>&1; then
+        if systemd_service_exists local-fs.target; then
+            if command -v systemd_service_is_active >/dev/null 2>&1; then
+                if ! systemd_service_is_active local-fs.target; then
+                    log_fail "local-fs.target is not active"
+                    return 1
+                fi
+                log_info "local-fs.target is active"
+            fi
+        fi
+    fi
+
+    if [ "$part_require_boot_ready" = "1" ]; then
+        if systemctl list-jobs --no-legend 2>/dev/null | grep -q '\.mount'; then
+            log_warn "Pending systemd mount jobs are still present"
+        fi
+    fi
+
+    if ! partition_systemd_mount_failures; then
+        log_fail "One or more mount/fs-related systemd units are failed"
+        return 1
+    fi
+
+    log_info "----- End boot readiness check -----"
+    return 0
+}
+
+# Trigger an autofs mountpoint by touching the path in a non-destructive way.
+partition_trigger_autofs() {
+    part_path="$1"
+
+    [ -n "$part_path" ] || return 1
+
+    log_info "Triggering autofs path: $part_path"
+
+    if [ ! -e "$part_path" ]; then
+        log_fail "Autofs trigger path does not exist: $part_path"
+        return 1
+    fi
+
+    if [ -d "$part_path" ]; then
+        ls "$part_path" >/dev/null 2>&1 || true
+        stat "$part_path" >/dev/null 2>&1 || true
+    else
+        stat "$part_path" >/dev/null 2>&1 || true
+    fi
+
+    if [ ! -r "$part_path" ] && [ ! -x "$part_path" ] && [ ! -d "$part_path" ]; then
+        log_fail "Autofs trigger path is not accessible: $part_path"
+        return 1
+    fi
+
+    sleep 1
+    return 0
+}
+
+# Non-destructive RW probe for a mountpoint.
+partition_check_rw() {
+    part_path="$1"
+    part_testfile=""
+    part_now=""
+
+    [ -n "$part_path" ] || return 1
+    [ -d "$part_path" ] || {
+        log_fail "RW probe path is not a directory: $part_path"
+        return 1
+    }
+
+    part_now="$(date +%s 2>/dev/null || echo 0)"
+    part_testfile="$part_path/.partition_rw_test_${part_now}_$$"
+
+    if ! ( umask 077 && printf 'partition-rw-test\n' > "$part_testfile" ); then
+        log_fail "RW probe write failed at $part_path"
+        return 1
+    fi
+
+    sync >/dev/null 2>&1 || true
+
+    if [ ! -f "$part_testfile" ]; then
+        log_fail "RW probe file was not created at $part_path"
+        return 1
+    fi
+
+    if ! rm -f "$part_testfile" 2>/dev/null; then
+        log_fail "RW probe cleanup failed at $part_path"
+        return 1
+    fi
+
+    log_info "RW probe passed at $part_path"
+    return 0
+}
+
+# Validate a single mount entry.
+# Args:
+# $1 = path
+# $2 = expected fs regex (ex: ext4|erofs|autofs|vfat)
+# $3 = rw required (0/1)
+# $4 = autofs trigger (0/1)
+partition_validate_mount() {
+    part_path="$1"
+    part_expected_fs="$2"
+    part_rw_required="${3:-0}"
+    part_autofs_trigger="${4:-0}"
+
+    part_src_before=""
+    part_fs_before=""
+    part_opts_before=""
+    part_src_after=""
+    part_fs_after=""
+    part_opts_after=""
+    part_fs_ok=0
+
+    [ -n "$part_path" ] || {
+        log_fail "partition_validate_mount: empty mount path"
+        return 1
+    }
+
+    if ! partition_mount_exists "$part_path"; then
+        log_fail "Required mountpoint is missing: $part_path"
+        return 1
+    fi
+
+    part_src_before="$(partition_get_mount_source "$part_path" 2>/dev/null)"
+    part_fs_before="$(partition_get_mount_fstype "$part_path" 2>/dev/null)"
+    part_opts_before="$(partition_get_mount_options "$part_path" 2>/dev/null)"
+
+    log_info "Mount before validation: path=$part_path source=${part_src_before:-unknown} fstype=${part_fs_before:-unknown} opts=${part_opts_before:-unknown}"
+
+    if [ "$part_autofs_trigger" = "1" ] || [ "$part_fs_before" = "autofs" ]; then
+        if ! partition_trigger_autofs "$part_path"; then
+            log_fail "Autofs trigger failed for $part_path"
+            return 1
+        fi
+    fi
+
+    part_src_after="$(partition_get_mount_source "$part_path" 2>/dev/null)"
+    part_fs_after="$(partition_get_mount_fstype "$part_path" 2>/dev/null)"
+    part_opts_after="$(partition_get_mount_options "$part_path" 2>/dev/null)"
+
+    log_info "Mount after validation: path=$part_path source=${part_src_after:-unknown} fstype=${part_fs_after:-unknown} opts=${part_opts_after:-unknown}"
+
+    if [ -n "$part_expected_fs" ]; then
+        if printf '%s\n' "$part_fs_before" | grep -Eq "^(${part_expected_fs})$"; then
+            part_fs_ok=1
+        fi
+        if printf '%s\n' "$part_fs_after" | grep -Eq "^(${part_expected_fs})$"; then
+            part_fs_ok=1
+        fi
+
+        if [ "$part_fs_ok" -ne 1 ]; then
+            log_fail "Filesystem type mismatch for $part_path: expected=(${part_expected_fs}) actual_before=${part_fs_before:-unknown} actual_after=${part_fs_after:-unknown}"
+            return 1
+        fi
+    fi
+
+    if [ "$part_rw_required" = "1" ]; then
+        if ! printf '%s\n' "$part_opts_after" | grep -Eq '(^|,)rw(,|$)'; then
+            if ! printf '%s\n' "$part_opts_before" | grep -Eq '(^|,)rw(,|$)'; then
+                log_fail "Mountpoint is not RW as required: $part_path"
+                return 1
+            fi
+        fi
+
+        if ! partition_check_rw "$part_path"; then
+            return 1
+        fi
+    fi
+
+    log_pass "Mount validation passed: $part_path"
+    return 0
+}
+
+# Validate a semicolon-separated mount matrix.
+# Entry format:
+# /path:fs1,fs2:rw_required:autofs_trigger
+# Example:
+# /efi:autofs,vfat:0:1;/var/lib/tee:ext4:1:0
+partition_validate_mount_matrix() {
+    part_matrix="$1"
+    part_fail_count=0
+    part_entry=""
+    part_path=""
+    part_expected=""
+    part_rw_required=""
+    part_autofs_trigger=""
+    oldifs="$IFS"
+
+    if [ -z "$part_matrix" ]; then
+        log_fail "partition_validate_mount_matrix: empty mount matrix"
+        return 1
+    fi
+
+    IFS=';'
+    for part_entry in $part_matrix; do
+        [ -n "$part_entry" ] || continue
+
+        part_path="$(printf '%s\n' "$part_entry" | awk -F: '{print $1}')"
+        part_expected="$(printf '%s\n' "$part_entry" | awk -F: '{print $2}')"
+        part_rw_required="$(printf '%s\n' "$part_entry" | awk -F: '{print $3}')"
+        part_autofs_trigger="$(printf '%s\n' "$part_entry" | awk -F: '{print $4}')"
+
+        [ -n "$part_path" ] || continue
+
+        if [ -z "$part_rw_required" ]; then
+            part_rw_required="0"
+        fi
+        if [ -z "$part_autofs_trigger" ]; then
+            part_autofs_trigger="0"
+        fi
+
+        part_expected="$(printf '%s\n' "$part_expected" | tr ',' '|')"
+
+        log_info "Validating mount matrix entry: path=$part_path expected_fs=${part_expected:-<any>} rw_required=$part_rw_required autofs_trigger=$part_autofs_trigger"
+
+        if ! partition_validate_mount "$part_path" "$part_expected" "$part_rw_required" "$part_autofs_trigger"; then
+            part_fail_count=$((part_fail_count + 1))
+        fi
+    done
+    IFS="$oldifs"
+
+    if [ "$part_fail_count" -ne 0 ]; then
+        log_fail "Partition mount matrix validation failed for $part_fail_count entry(s)"
+        return 1
+    fi
+
+    log_pass "Partition mount matrix validation passed"
+    return 0
+}
+
+# Scan mount/storage related dmesg using existing scan_dmesg_errors().
+# Returns 0 when clean, 1 when relevant errors are found.
+partition_scan_mount_dmesg() {
+    part_log_dir="$1"
+
+    if [ -z "$part_log_dir" ]; then
+        part_log_dir="."
+    fi
+
+    mkdir -p "$part_log_dir" 2>/dev/null || true
+
+    if ! command -v scan_dmesg_errors >/dev/null 2>&1; then
+        log_warn "scan_dmesg_errors not available; skipping partition dmesg scan"
+        return 0
+    fi
+
+    log_info "Scanning dmesg for mount/storage/filesystem issues"
+
+    if scan_dmesg_errors \
+        "$part_log_dir" \
+        "EXT4-fs .*|F2FS-fs .*|BTRFS .*|XFS .*|VFS.*|systemd-fsck.*|erofs.*" \
+        "dummy regulator|supply [^ ]+ not found|using dummy regulator"
+    then
+        log_fail "Relevant mount/storage/filesystem dmesg errors were found"
+        return 1
+    fi
+
+    log_info "No relevant mount/storage/filesystem dmesg errors were found"
+    return 0
+}
+
+# Log the current mount inventory in a CI-friendly format.
+# Prefers findmnt, falls back to /proc/mounts, then mount(8).
+partition_log_current_mounts() {
+    log_info "----- Current mount inventory -----"
+
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | \
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                log_info "[mount] $line"
+            fi
+        done
+        log_info "----- End current mount inventory -----"
+        return 0
+    fi
+
+    if [ -r /proc/mounts ]; then
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                log_info "[mount] $line"
+            fi
+        done < /proc/mounts
+        log_info "----- End current mount inventory -----"
+        return 0
+    fi
+
+    if command -v mount >/dev/null 2>&1; then
+        mount 2>/dev/null | while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                log_info "[mount] $line"
+            fi
+        done
+        log_info "----- End current mount inventory -----"
+        return 0
+    fi
+
+    log_warn "Unable to log current mount inventory"
+    log_info "----- End current mount inventory -----"
+    return 1
+}
+
+# Log block device and partition inventory for post-boot validation.
+# Uses lsblk for topology and blkid for filesystem metadata.
+partition_log_block_devices() {
+    log_info "----- Block device inventory -----"
+
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT,LABEL,PARTLABEL,UUID 2>/dev/null | \
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                log_info "[lsblk] $line"
+            fi
+        done
+    else
+        log_warn "lsblk not available for block device inventory"
+    fi
+
+    if command -v blkid >/dev/null 2>&1; then
+        blkid 2>/dev/null | while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                log_info "[blkid] $line"
+            fi
+        done
+    else
+        log_warn "blkid not available for block device inventory"
+    fi
+
+    log_info "----- End block device inventory -----"
+    return 0
+}
+
+###############################################################################
+# CPU hotplug validation helpers
+###############################################################################
+# Return 0 if the input is an unsigned decimal number.
+# shellcheck disable=SC2317
+is_unsigned_number() {
+    value="$1"
+
+    case "$value" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Read the first line from a sysfs/procfs file.
+# shellcheck disable=SC2317
+read_first_line() {
+    file="$1"
+
+    if [ -r "$file" ]; then
+        sed -n '1p' "$file" 2>/dev/null
+    fi
+}
+
+# Expand Linux CPU list format.
+#
+# Input examples:
+# 0-7
+# 0,2-3,5
+#
+# Output:
+# one CPU index per line
+# shellcheck disable=SC2317
+expand_cpu_list() {
+    list="$1"
+
+    printf '%s\n' "$list" | tr ',' '\n' |
+    while IFS= read -r range || [ -n "$range" ]; do
+        [ -n "$range" ] || continue
+
+        case "$range" in
+            *-*)
+                start="${range%-*}"
+                end="${range#*-}"
+
+                if ! is_unsigned_number "$start" || ! is_unsigned_number "$end"; then
+                    continue
+                fi
+
+                cpu="$start"
+                while [ "$cpu" -le "$end" ]; do
+                    printf '%s\n' "$cpu"
+                    cpu=$((cpu + 1))
+                done
+                ;;
+            *)
+                if is_unsigned_number "$range"; then
+                    printf '%s\n' "$range"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Return 0 if a CPU is listed in a Linux CPU list.
+# shellcheck disable=SC2317
+cpu_in_list() {
+    cpu="$1"
+    list="$2"
+
+    [ -n "$list" ] || return 1
+
+    expand_cpu_list "$list" | grep -qx "$cpu"
+}
+
+# Return online CPUs, one CPU index per line.
+# shellcheck disable=SC2317
+get_online_cpus() {
+    online="$(read_first_line /sys/devices/system/cpu/online)"
+
+    if [ -n "$online" ]; then
+        expand_cpu_list "$online"
+        return 0
+    fi
+
+    awk '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^CPU[0-9]+$/) {
+                    cpu = $i
+                    sub(/^CPU/, "", cpu)
+                    print cpu
+                }
+            }
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Return 0 if taskset can schedule a trivial task on the CPU.
+#
+# Return:
+# 0 - CPU is schedulable
+# 1 - taskset exists, but CPU is not schedulable
+# 2 - taskset is missing
+# shellcheck disable=SC2317
+cpu_is_schedulable() {
+    cpu="$1"
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        log_warn "taskset command is not available; cannot verify CPU$cpu schedulability"
+        return 2
+    fi
+
+    if taskset -c "$cpu" sh -c 'true' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Return CPU online control path.
+# shellcheck disable=SC2317
+cpu_hotplug_control_file() {
+    cpu_index="$1"
+
+    printf '%s\n' "/sys/devices/system/cpu/cpu${cpu_index}/online"
+}
+
+# Return 0 if CPU appears in current online CPU mask.
+# shellcheck disable=SC2317
+cpu_hotplug_in_online_mask() {
+    cpu_index="$1"
+    online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+
+    cpu_in_list "$cpu_index" "$online_raw"
+}
+
+# Read cpuX/online state.
+# shellcheck disable=SC2317
+cpu_hotplug_read_state() {
+    cpu_index="$1"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    read_first_line "$online_file"
+}
+
+# Write cpuX/online state and save stderr to out_dir.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - state: 0 or 1
+# $3 - action tag
+# $4 - output directory
+# shellcheck disable=SC2317
+cpu_hotplug_write_state() {
+    cpu_index="$1"
+    cpu_state="$2"
+    action_tag="$3"
+    out_dir="$4"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+    err_file="$out_dir/hotplug_cpu${cpu_index}_${action_tag}.err"
+
+    rm -f "$err_file" 2>/dev/null
+
+    if (printf '%s\n' "$cpu_state" > "$online_file") 2>"$err_file"; then
+        return 0
+    fi
+
+    if [ -s "$err_file" ]; then
+        cat "$err_file"
+    fi
+
+    return 1
+}
+
+# Save and print a small dmesg tail for hotplug evidence.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - tag
+# $3 - output directory
+# shellcheck disable=SC2317
+cpu_hotplug_log_dmesg_tail() {
+    cpu_index="$1"
+    tag="$2"
+    out_dir="$3"
+    dmesg_file="$out_dir/hotplug_cpu${cpu_index}_${tag}_dmesg.txt"
+
+    if command -v dmesg >/dev/null 2>&1; then
+        dmesg | tail -n 120 > "$dmesg_file" 2>/dev/null
+        log_info "Saved dmesg tail for CPU$cpu_index $tag: $dmesg_file"
+
+        tail -n 20 "$dmesg_file" 2>/dev/null |
+        while IFS= read -r dmesg_line || [ -n "$dmesg_line" ]; do
+            [ -n "$dmesg_line" ] || continue
+            log_info "[dmesg] $dmesg_line"
+        done
+    else
+        log_warn "dmesg command not available; cannot collect CPU$cpu_index $tag evidence"
+    fi
+}
+
+# Reset registered offlined CPU list.
+# shellcheck disable=SC2317
+cpu_hotplug_reset_registry() {
+    CPU_HOTPLUG_OFFLINED_CPUS=""
+}
+
+# Record a CPU that was successfully offlined so cleanup can restore it.
+# shellcheck disable=SC2317
+cpu_hotplug_record_offlined_cpu() {
+    cpu_index="$1"
+
+    for saved_cpu in $CPU_HOTPLUG_OFFLINED_CPUS; do
+        if [ "$saved_cpu" = "$cpu_index" ]; then
+            return 0
+        fi
+    done
+
+    CPU_HOTPLUG_OFFLINED_CPUS="${CPU_HOTPLUG_OFFLINED_CPUS} ${cpu_index}"
+}
+
+# Restore one CPU online, best effort.
+# shellcheck disable=SC2317
+cpu_hotplug_restore_best_effort() {
+    cpu_index="$1"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    if [ -w "$online_file" ]; then
+        if ! (printf '%s\n' 1 > "$online_file") 2>/dev/null; then
+            :
+        fi
+    fi
+}
+
+# Restore all CPUs recorded by cpu_hotplug_record_offlined_cpu().
+# shellcheck disable=SC2317
+cpu_hotplug_cleanup_registered() {
+    for cpu_index in $CPU_HOTPLUG_OFFLINED_CPUS; do
+        cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+        if [ "$cpu_state" = "0" ]; then
+            log_warn "Cleanup: CPU$cpu_index is still offline, restoring online"
+            cpu_hotplug_restore_best_effort "$cpu_index"
+        fi
+    done
+}
+
+# Try to offline a CPU with retry handling.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - retry count
+# $3 - retry delay seconds
+# $4 - output directory
+#
+# Return:
+# 0 - offline request accepted
+# 1 - offline failed with non-EBUSY error
+# 2 - offline returned EBUSY after retries; caller may defer and retry later
+# shellcheck disable=SC2317
+cpu_hotplug_try_offline_with_retry() {
+    cpu_index="$1"
+    retries="$2"
+    retry_delay="$3"
+    out_dir="$4"
+    attempt=1
+ 
+    while [ "$attempt" -le "$retries" ]; do
+        log_info "CPU$cpu_index offline attempt $attempt/$retries"
+ 
+        offline_output="$(cpu_hotplug_write_state "$cpu_index" 0 "offline_attempt${attempt}" "$out_dir" 2>&1)"
+        offline_rc=$?
+ 
+        if [ "$offline_rc" -eq 0 ]; then
+            log_info "CPU$cpu_index offline request accepted on attempt $attempt"
+            return 0
+        fi
+ 
+        log_warn "CPU$cpu_index offline attempt $attempt failed: ${offline_output:-<no stderr>}"
+ 
+        if printf '%s\n' "$offline_output" | grep -qi 'Device or resource busy'; then
+            log_warn "CPU$cpu_index offline returned EBUSY"
+            cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_ebusy_attempt${attempt}" "$out_dir"
+        else
+            log_fail "CPU$cpu_index offline failed with non-EBUSY error"
+            cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_error_attempt${attempt}" "$out_dir"
+            return 1
+        fi
+ 
+        attempt=$((attempt + 1))
+ 
+        if [ "$attempt" -le "$retries" ]; then
+            log_info "Waiting ${retry_delay}s before retrying CPU$cpu_index offline"
+            sleep "$retry_delay"
+        fi
+    done
+ 
+    log_warn "CPU$cpu_index offline returned EBUSY after $retries attempts; caller may defer retry"
+    return 2
+}
+
+# Validate offline/online hotplug flow for one CPU.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - pass name: primary, deferred-1, etc.
+# $3 - retry count
+# $4 - retry delay seconds
+# $5 - restore delay seconds
+# $6 - output directory
+#
+# Return:
+# 0 - CPU hotplug validation passed
+# 1 - hard failure
+# 2 - persistent EBUSY; caller may defer/retry later
+# 3 - skipped/not applicable
+# shellcheck disable=SC2317
+cpu_hotplug_validate_cpu_once() {
+    cpu_index="$1"
+    pass_name="${2:-primary}"
+    retries="$3"
+    retry_delay="$4"
+    restore_delay="$5"
+    out_dir="$6"
+
+    log_info "----- Testing CPU$cpu_index ($pass_name pass) -----"
+
+    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index is not present in the current online CPU mask"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index is not online during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    if [ ! -e "$online_file" ]; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index has no online control file; not hotplug-controllable on this platform"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index lost online control file during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ ! -w "$online_file" ]; then
+        if [ "$pass_name" = "primary" ]; then
+            log_skip "CPU$cpu_index online control file is not writable; not hotplug-controllable in this environment"
+            skipped=$((skipped + 1))
+            return 3
+        fi
+
+        log_fail "CPU$cpu_index online control file is not writable during deferred retry"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ "$pass_name" = "primary" ]; then
+        controllable=$((controllable + 1))
+    fi
+
+    cpu_is_schedulable "$cpu_index"
+    sched_rc=$?
+
+    if [ "$sched_rc" -eq 2 ]; then
+        log_fail "taskset is not available during CPU$cpu_index schedulability check"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if [ "$sched_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index is not schedulable before hotplug"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    cpu_hotplug_try_offline_with_retry "$cpu_index" "$retries" "$retry_delay" "$out_dir"
+    offline_rc=$?
+
+    if [ "$offline_rc" -eq 2 ]; then
+        log_warn "CPU$cpu_index still returned EBUSY during $pass_name pass"
+        return 2
+    fi
+
+    if [ "$offline_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index failed to offline after retry handling"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    cpu_hotplug_record_offlined_cpu "$cpu_index"
+    tested=$((tested + 1))
+
+    sleep "$restore_delay"
+
+    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+    if [ "$cpu_state" != "0" ]; then
+        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after offline request, expected 0"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    if cpu_hotplug_in_online_mask "$cpu_index"; then
+        log_fail "CPU$cpu_index still appears in online mask after offline request"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    if cpu_is_schedulable "$cpu_index"; then
+        log_fail "CPU$cpu_index is still schedulable after being offlined"
+        failed=$((failed + 1))
+        cpu_hotplug_restore_best_effort "$cpu_index"
+        return 1
+    fi
+
+    log_pass "CPU$cpu_index successfully offlined"
+
+    log_info "Attempting to online CPU$cpu_index"
+    online_output="$(cpu_hotplug_write_state "$cpu_index" 1 "online" "$out_dir" 2>&1)"
+    online_rc=$?
+
+    if [ "$online_rc" -ne 0 ]; then
+        log_fail "CPU$cpu_index failed to online rc=$online_rc output=${online_output:-<none>}"
+        cpu_hotplug_log_dmesg_tail "$cpu_index" "online_error" "$out_dir"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    sleep "$restore_delay"
+
+    cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+    if [ "$cpu_state" != "1" ]; then
+        log_fail "CPU$cpu_index online state is '${cpu_state:-<empty>}' after online request, expected 1"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if ! cpu_hotplug_in_online_mask "$cpu_index"; then
+        log_fail "CPU$cpu_index not present in online mask after online request"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    if ! cpu_is_schedulable "$cpu_index"; then
+        log_fail "CPU$cpu_index is not schedulable after online request"
+        failed=$((failed + 1))
+        return 1
+    fi
+
+    log_pass "CPU$cpu_index successfully restored online"
+    passed=$((passed + 1))
+    return 0
+}
+
+# Log topology details for one CPU.
+# shellcheck disable=SC2317
+cpu_hotplug_log_cpu_topology_one() {
+    cpu_index="$1"
+    cpu_dir="/sys/devices/system/cpu/cpu${cpu_index}"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    package_id="$(read_first_line "$cpu_dir/topology/physical_package_id")"
+    cluster_id="$(read_first_line "$cpu_dir/topology/cluster_id")"
+    core_id="$(read_first_line "$cpu_dir/topology/core_id")"
+    thread_siblings="$(read_first_line "$cpu_dir/topology/thread_siblings_list")"
+    core_siblings="$(read_first_line "$cpu_dir/topology/core_siblings_list")"
+    capacity="$(read_first_line "$cpu_dir/cpu_capacity")"
+    max_freq="$(read_first_line "$cpu_dir/cpufreq/cpuinfo_max_freq")"
+
+    hotplug_control="no"
+    writable="no"
+
+    if [ -e "$online_file" ]; then
+        hotplug_control="yes"
+    fi
+
+    if [ -w "$online_file" ]; then
+        writable="yes"
+    fi
+
+    log_info "CPU$cpu_index topology: hotplug_control=$hotplug_control writable=$writable package=${package_id:-NA} cluster=${cluster_id:-NA} core=${core_id:-NA} capacity=${capacity:-NA} max_freq=${max_freq:-NA} thread_siblings=${thread_siblings:-NA} core_siblings=${core_siblings:-NA}"
+}
+
+# Log global CPU topology and affinity diagnostics.
+# shellcheck disable=SC2317
+cpu_hotplug_log_topology() {
+    online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+    possible_raw="$(read_first_line /sys/devices/system/cpu/possible)"
+    present_raw="$(read_first_line /sys/devices/system/cpu/present)"
+    isolated_raw="$(read_first_line /sys/devices/system/cpu/isolated)"
+    nohz_raw="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    log_info "CPU online list: ${online_raw:-<unavailable>}"
+    log_info "CPU possible list: ${possible_raw:-<unavailable>}"
+    log_info "CPU present list: ${present_raw:-<unavailable>}"
+    log_info "CPU isolated list: ${isolated_raw:-<none>}"
+    log_info "CPU nohz_full list: ${nohz_raw:-<none>}"
+
+    if [ -r /proc/self/status ]; then
+        affinity="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status | head -n 1)"
+        log_info "Current process Cpus_allowed_list: ${affinity:-<unavailable>}"
     fi
 }

@@ -2,10 +2,14 @@
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
-# Robustly find and source init_env
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+SCRIPT_DIR="$(
+    cd "$(dirname "$0")" || exit 1
+    pwd
+)"
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
+
 while [ "$SEARCH" != "/" ]; do
     if [ -f "$SEARCH/init_env" ]; then
         INIT_ENV="$SEARCH/init_env"
@@ -19,76 +23,91 @@ if [ -z "$INIT_ENV" ]; then
     exit 1
 fi
 
-# Only source if not already loaded (idempotent)
-if [ -z "$__INIT_ENV_LOADED" ]; then
+if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
+    __INIT_ENV_LOADED=1
 fi
-# Always source functestlib.sh, using $TOOLS exported by init_env
+
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
 
 TESTNAME="irq"
-test_path=$(find_test_case_by_name "$TESTNAME")
-cd "$test_path" || exit 1
-# shellcheck disable=SC2034
+
+test_path="$(find_test_case_by_name "$TESTNAME")"
+if [ -n "$test_path" ]; then
+    cd "$test_path" || exit 1
+else
+    log_warn "Path not found for $TESTNAME test. Falling back to SCRIPT_DIR: $SCRIPT_DIR"
+    test_path="$SCRIPT_DIR"
+    cd "$test_path" || exit 1
+fi
+
 res_file="./$TESTNAME.res"
+
+IRQ_TIMER_PATTERN="${IRQ_TIMER_PATTERN:-arch_timer}"
+IRQ_WORKLOAD_SECONDS="${IRQ_WORKLOAD_SECONDS:-5}"
+IRQ_RETRIES="${IRQ_RETRIES:-2}"
+IRQ_SKIP_ISOLATED="${IRQ_SKIP_ISOLATED:-1}"
+
+rm -f "$res_file"
 
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 log_info "=== Test Initialization ==="
+log_info "Config, IRQ_TIMER_PATTERN=$IRQ_TIMER_PATTERN IRQ_WORKLOAD_SECONDS=$IRQ_WORKLOAD_SECONDS IRQ_RETRIES=$IRQ_RETRIES IRQ_SKIP_ISOLATED=$IRQ_SKIP_ISOLATED"
 
-# Function to get the timer count
-get_timer_count() {
-    cat /proc/interrupts | grep arch_timer
-}
+case "$IRQ_WORKLOAD_SECONDS" in
+    ''|*[!0-9]*)
+        log_warn "Invalid IRQ_WORKLOAD_SECONDS='$IRQ_WORKLOAD_SECONDS', using 5"
+        IRQ_WORKLOAD_SECONDS=5
+        ;;
+esac
 
-# Get the initial timer count
-log_info "Initial timer count:"
-initial_count=$(get_timer_count)
-log_info "$initial_count"
+case "$IRQ_RETRIES" in
+    ''|*[!0-9]*)
+        log_warn "Invalid IRQ_RETRIES='$IRQ_RETRIES', using 2"
+        IRQ_RETRIES=2
+        ;;
+esac
 
-# Wait for 20 seconds
-sleep 20
+case "$IRQ_SKIP_ISOLATED" in
+    0|1)
+        ;;
+    *)
+        log_warn "Invalid IRQ_SKIP_ISOLATED='$IRQ_SKIP_ISOLATED', using 1"
+        IRQ_SKIP_ISOLATED=1
+        ;;
+esac
 
-# Get the timer count after 20 secs
-log_info "Timer count after 20 secs:"
-final_count=$(get_timer_count)
-log_info "$final_count"
-
-# Compare the initial and final counts
-log_info "Comparing timer counts:"
-echo "$initial_count" | while read -r line; do
-    cpu=$(echo "$line" | awk '{print $1}')
-    initial_values=$(echo "$line" | awk '{for(i=2;i<=9;i++) print $i}')
-    final_values=$(echo "$final_count" | grep "$cpu" | awk '{for(i=2;i<=9;i++) print $i}')
-    
-    fail_test=false
-    initial_values_list=$(echo "$initial_values" | tr ' ' '
-')
-    final_values_list=$(echo "$final_values" | tr ' ' '
-')
-    
-    i=0
-    echo "$initial_values_list" | while read -r initial_value; do
-        final_value=$(echo "$final_values_list" | sed -n "$((i+1))p")
-        if [ "$initial_value" -lt "$final_value" ]; then
-            log_pass "CPU $i: Timer count has incremented. Test PASSED"
-        else
-            log_fail "CPU $i: Timer count has not incremented. Test FAILED"
-            fail_test=true
-        fi
-        i=$((i+1))
-    done
-
-    if [ "$fail_test" = false ]; then
-        log_pass "$TESTNAME : Test Passed"
-	echo "$TESTNAME PASS" > "$res_file"
+deps_list="awk sed grep tr sleep taskset"
+ 
+log_info "Checking dependencies: $deps_list"
+if ! check_dependencies "$deps_list"; then
+    log_skip "$TESTNAME SKIP - missing one or more dependencies: $deps_list"
+    echo "$TESTNAME SKIP" > "$res_file"
     exit 0
-    else
-        log_fail "$TESTNAME : Test Failed"
-	echo "$TESTNAME FAIL" > "$res_file"
-    exit 1
+fi
+
+validate_per_cpu_interrupt_active "$IRQ_TIMER_PATTERN" "$IRQ_WORKLOAD_SECONDS" "$IRQ_RETRIES" "$IRQ_SKIP_ISOLATED"
+irq_validate_rc=$?
+
+if [ "$irq_validate_rc" -eq 0 ]; then
+    if [ "${IRQ_ACTIVE_SKIPPED:-0}" -gt 0 ]; then
+        log_warn "$TESTNAME: all testable CPUs passed, skipped=${IRQ_ACTIVE_SKIPPED}"
     fi
-done
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+
+    log_pass "$TESTNAME : Test Passed"
+    echo "$TESTNAME PASS" > "$res_file"
+    exit 0
+fi
+
+if [ "$irq_validate_rc" -eq 2 ]; then
+    log_skip "$TESTNAME SKIP, ${IRQ_ACTIVE_SKIP_REASON:-active per-CPU interrupt validation unsupported}"
+    echo "$TESTNAME SKIP" > "$res_file"
+    exit 0
+fi
+
+log_fail "$TESTNAME : Test Failed"
+echo "$TESTNAME FAIL" > "$res_file"
+exit 0

@@ -442,36 +442,93 @@ camx_read_soc_id() {
 # Find ICP camera firmware ELF (CAMERA_ICP_*.elf)
 # Prints first match path on stdout.
 camx_find_icp_firmware() {
-  soc="$(camx_read_soc_id 2>/dev/null || true)"
-
-  # First try soc-specific canonical path
-  for root in /usr/lib/firmware /lib/firmware; do
-    if [ -n "$soc" ] && [ -d "$root/qcom/$soc" ]; then
-      p="$(find "$root/qcom/$soc" -maxdepth 1 -type f -name 'CAMERA_ICP_*.elf' 2>/dev/null | head -n 1)"
-      [ -n "$p" ] && echo "$p" && return 0
+  token_list=""
+  token=""
+  cand=""
+ 
+  if [ -r /proc/device-tree/compatible ]; then
+    token_list="$(
+      tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -n 's#.*\(qcm[0-9][0-9]*\|qcs[0-9][0-9]*\|sa[0-9][0-9]*p\).*#\1#p' \
+        | sort -u
+    )"
+  fi
+ 
+  for token in $token_list; do
+    if [ -d "/lib/firmware/qcom/$token" ]; then
+      for cand in \
+        "/lib/firmware/qcom/$token/CAMERA_ICP.mbn" \
+        "/lib/firmware/qcom/$token/CAMERA_ICP.elf"
+      do
+        if [ -f "$cand" ]; then
+          printf '%s\n' "$cand"
+          return 0
+        fi
+      done
+ 
+      cand="$(
+        find "/lib/firmware/qcom/$token" -maxdepth 1 -type f \
+          \( -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+          2>/dev/null | sort | head -n 1
+      )"
+      if [ -n "$cand" ] && [ -f "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
     fi
   done
-
-  # Fallback bounded search
-  for root in /usr/lib/firmware /lib/firmware; do
-    if [ -d "$root/qcom" ]; then
-      p="$(find "$root/qcom" -maxdepth 2 -type f -name 'CAMERA_ICP_*.elf' 2>/dev/null | head -n 1)"
-      [ -n "$p" ] && echo "$p" && return 0
-    fi
-  done
-
+ 
+  cand="$(
+    find /lib/firmware/qcom -type f \
+      \( -name 'CAMERA_ICP.mbn' -o -name 'CAMERA_ICP.elf' -o -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+      2>/dev/null | sort | head -n 1
+  )"
+  if [ -n "$cand" ] && [ -f "$cand" ]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+ 
+  cand="$(
+    find /lib/firmware -type f \
+      \( -name 'CAMERA_ICP.mbn' -o -name 'CAMERA_ICP.elf' -o -name 'CAMERA_ICP*.mbn' -o -name 'CAMERA_ICP*.elf' \) \
+      2>/dev/null | sort | head -n 1
+  )"
+  if [ -n "$cand" ] && [ -f "$cand" ]; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+ 
   return 1
 }
-
 # -----------------------------------------------------------------------------
 # Package helpers (Yocto/QLI proprietary builds)
 # -----------------------------------------------------------------------------
 camx_opkg_list_camx() {
-  command -v opkg >/dev/null 2>&1 || return 1
-  out="$(opkg list-installed 2>/dev/null | grep -i '^camx' || true)"
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out"
-  return 0
+  out=""
+ 
+  if command -v opkg >/dev/null 2>&1; then
+    out="$(opkg list-installed 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  if command -v dnf >/dev/null 2>&1; then
+    out="$(dnf list installed 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  if command -v rpm >/dev/null 2>&1; then
+    out="$(rpm -qa 2>/dev/null | grep -i '^camx' || true)"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+ 
+  return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -482,8 +539,8 @@ camx_fdtdump_has_cam_nodes() {
   [ -r /sys/firmware/fdt ] || return 1
 
   out="$(fdtdump /sys/firmware/fdt 2>/dev/null \
-    | grep -i 'cam' \
-    | grep -Ei 'qcom,cam|qcom,camera|camera@|cam-req|cam-cpas|cam-jpeg|cam-ife|cam-icp|cam-sensor|camera0-thermal' || true)"
+    | grep -Ei 'qcom,(cam|camera|cci|csiphy|eeprom)|camera@|cam-|cci[0-9]*@|csiphy[0-9]*@' \
+    | grep -Ei 'qcom,cam|qcom,camera|qcom,cci|qcom,csiphy|qcom,eeprom|qcom,cam-tpg|qcom,cam-gmsl|qcom,cam-sensor|camera@|cam-req|cam-cpas|cam-jpeg|cam-ife|cam-icp|cam-sensor|camera0-thermal|cci[0-9]*@|csiphy[0-9]*@' || true)"
 
   [ -n "$out" ] || return 1
   printf '%s\n' "$out" | head -n 20
@@ -500,6 +557,163 @@ nhx_pick_cksum_tool() {
   else
     echo ""
   fi
+}
+
+# Resolve one requested NHX JSON file.
+# Usage:
+# nhx_resolve_json_file "<base_dir>" "<json>" "<target>"
+#
+# base_dir: Camera_NHX testcase directory
+# json: absolute path, path relative to base_dir, or filename
+# target: optional target folder: Kodiak/Lemans/Monaco/Talos
+#
+# Prints resolved path on success.
+nhx_resolve_json_file() {
+  base_dir="$1"
+  json="$2"
+  target="$3"
+  cand=""
+  found=""
+  dir=""
+
+  [ -n "$base_dir" ] || return 1
+  [ -n "$json" ] || return 1
+
+  case "$json" in
+    /*)
+      if [ -f "$json" ]; then
+        printf '%s\n' "$json"
+        return 0
+      fi
+      ;;
+    */*)
+      cand="$base_dir/$json"
+      if [ -f "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+
+      cand="$(pwd)/$json"
+      if [ -f "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+      ;;
+    *)
+      if [ -n "$target" ]; then
+        cand="$base_dir/$target/$json"
+        if [ -f "$cand" ]; then
+          printf '%s\n' "$cand"
+          return 0
+        fi
+      fi
+
+      cand="$base_dir/$json"
+      if [ -f "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+
+      for dir in Kodiak Lemans Monaco Talos; do
+        cand="$base_dir/$dir/$json"
+        if [ -f "$cand" ]; then
+          if [ -n "$found" ]; then
+            return 2
+          fi
+          found="$cand"
+        fi
+      done
+
+      if [ -n "$found" ]; then
+        printf '%s\n' "$found"
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
+# Stage resolved NHX JSON into the path expected by /usr/bin/nhx.sh.
+# nhx.sh expects an argument without ".json" and internally looks under:
+# /etc/camera/test/NHX/${JSON_FILE}.json
+#
+# Usage:
+# nhx_stage_json_for_launcher "<base_dir>" "<resolved_json>" "<target>"
+#
+# Prints launcher argument, for example:
+# Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX
+nhx_stage_json_for_launcher() {
+  base_dir="$1"
+  src_json="$2"
+  target="$3"
+  json_root="${NHX_JSON_ROOT:-/etc/camera/test/NHX}"
+  rel=""
+  first=""
+  base=""
+  name_no_ext=""
+  dst_dir=""
+  dst_json=""
+
+  [ -n "$base_dir" ] || return 1
+  [ -n "$src_json" ] || return 1
+  [ -f "$src_json" ] || return 1
+
+  base="${src_json##*/}"
+  name_no_ext="${base%.json}"
+
+  if [ "$name_no_ext" = "$base" ]; then
+    return 1
+  fi
+
+  if [ -z "$target" ]; then
+    case "$src_json" in
+      "$base_dir"/*)
+        rel="${src_json#"$base_dir"/}"
+        first="${rel%%/*}"
+        case "$first" in
+          Kodiak|Lemans|Monaco|Talos)
+            target="$first"
+            ;;
+        esac
+        ;;
+    esac
+  fi
+
+  case "$target" in
+    Kodiak|Lemans|Monaco|Talos)
+      dst_dir="$json_root/$target"
+      dst_json="$dst_dir/$base"
+
+      if ! mkdir -p "$dst_dir"; then
+        return 1
+      fi
+
+      if ! cp -f "$src_json" "$dst_json"; then
+        return 1
+      fi
+
+      printf '%s/%s\n' "$target" "$name_no_ext"
+      return 0
+      ;;
+    "")
+      dst_dir="$json_root"
+      dst_json="$dst_dir/$base"
+
+      if ! mkdir -p "$dst_dir"; then
+        return 1
+      fi
+
+      if ! cp -f "$src_json" "$dst_json"; then
+        return 1
+      fi
+
+      printf '%s\n' "$name_no_ext"
+      return 0
+      ;;
+  esac
+
+  return 1
 }
 
 nhx_collect_new_dumps() {
@@ -634,4 +848,54 @@ run_cmd_live_to_log() {
   rm -f "$fifo"
   wait "$teepid" 2>/dev/null || true
   return "$rc"
+}
+
+# -----------------------------------------------------------------------------
+# Pick board-specific camera module from DT compatible/model
+# -----------------------------------------------------------------------------
+camx_pick_camera_module() {
+  compat_list=""
+  model_str=""
+ 
+  if [ -r /proc/device-tree/compatible ]; then
+    compat_list="$(tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  fi
+ 
+  if [ -r /proc/device-tree/model ]; then
+    model_str="$(tr '[:upper:]' '[:lower:]' </proc/device-tree/model 2>/dev/null)"
+  fi
+ 
+  case "$compat_list
+$model_str" in
+    *rb3gen2*|*qcm6490*|*qcs6490*)
+      printf '%s\n' "camera_qcm6490"
+      return 0
+      ;;
+    *qcs9100-ride-sx*|*iq-9075-evk*|*qcs8300-ride-sx*|*iq-8275-evk*|*qcs9100*|*qcs8300*)
+      printf '%s\n' "camera_qcs9100"
+      return 0
+      ;;
+    *qcs615-ride*|*iq-615-evk*|*qcs615*)
+      printf '%s\n' "camera_qcs615"
+      return 0
+      ;;
+  esac
+ 
+  return 1
+}
+
+# Get the size of the yuv file dump
+nhx_dump_size_bytes() {
+  file_path="$1"
+  size="$(file_size_bytes "$file_path" 2>/dev/null || printf '%s\n' "0")"
+
+  case "$size" in
+    ''|*[!0-9]*)
+      printf '%s\n' "0"
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "$size"
+  return 0
 }
