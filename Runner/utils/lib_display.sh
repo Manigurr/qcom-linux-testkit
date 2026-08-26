@@ -673,37 +673,129 @@ adopt_wayland_env_from_socket() {
     return 0
 }
 
+# Return success when the currently exported Wayland environment is usable.
+#
+# The probe must validate only Wayland connectivity. It must not depend on
+# EGL, GLES, GLVND vendor selection, or GPU acceleration.
+#
+# Inputs:
+#   XDG_RUNTIME_DIR
+#   WAYLAND_DISPLAY
+#
+# Arguments:
+#   None
+#
+# Return:
+#   0 - the Wayland client probe succeeded
+#   1 - the Wayland client probe failed
 wayland_connection_ok() {
-    sock=""
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        sock="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    wco_socket=""
+    wco_rc=1
+    wco_pid=""
+    wco_probe_log="${TMPDIR:-/tmp}/wayland_connection_ok.$$"
+ 
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] &&
+       [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        case "$WAYLAND_DISPLAY" in
+            /*)
+                wco_socket="$WAYLAND_DISPLAY"
+                ;;
+            *)
+                wco_socket="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+                ;;
+        esac
     fi
-    [ -n "$sock" ] || sock="<unknown>"
-    log_info "wayland_connection_ok: using socket $sock"
-
-    if ! command -v weston-simple-egl >/dev/null 2>&1; then
-        log_warn "wayland_connection_ok: weston-simple-egl not available; assuming OK"
-        return 0
-    fi
-
-    log_info "Probing Wayland by briefly starting weston-simple-egl"
-
-    if command -v run_with_timeout >/dev/null 2>&1; then
-        run_with_timeout "3s" weston-simple-egl >/dev/null 2>&1
-        rc=$?
-    else
-        weston-simple-egl >/dev/null 2>&1 &
-        pid=$!
-        sleep 3
-        kill "$pid" 2>/dev/null || true
-        rc=0
-    fi
-
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 143 ]; then
-        log_warn "wayland_connection_ok: weston-simple-egl probe returned $rc"
+ 
+    if [ -z "$wco_socket" ]; then
+        log_warn "wayland_connection_ok: Wayland environment is incomplete"
         return 1
     fi
-
+ 
+    log_info "wayland_connection_ok: using socket $wco_socket"
+ 
+    if [ ! -S "$wco_socket" ]; then
+        log_warn "wayland_connection_ok: Wayland socket is unavailable: $wco_socket"
+        return 1
+    fi
+ 
+    rm -f "$wco_probe_log"
+ 
+    if command -v wayland-info >/dev/null 2>&1; then
+        log_info "Probing Wayland connection with wayland-info"
+ 
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            run_with_timeout \
+                "3s" \
+                wayland-info \
+                >"$wco_probe_log" 2>&1
+            wco_rc=$?
+        else
+            wayland-info >"$wco_probe_log" 2>&1
+            wco_rc=$?
+        fi
+ 
+        if [ "$wco_rc" -eq 0 ]; then
+            rm -f "$wco_probe_log"
+            log_pass "Wayland connection probe passed"
+            return 0
+        fi
+ 
+        log_warn "wayland_connection_ok: wayland-info returned $wco_rc"
+        sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+        rm -f "$wco_probe_log"
+        return 1
+    fi
+ 
+    if ! command -v weston-simple-shm >/dev/null 2>&1; then
+        log_warn "wayland_connection_ok: no Wayland probe client is available"
+        log_warn "Expected wayland-info or weston-simple-shm"
+        return 1
+    fi
+ 
+    log_info "Probing Wayland connection with weston-simple-shm"
+ 
+    if command -v run_with_timeout >/dev/null 2>&1; then
+        run_with_timeout \
+            "3s" \
+            weston-simple-shm \
+            >"$wco_probe_log" 2>&1
+        wco_rc=$?
+ 
+        case "$wco_rc" in
+            0|124|137|143)
+                rm -f "$wco_probe_log"
+                log_pass "Wayland connection probe passed"
+                return 0
+                ;;
+            *)
+                log_warn "wayland_connection_ok: weston-simple-shm returned $wco_rc"
+                sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+                rm -f "$wco_probe_log"
+                return 1
+                ;;
+        esac
+    fi
+ 
+    weston-simple-shm >"$wco_probe_log" 2>&1 &
+    wco_pid=$!
+ 
+    sleep 1
+ 
+    if ! kill -0 "$wco_pid" 2>/dev/null; then
+        wait "$wco_pid" 2>/dev/null
+        wco_rc=$?
+ 
+        log_warn "wayland_connection_ok: weston-simple-shm exited early, rc=$wco_rc"
+        sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+        rm -f "$wco_probe_log"
+        return 1
+    fi
+ 
+    kill "$wco_pid" 2>/dev/null || true
+    wait "$wco_pid" 2>/dev/null || true
+    rm -f "$wco_probe_log"
+ 
+    log_pass "Wayland connection probe passed"
     return 0
 }
 
@@ -1439,175 +1531,392 @@ egli_print_legacy() {
   log_info "EGLINFO: GL_RENDERER: $gl_renderer"
 }
 
+# Extract one platform section from multi-platform Mesa eglinfo output.
+#
+# Args:
+#   $1 - platform name: x11, wayland, gbm, device, or surfaceless
+#
+# Input:
+#   eglinfo output on stdin
+#
+# Output:
+#   Only the requested platform section
+egli_extract_platform_section() {
+    eps_platform="$1"
+
+    awk \
+        -v wanted="$eps_platform" '
+        function platform_name(line) {
+            if (line ~ /^GBM platform:[[:space:]]*$/) {
+                return "gbm"
+            }
+
+            if (line ~ /^Wayland platform:[[:space:]]*$/) {
+                return "wayland"
+            }
+
+            if (line ~ /^X11 platform:[[:space:]]*$/) {
+                return "x11"
+            }
+
+            if (line ~ /^Surfaceless platform:[[:space:]]*$/) {
+                return "surfaceless"
+            }
+
+            if (line ~ /^Device platform:[[:space:]]*$/) {
+                return "device"
+            }
+
+            return ""
+        }
+
+        {
+            detected = platform_name($0)
+
+            if (detected != "") {
+                if (selected && detected != wanted) {
+                    exit
+                }
+
+                selected = detected == wanted
+            }
+
+            if (selected) {
+                print
+            }
+        }
+        '
+}
+
 egli_try_one_platform() {
-  plat="$1"
-  plat_flag="$2"
-
-  EGLINFO="${EGLINFO:-eglinfo}"
-
-  if [ -n "$plat_flag" ]; then
-    out="$("$EGLINFO" "$plat_flag" "$plat" 2>&1)"
-    rc=$?
-  else
-    out="$(EGL_PLATFORM="$plat" "$EGLINFO" 2>&1)"
-    rc=$?
-  fi
-
-  # “Initialized?” heuristic: at least one of these should exist
-  egl_vendor="$(printf '%s\n' "$out" | egli_get_field "EGL vendor string")"
-  egl_version="$(printf '%s\n' "$out" | egli_get_field "EGL version string")"
-  egl_api_ver="$(printf '%s\n' "$out" | egli_get_field "EGL API version")"
-
-  ok=0
-  [ -n "$egl_vendor" ] && ok=1
-  [ -n "$egl_version" ] && ok=1
-  [ -n "$egl_api_ver" ] && ok=1
-
-  if [ "$rc" -ne 0 ] || [ "$ok" -eq 0 ]; then
-    log_warn "eglinfo platform '$plat' did not initialize cleanly (rc=$rc)."
-    if [ "${EGLINFO_DEBUG:-0}" = "1" ]; then
-      log_info "---- eglinfo output (platform '$plat') ----"
-      printf '%s\n' "$out"
-      log_info "---- end eglinfo output ----"
+    plat="$1"
+    plat_flag="$2"
+ 
+    EGLINFO="${EGLINFO:-eglinfo}"
+ 
+    out=""
+    parse_out=""
+    platform_out=""
+    rc=0
+ 
+    if [ -n "$plat_flag" ]; then
+        out="$(
+            "$EGLINFO" \
+                "$plat_flag" \
+                "$plat" \
+                2>&1
+        )"
+ 
+        rc=$?
+    else
+        out="$(
+            EGL_PLATFORM="$plat" \
+                "$EGLINFO" \
+                2>&1
+        )"
+ 
+        rc=$?
     fi
-    return 1
-  fi
-
-  # Driver name
-  driver="$(egli_get_first "$out" \
-    "EGL driver name" \
-    "EGL driver" \
-    "Driver name" \
-    "Driver")"
-
-  # GL vendor
-  gl_vendor="$(egli_get_first "$out" \
-    "GL_VENDOR" \
-    "OpenGL ES profile vendor string" \
-    "OpenGL vendor string" \
-    "OpenGL ES vendor string")"
-
-  # GL renderer
-  gl_renderer="$(egli_get_first "$out" \
-    "GL_RENDERER" \
-    "OpenGL ES profile renderer string" \
-    "OpenGL renderer string" \
-    "OpenGL ES renderer string")"
-
-  # Avoid classification on empty strings
-  [ -n "$driver" ] || driver="unknown"
-  [ -n "$gl_vendor" ] || gl_vendor="unknown"
-  [ -n "$gl_renderer" ] || gl_renderer="unknown"
-
-  # If eglinfo didn't expose a driver name, derive one from GLVND JSON + strings
-  if [ "$driver" = "unknown" ]; then
-    driver="$(egli_derive_driver_name "$gl_vendor" "$gl_renderer")"
-  fi
-
-  # Print GPU/CPU pipeline type
-  pipe_kind="$(egli_classify_pipeline "$driver" "$gl_vendor" "$gl_renderer")"
-  log_info "EGLINFO: Pipeline type: $pipe_kind"
-
-  # ---- Cache what we used, so decision uses the same data ----
-  EGLI_LAST_PLATFORM="$plat"
-  EGLI_LAST_DRIVER="$driver"
-  EGLI_LAST_GL_VENDOR="$gl_vendor"
-  EGLI_LAST_GL_RENDERER="$gl_renderer"
-  EGLI_LAST_PIPE_KIND="$pipe_kind"
-  if [ "${EGLINFO_CACHE_OUTPUT:-0}" = "1" ]; then
-    EGLI_LAST_OUT="$out"
-  else
-    EGLI_LAST_OUT=""
-  fi
-  # -----------------------------------------------------------
-
-  egli_print_legacy "$plat" "$driver" "$gl_vendor" "$gl_renderer"
-  return 0
+ 
+    platform_out="$(
+        printf '%s\n' "$out" |
+            egli_extract_platform_section \
+                "$plat"
+    )"
+ 
+    if [ -n "$platform_out" ]; then
+        parse_out="$platform_out"
+    else
+        parse_out="$out"
+    fi
+ 
+    egl_vendor="$(
+        printf '%s\n' "$parse_out" |
+            egli_get_field \
+                "EGL vendor string"
+    )"
+ 
+    egl_version="$(
+        printf '%s\n' "$parse_out" |
+            egli_get_field \
+                "EGL version string"
+    )"
+ 
+    egl_api_ver="$(
+        printf '%s\n' "$parse_out" |
+            egli_get_field \
+                "EGL API version"
+    )"
+ 
+    ok=0
+ 
+    [ -n "$egl_vendor" ] && ok=1
+    [ -n "$egl_version" ] && ok=1
+    [ -n "$egl_api_ver" ] && ok=1
+ 
+    if [ "$ok" -eq 0 ] ||
+       printf '%s\n' "$parse_out" |
+           grep -q \
+               '^eglinfo: eglInitialize failed'; then
+        log_warn "eglinfo platform '$plat' did not initialize cleanly, rc=$rc"
+ 
+        if [ "${EGLINFO_DEBUG:-0}" = "1" ]; then
+            log_info "---- eglinfo output, platform '$plat' ----"
+ 
+            printf '%s\n' "$parse_out"
+ 
+            log_info "---- end eglinfo output ----"
+        fi
+ 
+        return 1
+    fi
+ 
+    if [ "$rc" -ne 0 ] &&
+       [ -n "$platform_out" ]; then
+        log_warn "eglinfo returned rc=$rc because another platform probe failed; selected platform '$plat' initialized successfully"
+    fi
+ 
+    driver="$(
+        egli_get_first \
+            "$parse_out" \
+            "EGL driver name" \
+            "EGL driver" \
+            "Driver name" \
+            "Driver"
+    )"
+ 
+    gl_vendor="$(
+        egli_get_first \
+            "$parse_out" \
+            "GL_VENDOR" \
+            "OpenGL ES profile vendor" \
+            "OpenGL core profile vendor" \
+            "OpenGL compatibility profile vendor" \
+            "OpenGL ES profile vendor string" \
+            "OpenGL vendor string" \
+            "OpenGL ES vendor string"
+    )"
+ 
+    gl_renderer="$(
+        egli_get_first \
+            "$parse_out" \
+            "GL_RENDERER" \
+            "OpenGL ES profile renderer" \
+            "OpenGL core profile renderer" \
+            "OpenGL compatibility profile renderer" \
+            "OpenGL ES profile renderer string" \
+            "OpenGL renderer string" \
+            "OpenGL ES renderer string"
+    )"
+ 
+    [ -n "$egl_vendor" ] || egl_vendor="unknown"
+    [ -n "$egl_version" ] || egl_version="unknown"
+    [ -n "$egl_api_ver" ] || egl_api_ver="unknown"
+    [ -n "$driver" ] || driver="unknown"
+    [ -n "$gl_vendor" ] || gl_vendor="unknown"
+    [ -n "$gl_renderer" ] || gl_renderer="unknown"
+ 
+    if [ "$driver" = "unknown" ]; then
+        driver="$(
+            egli_derive_driver_name \
+                "$gl_vendor" \
+                "$gl_renderer"
+        )"
+    fi
+ 
+    pipe_kind="$(
+        egli_classify_pipeline \
+            "$driver" \
+            "$gl_vendor" \
+            "$gl_renderer"
+    )"
+ 
+    log_info "EGLINFO: Pipeline type: $pipe_kind"
+ 
+    EGLI_LAST_PLATFORM="$plat"
+    EGLI_LAST_EGL_VENDOR="$egl_vendor"
+    EGLI_LAST_EGL_VERSION="$egl_version"
+    EGLI_LAST_EGL_API_VERSION="$egl_api_ver"
+    EGLI_LAST_DRIVER="$driver"
+    EGLI_LAST_GL_VENDOR="$gl_vendor"
+    EGLI_LAST_GL_RENDERER="$gl_renderer"
+    EGLI_LAST_PIPE_KIND="$pipe_kind"
+ 
+    if [ "${EGLINFO_CACHE_OUTPUT:-0}" = "1" ]; then
+        EGLI_LAST_OUT="$parse_out"
+    else
+        EGLI_LAST_OUT=""
+    fi
+ 
+    egli_print_legacy \
+        "$plat" \
+        "$driver" \
+        "$gl_vendor" \
+        "$gl_renderer"
+ 
+    return 0
 }
 
 display_print_eglinfo_pipeline() {
-  # Usage: display_print_eglinfo_pipeline auto|wayland|gbm|device|surfaceless
-  mode="${1:-auto}"
-
-  # Clear cached result on every call (prevents stale decisions)
-  EGLI_LAST_PLATFORM=""
-  EGLI_LAST_DRIVER=""
-  EGLI_LAST_GL_VENDOR=""
-  EGLI_LAST_GL_RENDERER=""
-  EGLI_LAST_PIPE_KIND=""
-  EGLI_LAST_OUT=""
-
-  EGLINFO="${EGLINFO:-eglinfo}"
-  if ! command -v "$EGLINFO" >/dev/null 2>&1; then
-    log_error "eglinfo not found (EGLINFO='$EGLINFO')"
-    return 1
-  fi
-
-  # egli_pick_platform_flag may return non-zero; treat empty as "use EGL_PLATFORM="
-  plat_flag="$(egli_pick_platform_flag 2>/dev/null)" || plat_flag=""
-
-  log_info "---------------- EGLINFO pipeline detection (select one) ----------------"
-
-  if [ "$mode" = "auto" ]; then
-    # Prefer wayland only if the socket really exists (base/prop handled)
-    if egli_wayland_socket_ok; then
-      if egli_try_one_platform "wayland" "$plat_flag"; then
-        log_info "---------------- End EGLINFO pipeline detection --------------------------"
-        return 0
-      fi
+    # Usage:
+    #   display_print_eglinfo_pipeline \
+    #       auto|x11|wayland|gbm|device|surfaceless
+    #
+    # Cache populated by egli_try_one_platform():
+    #   EGLI_LAST_PLATFORM
+    #   EGLI_LAST_EGL_VENDOR
+    #   EGLI_LAST_EGL_VERSION
+    #   EGLI_LAST_EGL_API_VERSION
+    #   EGLI_LAST_DRIVER
+    #   EGLI_LAST_GL_VENDOR
+    #   EGLI_LAST_GL_RENDERER
+    #   EGLI_LAST_PIPE_KIND
+    #   EGLI_LAST_OUT
+ 
+    mode="${1:-auto}"
+ 
+    # Clear every cached field before probing so callers never consume stale
+    # data from an earlier platform attempt.
+    EGLI_LAST_PLATFORM=""
+    EGLI_LAST_EGL_VENDOR=""
+    EGLI_LAST_EGL_VERSION=""
+    EGLI_LAST_EGL_API_VERSION=""
+    EGLI_LAST_DRIVER=""
+    EGLI_LAST_GL_VENDOR=""
+    EGLI_LAST_GL_RENDERER=""
+    EGLI_LAST_PIPE_KIND=""
+    EGLI_LAST_OUT=""
+ 
+    EGLINFO="${EGLINFO:-eglinfo}"
+ 
+    if ! command -v "$EGLINFO" >/dev/null 2>&1; then
+        log_error "eglinfo not found, EGLINFO=$EGLINFO"
+        return 1
     fi
-
-    if egli_try_one_platform "gbm" "$plat_flag"; then
-      log_info "---------------- End EGLINFO pipeline detection --------------------------"
-      return 0
-    fi
-
-    if egli_try_one_platform "device" "$plat_flag"; then
-      log_info "---------------- End EGLINFO pipeline detection --------------------------"
-      return 0
-    fi
-
-    if egli_try_one_platform "surfaceless" "$plat_flag"; then
-      log_info "---------------- End EGLINFO pipeline detection --------------------------"
-      return 0
-    fi
-
-    log_warn "No working eglinfo platform found (tried wayland/gbm/device/surfaceless)."
-    log_info "---------------- End EGLINFO pipeline detection --------------------------"
-    return 1
-  fi
-
-  case "$mode" in
-    wayland|gbm|device|surfaceless)
-      # If user explicitly requested wayland but socket is not present, warn and fallback
-      if [ "$mode" = "wayland" ] && ! egli_wayland_socket_ok; then
-        log_warn "Requested 'wayland' but WAYLAND_DISPLAY socket is not present; trying fallbacks..."
-      else
-        if egli_try_one_platform "$mode" "$plat_flag"; then
-          log_info "---------------- End EGLINFO pipeline detection --------------------------"
-          return 0
-        fi
-        log_warn "Requested '$mode' did not work. Trying fallbacks..."
-      fi
-
-      # Fallback order: gbm -> device -> surfaceless -> wayland (last)
-      if egli_try_one_platform "gbm" "$plat_flag"; then :;
-      elif egli_try_one_platform "device" "$plat_flag"; then :;
-      elif egli_try_one_platform "surfaceless" "$plat_flag"; then :;
-      elif egli_wayland_socket_ok && egli_try_one_platform "wayland" "$plat_flag"; then :;
-      else
-        log_warn "No fallback platforms worked either."
-      fi
-
-      log_info "---------------- End EGLINFO pipeline detection --------------------------"
-      return 0
-      ;;
-    *)
-      log_warn "Unknown mode '$mode' (use: auto|wayland|gbm|device|surfaceless). Defaulting to auto."
-      display_print_eglinfo_pipeline auto
-      return $?
-      ;;
-  esac
+ 
+    plat_flag="$(
+        egli_pick_platform_flag \
+            2>/dev/null
+    )" || plat_flag=""
+ 
+    log_info "---------------- EGLINFO pipeline detection (select one) ----------------"
+ 
+    case "$mode" in
+        auto)
+            # Preserve the existing compositor/direct-rendering selection
+            # order. X11 tests must request x11 explicitly so auto mode cannot
+            # accidentally validate a different display stack.
+            if egli_wayland_socket_ok &&
+               egli_try_one_platform \
+                   wayland \
+                   "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if egli_try_one_platform \
+                gbm \
+                "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if egli_try_one_platform \
+                device \
+                "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if egli_try_one_platform \
+                surfaceless \
+                "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            log_warn "No working eglinfo platform found, tried wayland/gbm/device/surfaceless"
+            log_info "---------------- End EGLINFO pipeline detection --------------------------"
+            return 1
+            ;;
+ 
+        x11)
+            # X11 is intentionally strict. Do not fall back to GBM, device,
+            # surfaceless, or Wayland because that would make an X11 testcase
+            # pass without validating X11 EGL.
+            if egli_try_one_platform \
+                x11 \
+                "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            log_warn "Requested X11 EGL platform did not initialize"
+            log_info "---------------- End EGLINFO pipeline detection --------------------------"
+            return 1
+            ;;
+ 
+        wayland|gbm|device|surfaceless)
+            if [ "$mode" = "wayland" ] &&
+               ! egli_wayland_socket_ok; then
+                log_warn "Requested wayland platform, but the WAYLAND_DISPLAY socket is unavailable; trying fallbacks"
+            elif egli_try_one_platform \
+                "$mode" \
+                "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            else
+                log_warn "Requested $mode platform did not initialize; trying fallbacks"
+            fi
+ 
+            # Preserve the existing fallback policy for non-X11 callers.
+            if [ "$mode" != "gbm" ] &&
+               egli_try_one_platform \
+                   gbm \
+                   "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if [ "$mode" != "device" ] &&
+               egli_try_one_platform \
+                   device \
+                   "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if [ "$mode" != "surfaceless" ] &&
+               egli_try_one_platform \
+                   surfaceless \
+                   "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            if [ "$mode" != "wayland" ] &&
+               egli_wayland_socket_ok &&
+               egli_try_one_platform \
+                   wayland \
+                   "$plat_flag"; then
+                log_info "---------------- End EGLINFO pipeline detection --------------------------"
+                return 0
+            fi
+ 
+            log_warn "No working eglinfo platform found for requested mode $mode or its fallbacks"
+            log_info "---------------- End EGLINFO pipeline detection --------------------------"
+            return 1
+            ;;
+ 
+        *)
+            log_warn "Unknown mode '$mode', use auto|x11|wayland|gbm|device|surfaceless; defaulting to auto"
+ 
+            display_print_eglinfo_pipeline \
+                auto
+ 
+            return $?
+            ;;
+    esac
 }
 
 ###############################################################################
@@ -1826,6 +2135,7 @@ display_resolve_fps_policy() {
     fps_default="${EXPECT_FPS_DEFAULT:-60}"
     fps_tol="${FPS_TOL_PCT:-10}"
     fps_min_pct="${MIN_FPS_PCT:-85}"
+    fps_backend="${DISPLAY_FPS_BACKEND:-auto}"
 
     case "$fps_mode" in
         auto)
@@ -1849,7 +2159,9 @@ display_resolve_fps_policy() {
     esac
 
     if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
-        if command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+        if command -v display_get_primary_refresh_hz >/dev/null 2>&1; then
+            DISPLAY_FPS_DETECTED_HZ="$(display_get_primary_refresh_hz "$fps_backend" 2>/dev/null || true)"
+        elif command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
             DISPLAY_FPS_DETECTED_HZ="$(weston_get_primary_refresh_hz 2>/dev/null || true)"
         fi
 
@@ -1867,7 +2179,7 @@ display_resolve_fps_policy() {
             *)
                 DISPLAY_FPS_EXPECTED="$(printf '%s\n' "$DISPLAY_FPS_DETECTED_HZ" | awk '{printf "%.0f\n", $1 + 0.0}')"
                 DISPLAY_FPS_MIN_OK="$(awk -v f="$DISPLAY_FPS_EXPECTED" -v p="$fps_min_pct" 'BEGIN { printf "%.0f\n", f * p / 100.0 }')"
-                log_info "FPS policy: mode=detected refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK}"
+                log_info "FPS policy: mode=detected backend=$fps_backend refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK}"
                 return 0
                 ;;
         esac
@@ -1898,6 +2210,11 @@ display_apply_fps_refresh_policy() {
 
     if [ "$DISPLAY_FPS_MODE" = "detected" ]; then
         log_info "Detected FPS mode selected; keeping native refresh"
+        return 0
+    fi
+
+    if [ "${DISPLAY_FPS_BACKEND:-auto}" = "x11" ]; then
+        log_info "X11 FPS backend selected; keeping the active XRandR mode unchanged"
         return 0
     fi
 
@@ -1971,66 +2288,147 @@ display_fps_gate_avg() {
     return 0
 }
 
-# Parse FPS samples from a weston-simple-egl style log.
-# Sets DISPLAY_FPS_COUNT / DISPLAY_FPS_AVG / DISPLAY_FPS_MIN / DISPLAY_FPS_MAX.
+# Parse FPS samples from a weston-simple-egl log.
+#
+# Supported formats:
+#   Weston 14:
+#     601 frames in 5 seconds: 120.199997 fps
+#
+#   Older Weston:
+#     601 frames in 5 seconds = 120.199997
+#
+# The first sample is discarded as warm-up when two or more samples exist.
+#
+# Exports through shell globals:
+#   DISPLAY_FPS_COUNT
+#   DISPLAY_FPS_AVG
+#   DISPLAY_FPS_MIN
+#   DISPLAY_FPS_MAX
+#
+# Return:
+#   0 - one or more usable FPS samples remain after warm-up handling
+#   1 - log is missing, unreadable, or contains no usable FPS samples
 display_parse_fps_log() {
-    logf="$1"
-
+    dpfl_log_file="$1"
+    dpfl_stats=""
+ 
     DISPLAY_FPS_COUNT=0
     DISPLAY_FPS_AVG="-"
     DISPLAY_FPS_MIN="-"
     DISPLAY_FPS_MAX="-"
-
-    [ -n "$logf" ] || return 1
-    [ -r "$logf" ] || return 1
-
-    fps_stats=$(
+ 
+    [ -n "$dpfl_log_file" ] || return 1
+    [ -r "$dpfl_log_file" ] || return 1
+ 
+    dpfl_stats="$(
         awk '
-            /[0-9]+[[:space:]]+frames in[[:space:]]+[0-9]+[[:space:]]+seconds/ {
-                val = $(NF-1) + 0.0
-                all_n++
-                all_vals[all_n] = val
-            }
-            END {
-                if (all_n == 0) exit
-
-                if (all_n == 1) {
-                    n = 1
-                    sum = all_vals[1]
-                    min = all_vals[1]
-                    max = all_vals[1]
-                } else {
-                    n = 0
-                    sum = 0.0
-                    for (i = 2; i <= all_n; i++) {
-                        v = all_vals[i]
-                        n++
-                        sum += v
-                        if (n == 1 || v < min) min = v
-                        if (n == 1 || v > max) max = v
+            {
+                value = ""
+ 
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "frames" &&
+                        i > 1 &&
+                        $(i + 1) == "in") {
+                        for (j = i + 2; j <= NF; j++) {
+                            # Weston 14:
+                            # 601 frames in 5 seconds: 120.199997 fps
+                            if ($j ~ /^seconds:$/) {
+                                value = $(j + 1)
+                                break
+                            }
+ 
+                            # Older Weston:
+                            # 601 frames in 5 seconds = 120.199997
+                            if ($j == "seconds" &&
+                                $(j + 1) == "=") {
+                                value = $(j + 2)
+                                break
+                            }
+                        }
+ 
+                        break
                     }
                 }
-
-                if (n > 0) {
-                    avg = sum / n
-                    printf "n=%d avg=%f min=%f max=%f\n", n, avg, min, max
+ 
+                if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+                    all_n++
+                    all_values[all_n] = value + 0.0
                 }
             }
-        ' "$logf" 2>/dev/null || true
-    )
-
-    [ -n "$fps_stats" ] || return 1
-
-    DISPLAY_FPS_COUNT=$(printf '%s\n' "$fps_stats" | awk '{print $1}' | sed 's/^n=//')
-    DISPLAY_FPS_AVG=$(printf '%s\n' "$fps_stats" | awk '{print $2}' | sed 's/^avg=//')
-    DISPLAY_FPS_MIN=$(printf '%s\n' "$fps_stats" | awk '{print $3}' | sed 's/^min=//')
-    DISPLAY_FPS_MAX=$(printf '%s\n' "$fps_stats" | awk '{print $4}' | sed 's/^max=//')
-
-    case "$DISPLAY_FPS_COUNT" in ''|*[!0-9]*) DISPLAY_FPS_COUNT=0 ;; esac
-    [ -n "$DISPLAY_FPS_AVG" ] || DISPLAY_FPS_AVG="-"
-    [ -n "$DISPLAY_FPS_MIN" ] || DISPLAY_FPS_MIN="-"
-    [ -n "$DISPLAY_FPS_MAX" ] || DISPLAY_FPS_MAX="-"
-
+ 
+            END {
+                if (all_n == 0) {
+                    exit 1
+                }
+ 
+                # Preserve the existing behavior: discard the first warm-up
+                # sample when two or more samples were collected.
+                first = (all_n > 1) ? 2 : 1
+                count = 0
+                sum = 0.0
+ 
+                for (i = first; i <= all_n; i++) {
+                    value = all_values[i]
+                    count++
+                    sum += value
+ 
+                    if (count == 1 || value < min) {
+                        min = value
+                    }
+ 
+                    if (count == 1 || value > max) {
+                        max = value
+                    }
+                }
+ 
+                if (count > 0) {
+                    printf "n=%d avg=%.6f min=%.6f max=%.6f\n",
+                        count,
+                        sum / count,
+                        min,
+                        max
+                }
+            }
+        ' "$dpfl_log_file" 2>/dev/null
+    )" || true
+ 
+    [ -n "$dpfl_stats" ] || return 1
+ 
+    DISPLAY_FPS_COUNT="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $1 }' |
+            sed 's/^n=//'
+    )"
+ 
+    DISPLAY_FPS_AVG="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $2 }' |
+            sed 's/^avg=//'
+    )"
+ 
+    DISPLAY_FPS_MIN="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $3 }' |
+            sed 's/^min=//'
+    )"
+ 
+    DISPLAY_FPS_MAX="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $4 }' |
+            sed 's/^max=//'
+    )"
+ 
+    case "$DISPLAY_FPS_COUNT" in
+        ''|*[!0-9]*)
+            DISPLAY_FPS_COUNT=0
+            DISPLAY_FPS_AVG="-"
+            DISPLAY_FPS_MIN="-"
+            DISPLAY_FPS_MAX="-"
+            return 1
+            ;;
+    esac
+ 
+    [ "$DISPLAY_FPS_COUNT" -gt 0 ] 2>/dev/null || return 1
     return 0
 }
 
@@ -2207,18 +2605,34 @@ weston_systemd_service_user() {
     return 1
 }
 
-# Prefer the Wayland socket that belongs to the systemd-managed Weston user.
-# Fall back to generic discovery only when needed.
+# Prefer the Wayland socket that belongs to the active Weston runtime.
+#
+# Discovery order:
+# 1. Socket owned by the configured systemd weston.service user.
+# 2. Socket derived from a live Weston process:
+#    - XDG_RUNTIME_DIR from /proc/<pid>/environ
+#    - --socket from /proc/<pid>/cmdline
+# 3. Existing generic Wayland socket discovery.
+#
+# This allows a Weston runtime started by one testcase shell to be reused by
+# later testcase shells without hardcoding its runtime directory or socket name.
 weston_preferred_socket() {
     wps_user=""
     wps_uid=""
     wps_dir=""
     wps_sock=""
+    wps_pids=""
+    wps_pid=""
+    wps_runtime_dir=""
+    wps_socket_name=""
+    wps_candidate=""
 
     if wps_user="$(weston_systemd_service_user 2>/dev/null)"; then
         wps_uid="$(id -u "$wps_user" 2>/dev/null || true)"
+
         if [ -n "$wps_uid" ]; then
             wps_dir="/run/user/$wps_uid"
+
             if [ -d "$wps_dir" ]; then
                 for wps_sock in "$wps_dir"/wayland-*; do
                     if [ -S "$wps_sock" ]; then
@@ -2230,8 +2644,84 @@ weston_preferred_socket() {
         fi
     fi
 
+    if command -v pgrep >/dev/null 2>&1; then
+        wps_pids="$(pgrep -x weston 2>/dev/null || true)"
+    else
+        wps_pids="$(
+            ps -eo pid=,comm= 2>/dev/null |
+                awk '$2 == "weston" { print $1 }'
+        )"
+    fi
+
+    for wps_pid in $wps_pids; do
+        [ -r "/proc/$wps_pid/cmdline" ] || continue
+
+        wps_socket_name="$(
+            tr '\000' '\n' <"/proc/$wps_pid/cmdline" 2>/dev/null |
+                awk '
+                    take_socket {
+                        print
+                        exit
+                    }
+
+                    $0 == "--socket" {
+                        take_socket = 1
+                        next
+                    }
+
+                    /^--socket=/ {
+                        sub(/^--socket=/, "")
+                        print
+                        exit
+                    }
+                '
+        )"
+
+        wps_runtime_dir=""
+
+        if [ -r "/proc/$wps_pid/environ" ]; then
+            wps_runtime_dir="$(
+                tr '\000' '\n' <"/proc/$wps_pid/environ" 2>/dev/null |
+                    sed -n 's/^XDG_RUNTIME_DIR=//p' |
+                    head -n 1
+            )"
+        fi
+
+        if [ -n "$wps_socket_name" ]; then
+            case "$wps_socket_name" in
+                /*)
+                    wps_candidate="$wps_socket_name"
+                    ;;
+                *)
+                    if [ -n "$wps_runtime_dir" ]; then
+                        wps_candidate="$wps_runtime_dir/$wps_socket_name"
+                    else
+                        wps_candidate=""
+                    fi
+                    ;;
+            esac
+
+            if [ -n "$wps_candidate" ] &&
+               [ -S "$wps_candidate" ]; then
+                printf '%s\n' "$wps_candidate"
+                return 0
+            fi
+        fi
+
+        if [ -n "$wps_runtime_dir" ] &&
+           [ -d "$wps_runtime_dir" ]; then
+            for wps_sock in "$wps_runtime_dir"/wayland-*; do
+                if [ -S "$wps_sock" ]; then
+                    printf '%s\n' "$wps_sock"
+                    return 0
+                fi
+            done
+        fi
+    done
+
     if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
-        discover_wayland_socket_anywhere 2>/dev/null | head -n 1
+        discover_wayland_socket_anywhere 2>/dev/null |
+            head -n 1
         return 0
     fi
 
@@ -2935,6 +3425,2466 @@ display_restore_service_from_state() {
 
     rm -f "$drsfs_state_file"
     log_pass "Display manager restored: $drsfs_service"
+    return 0
+}
+
+###############################################################################
+# X11 runtime, output, GLX, and XVideo helpers
+###############################################################################
+# These helpers extend lib_display.sh. They discover the currently usable X11
+# runtime from live server processes and sockets instead of assuming :0, a
+# LightDM path, a user ID, a connector name, a mode, or a refresh rate.
+
+DISPLAY_X11_DISPLAY=""
+DISPLAY_X11_XAUTHORITY=""
+DISPLAY_X11_SERVER_PID=""
+DISPLAY_X11_SERVER_COMMAND=""
+DISPLAY_X11_SESSION_KIND="unknown"
+DISPLAY_X11_OUTPUT=""
+DISPLAY_X11_MODE=""
+DISPLAY_X11_REFRESH_HZ=""
+DISPLAY_X11_ROOT_WIDTH=""
+DISPLAY_X11_ROOT_HEIGHT=""
+DISPLAY_X11_ROOT_DEPTH=""
+DISPLAY_X11_ROOT_MAP_STATE=""
+
+DISPLAY_GLX_DIRECT=""
+DISPLAY_GLX_ACCELERATED=""
+DISPLAY_GLX_VENDOR=""
+DISPLAY_GLX_RENDERER=""
+DISPLAY_GLX_VERSION=""
+DISPLAY_GLX_PIPE_KIND=""
+DISPLAY_GLX_OUT=""
+
+# display_x11_connection_ok [display] [xauthority]
+# Verify that xdpyinfo can connect to the supplied or currently exported X11
+# display. When an authority file is supplied, it must be readable and is used
+# only for this probe.
+# Returns: 0 when the connection succeeds; 1 otherwise.
+display_x11_connection_ok() {
+    dxco_display="${1:-${DISPLAY:-}}"
+    dxco_authority="${2:-${XAUTHORITY:-}}"
+
+    [ -n "$dxco_display" ] || return 1
+    command -v xdpyinfo >/dev/null 2>&1 || return 1
+
+    if [ -n "$dxco_authority" ]; then
+        [ -r "$dxco_authority" ] || return 1
+        DISPLAY="$dxco_display" \
+        XAUTHORITY="$dxco_authority" \
+        LC_ALL=C \
+            xdpyinfo -display "$dxco_display" >/dev/null 2>&1
+        return $?
+    fi
+
+    (
+        unset XAUTHORITY
+        DISPLAY="$dxco_display" \
+        LC_ALL=C \
+            xdpyinfo -display "$dxco_display" >/dev/null 2>&1
+    )
+}
+
+# display_x11_server_pids
+# Print unique PIDs for live Xorg, X, and Xwayland server processes. pgrep is
+# used when available and ps provides a portable fallback.
+# Returns: 0 after emitting zero or more PIDs.
+display_x11_server_pids() {
+    {
+        if command -v pgrep >/dev/null 2>&1; then
+            for dxsp_name in Xorg X Xwayland; do
+                pgrep -x "$dxsp_name" 2>/dev/null || true
+            done
+        fi
+
+        ps -eo pid=,comm= 2>/dev/null |
+            awk '$2 == "Xorg" || $2 == "X" || $2 == "Xwayland" { print $1 }'
+    } | awk 'NF && !seen[$1]++ { print $1 }'
+
+    return 0
+}
+
+# display_x11_process_display <pid>
+# Extract the first command-line argument that looks like an X11 display name
+# such as :0 or :0.0 from one server process.
+# Returns: 0 when a display is printed; 1 when it cannot be determined.
+display_x11_process_display() {
+    dxpd_pid="${1:-}"
+
+    [ -n "$dxpd_pid" ] || return 1
+    [ -r "/proc/$dxpd_pid/cmdline" ] || return 1
+
+    tr '\000' '\n' <"/proc/$dxpd_pid/cmdline" 2>/dev/null |
+        awk '/^:[0-9]+([.][0-9]+)?$/ { print; exit }'
+}
+
+# display_x11_process_env_value <pid> <name>
+# Read one environment variable from /proc/<pid>/environ and print its first
+# value without modifying the caller's environment.
+# Returns: 0 when a value is printed; 1 when the process environment is not
+# readable or the variable is absent.
+display_x11_process_env_value() {
+    dxpev_pid="${1:-}"
+    dxpev_name="${2:-}"
+
+    [ -n "$dxpev_pid" ] || return 1
+    [ -n "$dxpev_name" ] || return 1
+    [ -r "/proc/$dxpev_pid/environ" ] || return 1
+
+    tr '\000' '\n' <"/proc/$dxpev_pid/environ" 2>/dev/null |
+        sed -n "s/^${dxpev_name}=//p" |
+        head -n 1
+}
+
+# display_x11_process_authority <pid>
+# Discover an Xauthority path from an X server's -auth command-line argument,
+# falling back to the process XAUTHORITY environment variable.
+# Returns: 0 and prints a non-empty path when found; 1 otherwise.
+display_x11_process_authority() {
+    dxpa_pid="${1:-}"
+
+    [ -n "$dxpa_pid" ] || return 1
+
+    dxpa_authority=""
+
+    if [ -r "/proc/$dxpa_pid/cmdline" ]; then
+        dxpa_authority="$(
+            tr '\000' '\n' <"/proc/$dxpa_pid/cmdline" 2>/dev/null |
+                awk '
+                    take_next { print; exit }
+                    $0 == "-auth" { take_next=1 }
+                '
+        )"
+    fi
+
+    if [ -z "$dxpa_authority" ]; then
+        dxpa_authority="$(
+            display_x11_process_env_value "$dxpa_pid" XAUTHORITY 2>/dev/null || true
+        )"
+    fi
+
+    [ -n "$dxpa_authority" ] || return 1
+    printf '%s\n' "$dxpa_authority"
+}
+
+# display_x11_find_authority_for_display <display>
+# Search readable process environments for a process using the requested
+# DISPLAY and print the first readable XAUTHORITY path associated with it.
+# Returns: 0 when a readable authority file is printed; 1 otherwise.
+display_x11_find_authority_for_display() {
+    dxfafd_display="${1:-}"
+
+    [ -n "$dxfafd_display" ] || return 1
+
+    for dxfafd_env in /proc/[0-9]*/environ; do
+        [ -r "$dxfafd_env" ] || continue
+
+        dxfafd_pid=${dxfafd_env#/proc/}
+        dxfafd_pid=${dxfafd_pid%/environ}
+        dxfafd_proc_display="$(
+            display_x11_process_env_value "$dxfafd_pid" DISPLAY 2>/dev/null || true
+        )"
+
+        [ "$dxfafd_proc_display" = "$dxfafd_display" ] || continue
+
+        dxfafd_authority="$(
+            display_x11_process_env_value "$dxfafd_pid" XAUTHORITY 2>/dev/null || true
+        )"
+
+        if [ -n "$dxfafd_authority" ] && [ -r "$dxfafd_authority" ]; then
+            printf '%s\n' "$dxfafd_authority"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# display_x11_process_on_display <process-name> <display>
+# Return success when an exact process name has at least one process whose
+# DISPLAY environment matches the requested X11 display.
+# Returns: 0 on a match; 1 when no matching process is found.
+display_x11_process_on_display() {
+    dxpod_name="${1:-}"
+    dxpod_display="${2:-}"
+
+    [ -n "$dxpod_name" ] || return 1
+    [ -n "$dxpod_display" ] || return 1
+    command -v pgrep >/dev/null 2>&1 || return 1
+
+    for dxpod_pid in $(pgrep -x "$dxpod_name" 2>/dev/null || true); do
+        dxpod_process_display="$(
+            display_x11_process_env_value "$dxpod_pid" DISPLAY 2>/dev/null || true
+        )"
+
+        if [ "$dxpod_process_display" = "$dxpod_display" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# display_x11_detect_session_kind
+# Classify the adopted X11 session as generic x11, xfce, or lightdm-greeter by
+# inspecting the active window manager and session processes.
+# Sets and exports DISPLAY_X11_SESSION_KIND and prints the detected value.
+# Returns: 0 after classification.
+display_x11_detect_session_kind() {
+    DISPLAY_X11_SESSION_KIND="x11"
+
+    if command -v xprop >/dev/null 2>&1; then
+        dxsk_wm_id="$({
+            LC_ALL=C xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null || true
+        } |
+            sed -n 's/.*#[[:space:]]*\(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' |
+            head -n 1)"
+
+        if [ -n "$dxsk_wm_id" ]; then
+            dxsk_wm_name="$({
+                LC_ALL=C xprop -id "$dxsk_wm_id" _NET_WM_NAME WM_NAME 2>/dev/null || true
+            } |
+                sed -n 's/.*=[[:space:]]*"\(.*\)".*/\1/p' |
+                head -n 1)"
+
+            case "$(printf '%s\n' "$dxsk_wm_name" | tr '[:upper:]' '[:lower:]')" in
+                *xfwm*) DISPLAY_X11_SESSION_KIND="xfce" ;;
+            esac
+        fi
+    fi
+
+    if [ "$DISPLAY_X11_SESSION_KIND" != "xfce" ]; then
+        dxsk_display="${DISPLAY:-${DISPLAY_X11_DISPLAY:-}}"
+
+        if display_x11_process_on_display xfce4-session "$dxsk_display" ||
+           display_x11_process_on_display xfwm4 "$dxsk_display"; then
+            DISPLAY_X11_SESSION_KIND="xfce"
+        elif display_x11_process_on_display lightdm-gtk-greeter "$dxsk_display"; then
+            DISPLAY_X11_SESSION_KIND="lightdm-greeter"
+        fi
+    fi
+
+    export DISPLAY_X11_SESSION_KIND
+    printf '%s\n' "$DISPLAY_X11_SESSION_KIND"
+    return 0
+}
+
+# display_x11_adopt_candidate <display> [xauthority] [server-pid]
+# Validate one DISPLAY/XAUTHORITY candidate, export it for subsequent helpers,
+# capture optional server metadata, and classify the session.
+# Returns: 0 when the candidate is usable and adopted; 1 otherwise.
+display_x11_adopt_candidate() {
+    dxac_display="${1:-}"
+    dxac_authority="${2:-}"
+    dxac_pid="${3:-}"
+
+    [ -n "$dxac_display" ] || return 1
+
+    if [ -n "$dxac_authority" ] &&
+       display_x11_connection_ok "$dxac_display" "$dxac_authority"; then
+        DISPLAY="$dxac_display"
+        XAUTHORITY="$dxac_authority"
+        export DISPLAY XAUTHORITY
+    elif display_x11_connection_ok "$dxac_display" ""; then
+        DISPLAY="$dxac_display"
+        export DISPLAY
+        unset XAUTHORITY
+        dxac_authority=""
+    else
+        return 1
+    fi
+
+    DISPLAY_X11_DISPLAY="$dxac_display"
+    DISPLAY_X11_XAUTHORITY="$dxac_authority"
+    DISPLAY_X11_SERVER_PID="$dxac_pid"
+    DISPLAY_X11_SERVER_COMMAND=""
+
+    if [ -n "$dxac_pid" ] && [ -r "/proc/$dxac_pid/cmdline" ]; then
+        DISPLAY_X11_SERVER_COMMAND="$(
+            tr '\000' ' ' <"/proc/$dxac_pid/cmdline" 2>/dev/null
+        )"
+    fi
+
+    export DISPLAY_X11_DISPLAY
+    export DISPLAY_X11_XAUTHORITY
+    export DISPLAY_X11_SERVER_PID
+    export DISPLAY_X11_SERVER_COMMAND
+
+    display_x11_detect_session_kind >/dev/null 2>&1 || true
+
+    log_info "Adopted X11 runtime: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-<unset>} server_pid=${DISPLAY_X11_SERVER_PID:-unknown} session=${DISPLAY_X11_SESSION_KIND:-unknown}"
+    return 0
+}
+
+# display_x11_resolve_env [display-override] [xauthority-override]
+# Resolve and adopt a usable X11 runtime in this order: explicit override,
+# current environment, discovered X server processes, then live X11 sockets.
+# Returns: 0 after exporting a usable runtime; 1 when none can be discovered.
+display_x11_resolve_env() {
+    dxre_display_override="${1:-}"
+    dxre_authority_override="${2:-}"
+
+    if [ -n "$dxre_display_override" ]; then
+        if display_x11_adopt_candidate \
+            "$dxre_display_override" \
+            "$dxre_authority_override" \
+            ""; then
+            return 0
+        fi
+
+        if [ -n "${XAUTHORITY:-}" ] &&
+           [ "$dxre_authority_override" != "$XAUTHORITY" ] &&
+           display_x11_adopt_candidate \
+               "$dxre_display_override" \
+               "$XAUTHORITY" \
+               ""; then
+            return 0
+        fi
+    fi
+
+    if [ -n "${DISPLAY:-}" ]; then
+        if display_x11_adopt_candidate \
+            "$DISPLAY" \
+            "${XAUTHORITY:-}" \
+            ""; then
+            return 0
+        fi
+    fi
+
+    dxre_pids="$(display_x11_server_pids 2>/dev/null)"
+
+    for dxre_pid in $dxre_pids; do
+        dxre_display="$(display_x11_process_display "$dxre_pid" 2>/dev/null || true)"
+        dxre_authority="$(display_x11_process_authority "$dxre_pid" 2>/dev/null || true)"
+
+        [ -n "$dxre_display" ] || continue
+
+        if [ -z "$dxre_authority" ]; then
+            dxre_authority="$(
+                display_x11_find_authority_for_display "$dxre_display" 2>/dev/null || true
+            )"
+        fi
+
+        if [ -n "$dxre_display_override" ] &&
+           [ "$dxre_display" != "$dxre_display_override" ]; then
+            continue
+        fi
+
+        if [ -n "$dxre_authority_override" ]; then
+            dxre_authority="$dxre_authority_override"
+        fi
+
+        if display_x11_adopt_candidate \
+            "$dxre_display" \
+            "$dxre_authority" \
+            "$dxre_pid"; then
+            return 0
+        fi
+    done
+
+    for dxre_socket in /tmp/.X11-unix/X*; do
+        [ -S "$dxre_socket" ] || continue
+
+        dxre_index=${dxre_socket##*/X}
+        case "$dxre_index" in
+            ''|*[!0-9]*) continue ;;
+        esac
+
+        dxre_display=":$dxre_index"
+
+        if [ -n "$dxre_display_override" ] &&
+           [ "$dxre_display" != "$dxre_display_override" ]; then
+            continue
+        fi
+
+        dxre_socket_authority="$dxre_authority_override"
+        if [ -z "$dxre_socket_authority" ]; then
+            dxre_socket_authority="$(
+                display_x11_find_authority_for_display "$dxre_display" 2>/dev/null || true
+            )"
+        fi
+
+        if display_x11_adopt_candidate \
+            "$dxre_display" \
+            "$dxre_socket_authority" \
+            ""; then
+            return 0
+        fi
+    done
+
+    log_warn "No usable X11 display and Xauthority pair was discovered"
+    return 1
+}
+
+# display_x11_get_active_output
+# Discover the active XRandR output, current mode, and refresh rate. A primary
+# output is preferred; otherwise the first connected output with an active mode
+# is selected.
+# Sets and exports DISPLAY_X11_OUTPUT, DISPLAY_X11_MODE, and
+# DISPLAY_X11_REFRESH_HZ.
+# Returns: 0 when a valid active output is found; 1 otherwise.
+display_x11_get_active_output() {
+    command -v xrandr >/dev/null 2>&1 || return 1
+    display_x11_connection_ok || return 1
+
+    dxao_record="$(LC_ALL=C xrandr --current 2>/dev/null |
+        awk '
+            function clean_hz(value) {
+                gsub(/[+*i]/, "", value)
+                return value
+            }
+
+            $2 == "connected" {
+                in_output=1
+                output_name=$1
+                output_primary=0
+
+                for (i=3; i<=NF; i++) {
+                    if ($i == "primary") {
+                        output_primary=1
+                    }
+                }
+                next
+            }
+
+            $2 == "disconnected" {
+                in_output=0
+                next
+            }
+
+            in_output && $1 ~ /^[0-9]+x[0-9]+$/ {
+                for (i=2; i<=NF; i++) {
+                    if (index($i, "*") > 0) {
+                        hz=clean_hz($i)
+                        record=output_name "|" $1 "|" hz
+
+                        if (output_primary) {
+                            print record
+                            emitted=1
+                            exit
+                        }
+
+                        if (first_record == "") {
+                            first_record=record
+                        }
+                    }
+                }
+            }
+
+            END {
+                if (!emitted && first_record != "") {
+                    print first_record
+                }
+            }
+        ' | head -n 1)"
+
+    [ -n "$dxao_record" ] || return 1
+
+    DISPLAY_X11_OUTPUT="$(printf '%s\n' "$dxao_record" | awk -F'|' '{print $1}')"
+    DISPLAY_X11_MODE="$(printf '%s\n' "$dxao_record" | awk -F'|' '{print $2}')"
+    DISPLAY_X11_REFRESH_HZ="$(printf '%s\n' "$dxao_record" | awk -F'|' '{print $3}')"
+
+    case "$DISPLAY_X11_MODE" in
+        *x*) ;;
+        *) return 1 ;;
+    esac
+
+    case "$DISPLAY_X11_REFRESH_HZ" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+
+    export DISPLAY_X11_OUTPUT
+    export DISPLAY_X11_MODE
+    export DISPLAY_X11_REFRESH_HZ
+    return 0
+}
+
+# display_x11_get_primary_refresh_hz
+# Print the refresh rate selected by display_x11_get_active_output.
+# Returns: 0 when a refresh rate is printed; 1 when no active output is found.
+display_x11_get_primary_refresh_hz() {
+    if ! display_x11_get_active_output; then
+        return 1
+    fi
+
+    printf '%s\n' "$DISPLAY_X11_REFRESH_HZ"
+}
+
+# display_x11_get_root_geometry
+# Query the X11 root window and capture its width, height, depth, and map state.
+# Sets and exports DISPLAY_X11_ROOT_WIDTH, DISPLAY_X11_ROOT_HEIGHT,
+# DISPLAY_X11_ROOT_DEPTH, and DISPLAY_X11_ROOT_MAP_STATE.
+# Returns: 0 when numeric root geometry is available; 1 otherwise.
+display_x11_get_root_geometry() {
+    command -v xwininfo >/dev/null 2>&1 || return 1
+    display_x11_connection_ok || return 1
+
+    dxrg_out="$(LC_ALL=C xwininfo -root 2>/dev/null)" || return 1
+
+    DISPLAY_X11_ROOT_WIDTH="$(printf '%s\n' "$dxrg_out" |
+        sed -n 's/^[[:space:]]*Width:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_X11_ROOT_HEIGHT="$(printf '%s\n' "$dxrg_out" |
+        sed -n 's/^[[:space:]]*Height:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_X11_ROOT_DEPTH="$(printf '%s\n' "$dxrg_out" |
+        sed -n 's/^[[:space:]]*Depth:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_X11_ROOT_MAP_STATE="$(printf '%s\n' "$dxrg_out" |
+        sed -n 's/^[[:space:]]*Map State:[[:space:]]*//p' |
+        head -n 1)"
+
+    case "$DISPLAY_X11_ROOT_WIDTH:$DISPLAY_X11_ROOT_HEIGHT" in
+        *[!0-9:]*|:*|*:) return 1 ;;
+    esac
+
+    export DISPLAY_X11_ROOT_WIDTH
+    export DISPLAY_X11_ROOT_HEIGHT
+    export DISPLAY_X11_ROOT_DEPTH
+    export DISPLAY_X11_ROOT_MAP_STATE
+    return 0
+}
+
+# display_x11_print_glx_pipeline
+# Run glxinfo -B, parse the direct-rendering and renderer details, classify the
+# pipeline as hardware or software, export the parsed fields, and print the raw
+# glxinfo output.
+# Returns: 0 when a renderer is reported; 1 when glxinfo or the X11 connection
+# is unavailable or glxinfo fails.
+display_x11_print_glx_pipeline() {
+    DISPLAY_GLX_DIRECT=""
+    DISPLAY_GLX_ACCELERATED=""
+    DISPLAY_GLX_VENDOR=""
+    DISPLAY_GLX_RENDERER=""
+    DISPLAY_GLX_VERSION=""
+    DISPLAY_GLX_PIPE_KIND=""
+    DISPLAY_GLX_OUT=""
+
+    command -v glxinfo >/dev/null 2>&1 || return 1
+    display_x11_connection_ok || return 1
+
+    dxpg_out="$(LC_ALL=C glxinfo -B 2>&1)"
+    dxpg_rc=$?
+
+    if [ "$dxpg_rc" -ne 0 ]; then
+        printf '%s\n' "$dxpg_out"
+        return 1
+    fi
+
+    DISPLAY_GLX_DIRECT="$(printf '%s\n' "$dxpg_out" |
+        sed -n 's/^direct rendering:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_GLX_ACCELERATED="$(printf '%s\n' "$dxpg_out" |
+        sed -n 's/^[[:space:]]*Accelerated:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_GLX_VENDOR="$(printf '%s\n' "$dxpg_out" |
+        sed -n 's/^OpenGL vendor string:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_GLX_RENDERER="$(printf '%s\n' "$dxpg_out" |
+        sed -n 's/^OpenGL renderer string:[[:space:]]*//p' |
+        head -n 1)"
+    DISPLAY_GLX_VERSION="$(printf '%s\n' "$dxpg_out" |
+        sed -n \
+            -e 's/^OpenGL core profile version string:[[:space:]]*//p' \
+            -e 's/^OpenGL version string:[[:space:]]*//p' |
+        head -n 1)"
+
+    [ -n "$DISPLAY_GLX_VENDOR" ] || DISPLAY_GLX_VENDOR="unknown"
+    [ -n "$DISPLAY_GLX_RENDERER" ] || DISPLAY_GLX_RENDERER="unknown"
+    [ -n "$DISPLAY_GLX_VERSION" ] || DISPLAY_GLX_VERSION="unknown"
+
+    if command -v egli_classify_pipeline >/dev/null 2>&1; then
+        DISPLAY_GLX_PIPE_KIND="$(egli_classify_pipeline \
+            "" \
+            "$DISPLAY_GLX_VENDOR" \
+            "$DISPLAY_GLX_RENDERER")"
+    else
+        case "$(printf '%s\n' "$DISPLAY_GLX_RENDERER" | tr '[:upper:]' '[:lower:]')" in
+            *llvmpipe*|*softpipe*|*swrast*|*software*)
+                DISPLAY_GLX_PIPE_KIND="CPU (software)"
+                ;;
+            unknown|"")
+                DISPLAY_GLX_PIPE_KIND="unknown"
+                ;;
+            *)
+                DISPLAY_GLX_PIPE_KIND="GPU (hardware)"
+                ;;
+        esac
+    fi
+
+    [ -n "$DISPLAY_GLX_PIPE_KIND" ] || DISPLAY_GLX_PIPE_KIND="unknown"
+    DISPLAY_GLX_OUT="$dxpg_out"
+
+    export DISPLAY_GLX_DIRECT
+    export DISPLAY_GLX_ACCELERATED
+    export DISPLAY_GLX_VENDOR
+    export DISPLAY_GLX_RENDERER
+    export DISPLAY_GLX_VERSION
+    export DISPLAY_GLX_PIPE_KIND
+    export DISPLAY_GLX_OUT
+
+    printf '%s\n' "$dxpg_out"
+    log_info "GLXINFO: direct=${DISPLAY_GLX_DIRECT:-unknown} accelerated=${DISPLAY_GLX_ACCELERATED:-unknown}"
+    log_info "GLXINFO: vendor=$DISPLAY_GLX_VENDOR"
+    log_info "GLXINFO: renderer=$DISPLAY_GLX_RENDERER"
+    log_info "GLXINFO: version=$DISPLAY_GLX_VERSION"
+    log_info "GLXINFO: pipeline type=$DISPLAY_GLX_PIPE_KIND"
+
+    [ "$DISPLAY_GLX_RENDERER" != "unknown" ]
+}
+
+###############################################################################
+# X11 fullscreen helpers
+###############################################################################
+# These helpers are shared by X11 clients that do not provide a reliable native
+# fullscreen option. Window discovery compares exact before/after snapshots so
+# an existing root, greeter, panel, or desktop window is not selected.
+
+DISPLAY_X11_FULLSCREEN_WATCH_PID=""
+DISPLAY_X11_FULLSCREEN_STATUS_FILE=""
+DISPLAY_X11_FULLSCREEN_STOP_FILE=""
+DISPLAY_X11_FULLSCREEN_RESULT=""
+DISPLAY_X11_FULLSCREEN_WINDOW_ID=""
+DISPLAY_X11_FULLSCREEN_DETAIL=""
+DISPLAY_X11_FULLSCREEN_AVAILABLE=0
+DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL=0
+
+# display_x11__snapshot_visible_windows <output-file>
+# Save the unique IDs of all currently visible X11 windows to the supplied file.
+# Returns: 0 when the snapshot file is created; 1 when it cannot be created.
+display_x11__snapshot_visible_windows() {
+    dxsvw_file="${1:-}"
+
+    [ -n "$dxsvw_file" ] || return 1
+    : >"$dxsvw_file" || return 1
+
+    xdotool search \
+        --onlyvisible \
+        --name '.*' \
+        2>/dev/null |
+        awk '/^[0-9]+$/ && !seen[$1]++ { print $1 }' \
+        >"$dxsvw_file" ||
+        true
+
+    return 0
+}
+
+# display_x11__snapshot_command_pids <command> <output-file>
+# Save the PIDs whose process comm exactly matches the requested command. A path
+# is normalized to its basename before matching.
+# Returns: 0 when the snapshot file is created; 1 when it cannot be created.
+display_x11__snapshot_command_pids() {
+    dxscp_command="${1:-}"
+    dxscp_file="${2:-}"
+
+    [ -n "$dxscp_file" ] || return 1
+    : >"$dxscp_file" || return 1
+
+    [ -n "$dxscp_command" ] || return 0
+    dxscp_command=${dxscp_command##*/}
+
+    ps -eo pid=,comm= 2>/dev/null |
+        awk -v command="$dxscp_command" '
+            $2 == command {
+                print $1
+            }
+        ' >"$dxscp_file" ||
+        true
+
+    return 0
+}
+
+# display_x11__window_is_viewable <window-id>
+# Return success when xwininfo reports that the requested X11 window is mapped
+# and viewable.
+# Returns: 0 for a viewable window; 1 otherwise.
+display_x11__window_is_viewable() {
+    dxwiv_id="${1:-}"
+
+    [ -n "$dxwiv_id" ] || return 1
+
+    LC_ALL=C xwininfo \
+        -id "$dxwiv_id" \
+        2>/dev/null |
+        grep -q 'Map State:[[:space:]]*IsViewable'
+}
+
+# display_x11__find_new_window <command> <before-windows> <before-pids>
+#                              <after-windows> <after-pids>
+# Find a newly created viewable window. New PIDs matching the client command are
+# preferred; a before/after visible-window comparison is used as fallback.
+# Sets and exports DISPLAY_X11_FULLSCREEN_WINDOW_ID.
+# Returns: 0 when a new viewable window is found; 1 otherwise.
+display_x11__find_new_window() {
+    dxfnw_command="${1:-}"
+    dxfnw_before_windows="${2:-}"
+    dxfnw_before_pids="${3:-}"
+    dxfnw_after_windows="${4:-}"
+    dxfnw_after_pids="${5:-}"
+
+    DISPLAY_X11_FULLSCREEN_WINDOW_ID=""
+
+    display_x11__snapshot_command_pids \
+        "$dxfnw_command" \
+        "$dxfnw_after_pids"
+
+    if [ -n "$dxfnw_command" ]; then
+        while IFS= read -r dxfnw_pid; do
+            [ -n "$dxfnw_pid" ] || continue
+
+            if grep -Fqx \
+                "$dxfnw_pid" \
+                "$dxfnw_before_pids" \
+                2>/dev/null; then
+                continue
+            fi
+
+            dxfnw_id="$({
+                xdotool search \
+                    --onlyvisible \
+                    --pid "$dxfnw_pid" \
+                    2>/dev/null ||
+                    true
+            } | head -n 1)"
+
+            if display_x11__window_is_viewable "$dxfnw_id"; then
+                DISPLAY_X11_FULLSCREEN_WINDOW_ID="$dxfnw_id"
+                export DISPLAY_X11_FULLSCREEN_WINDOW_ID
+                return 0
+            fi
+        done <"$dxfnw_after_pids"
+    fi
+
+    display_x11__snapshot_visible_windows "$dxfnw_after_windows"
+
+    while IFS= read -r dxfnw_id; do
+        [ -n "$dxfnw_id" ] || continue
+
+        if grep -Fqx \
+            "$dxfnw_id" \
+            "$dxfnw_before_windows" \
+            2>/dev/null; then
+            continue
+        fi
+
+        if display_x11__window_is_viewable "$dxfnw_id"; then
+            DISPLAY_X11_FULLSCREEN_WINDOW_ID="$dxfnw_id"
+            export DISPLAY_X11_FULLSCREEN_WINDOW_ID
+            return 0
+        fi
+    done <"$dxfnw_after_windows"
+
+    return 1
+}
+
+# display_x11__recover_command <command>
+# Recover one missing X11 command through the common command-to-package map.
+# The package-provider library is sourced lazily when needed, and the configured
+# dependency-recovery policy is respected.
+# Returns: 0 when the command is available before or after recovery; 1 otherwise.
+display_x11__recover_command() {
+    dxrc_command="${1:-}"
+
+    [ -n "$dxrc_command" ] || return 1
+
+    if command -v "$dxrc_command" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! command -v pkg_ensure_command >/dev/null 2>&1; then
+        if [ -n "${TOOLS:-}" ] && [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+            # shellcheck disable=SC1091
+            . "$TOOLS/lib_pkg_provider.sh"
+        fi
+    fi
+
+    if ! command -v pkg_ensure_command >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if command -v pkg_check_dependencies_recover_enabled >/dev/null 2>&1 &&
+       ! pkg_check_dependencies_recover_enabled; then
+        return 1
+    fi
+
+    if ! pkg_ensure_command "$dxrc_command"; then
+        return 1
+    fi
+
+    hash -r 2>/dev/null || true
+    command -v "$dxrc_command" >/dev/null 2>&1
+}
+
+# display_x11_prepare_fullscreen_support
+# Prepare the optional shared fullscreen watcher when X11_FULLSCREEN=1.
+# xdotool and xwininfo are required and are recovered individually through the
+# command map. wmctrl is recovered best-effort and enables an EWMH fullscreen
+# request in addition to the geometry fallback.
+# Sets and exports DISPLAY_X11_FULLSCREEN_AVAILABLE and
+# DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL.
+# Returns: 0 when fullscreen is disabled or support is ready; 1 when enabled but
+# required commands remain unavailable.
+display_x11_prepare_fullscreen_support() {
+    DISPLAY_X11_FULLSCREEN_AVAILABLE=0
+    DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL=0
+
+    export DISPLAY_X11_FULLSCREEN_AVAILABLE
+    export DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL
+
+    [ "${X11_FULLSCREEN:-0}" = "1" ] || return 0
+
+    display_x11__recover_command xdotool || true
+    display_x11__recover_command xwininfo || true
+
+    # Optional EWMH support. Failure does not disable geometry-based fullscreen.
+    display_x11__recover_command wmctrl || true
+
+    if command -v wmctrl >/dev/null 2>&1; then
+        DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL=1
+    fi
+
+    if command -v xdotool >/dev/null 2>&1 &&
+       command -v xwininfo >/dev/null 2>&1; then
+        DISPLAY_X11_FULLSCREEN_AVAILABLE=1
+        export DISPLAY_X11_FULLSCREEN_AVAILABLE
+        export DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL
+
+        log_info "X11 fullscreen support ready: xdotool=$(command -v xdotool) xwininfo=$(command -v xwininfo) wmctrl=${DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL}"
+        return 0
+    fi
+
+    if ! command -v xdotool >/dev/null 2>&1; then
+        log_warn "X11 fullscreen support unavailable: xdotool not installed"
+    fi
+
+    if ! command -v xwininfo >/dev/null 2>&1; then
+        log_warn "X11 fullscreen support unavailable: xwininfo not installed"
+    fi
+
+    export DISPLAY_X11_FULLSCREEN_AVAILABLE
+    export DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL
+    return 1
+}
+
+# display_x11__apply_fullscreen_window <window-id> <width> <height>
+# Map the selected window, request EWMH fullscreen when wmctrl is available,
+# force it to root-window geometry with xdotool, and verify the resulting size.
+# Sets and exports DISPLAY_X11_FULLSCREEN_DETAIL.
+# Returns: 0 when the measured size matches; 1 otherwise.
+display_x11__apply_fullscreen_window() {
+    dxafw_id="${1:-}"
+    dxafw_width="${2:-}"
+    dxafw_height="${3:-}"
+
+    [ -n "$dxafw_id" ] || return 1
+    [ -n "$dxafw_width" ] || return 1
+    [ -n "$dxafw_height" ] || return 1
+
+    xdotool windowmap \
+        "$dxafw_id" \
+        >/dev/null 2>&1 ||
+        true
+
+    if [ "${DISPLAY_X11_FULLSCREEN_HAVE_WMCTRL:-0}" = "1" ] &&
+       command -v wmctrl >/dev/null 2>&1; then
+        dxafw_hex="$({
+            printf '0x%x\n' "$dxafw_id" 2>/dev/null ||
+            true
+        } | head -n 1)"
+
+        if [ -n "$dxafw_hex" ]; then
+            wmctrl \
+                -i \
+                -r "$dxafw_hex" \
+                -b add,fullscreen \
+                >/dev/null 2>&1 ||
+                true
+        fi
+    fi
+
+    xdotool windowmove \
+        "$dxafw_id" \
+        0 \
+        0 \
+        >/dev/null 2>&1 ||
+        true
+
+    xdotool windowsize \
+        "$dxafw_id" \
+        "$dxafw_width" \
+        "$dxafw_height" \
+        >/dev/null 2>&1 ||
+        true
+
+    xdotool windowraise \
+        "$dxafw_id" \
+        >/dev/null 2>&1 ||
+        true
+
+    dxafw_actual_width="$({
+        LC_ALL=C xwininfo \
+            -id "$dxafw_id" \
+            2>/dev/null ||
+            true
+    } | awk '
+        /^[[:space:]]*Width:/ {
+            print $2
+            exit
+        }
+    ')"
+
+    dxafw_actual_height="$({
+        LC_ALL=C xwininfo \
+            -id "$dxafw_id" \
+            2>/dev/null ||
+            true
+    } | awk '
+        /^[[:space:]]*Height:/ {
+            print $2
+            exit
+        }
+    ')"
+
+    DISPLAY_X11_FULLSCREEN_DETAIL="actual=${dxafw_actual_width:-unknown}x${dxafw_actual_height:-unknown}"
+    export DISPLAY_X11_FULLSCREEN_DETAIL
+
+    [ "$dxafw_actual_width" = "$dxafw_width" ] &&
+    [ "$dxafw_actual_height" = "$dxafw_height" ]
+}
+
+# display_x11_fullscreen_watch_start [wait-seconds] [command] [status-file]
+# Start a background watcher before launching an X11 client. It snapshots the
+# current windows/processes, waits for the new client window, and repeatedly
+# applies fullscreen geometry until the client exits or the watcher is stopped.
+# Sets and exports watcher PID/status/stop-file globals.
+# Returns: 0 when the watcher starts; 1 when fullscreen is disabled, preparation
+# fails, the timeout is invalid, or root geometry cannot be resolved.
+display_x11_fullscreen_watch_start() {
+    dxfw_wait_seconds="${1:-10}"
+    dxfw_command="${2:-}"
+    dxfw_status_file="${3:-/tmp/display-x11-fullscreen-$$.status}"
+    dxfw_stop_file="${dxfw_status_file}.stop"
+    dxfw_before_windows="${dxfw_status_file}.before-windows"
+    dxfw_before_pids="${dxfw_status_file}.before-pids"
+    dxfw_after_windows="${dxfw_status_file}.after-windows"
+    dxfw_after_pids="${dxfw_status_file}.after-pids"
+
+    DISPLAY_X11_FULLSCREEN_WATCH_PID=""
+    DISPLAY_X11_FULLSCREEN_STATUS_FILE="$dxfw_status_file"
+    DISPLAY_X11_FULLSCREEN_STOP_FILE="$dxfw_stop_file"
+
+    export DISPLAY_X11_FULLSCREEN_WATCH_PID
+    export DISPLAY_X11_FULLSCREEN_STATUS_FILE
+    export DISPLAY_X11_FULLSCREEN_STOP_FILE
+
+    case "$dxfw_wait_seconds" in
+        ''|*[!0-9]*|0)
+            printf '%s\n' \
+                "SKIP|invalid-timeout|$dxfw_wait_seconds" \
+                >"$dxfw_status_file"
+            return 1
+            ;;
+    esac
+
+    if [ "${X11_FULLSCREEN:-0}" != "1" ]; then
+        printf '%s\n' \
+            "SKIP|fullscreen-disabled|" \
+            >"$dxfw_status_file"
+        return 1
+    fi
+
+    if ! display_x11_prepare_fullscreen_support; then
+        if ! command -v xdotool >/dev/null 2>&1; then
+            dxfw_prepare_reason="xdotool-unavailable"
+        elif ! command -v xwininfo >/dev/null 2>&1; then
+            dxfw_prepare_reason="xwininfo-unavailable"
+        else
+            dxfw_prepare_reason="fullscreen-support-unavailable"
+        fi
+
+        printf '%s\n' \
+            "SKIP|$dxfw_prepare_reason|" \
+            >"$dxfw_status_file"
+        return 1
+    fi
+
+    if ! display_x11_get_root_geometry; then
+        printf '%s\n' \
+            "SKIP|root-geometry-unavailable|" \
+            >"$dxfw_status_file"
+        return 1
+    fi
+
+    dxfw_root_width="$DISPLAY_X11_ROOT_WIDTH"
+    dxfw_root_height="$DISPLAY_X11_ROOT_HEIGHT"
+
+    case "$dxfw_root_width:$dxfw_root_height" in
+        *[!0-9:]*|:*|*:)
+            printf '%s\n' \
+                "SKIP|invalid-root-geometry|${dxfw_root_width}x${dxfw_root_height}" \
+                >"$dxfw_status_file"
+            return 1
+            ;;
+    esac
+
+    rm -f \
+        "$dxfw_status_file" \
+        "$dxfw_stop_file" \
+        "$dxfw_before_windows" \
+        "$dxfw_before_pids" \
+        "$dxfw_after_windows" \
+        "$dxfw_after_pids"
+
+    if ! display_x11__snapshot_visible_windows "$dxfw_before_windows"; then
+        printf '%s\n' \
+            "SKIP|window-snapshot-failed|" \
+            >"$dxfw_status_file"
+        return 1
+    fi
+
+    if ! display_x11__snapshot_command_pids \
+        "$dxfw_command" \
+        "$dxfw_before_pids"; then
+        printf '%s\n' \
+            "SKIP|process-snapshot-failed|command=$dxfw_command" \
+            >"$dxfw_status_file"
+        return 1
+    fi
+
+    (
+        dxfw_elapsed=0
+        dxfw_window_id=""
+        dxfw_first_apply_elapsed=""
+        dxfw_verified=0
+
+        while [ "$dxfw_elapsed" -lt "$dxfw_wait_seconds" ] &&
+              [ ! -e "$dxfw_stop_file" ]; do
+            if display_x11__find_new_window \
+                "$dxfw_command" \
+                "$dxfw_before_windows" \
+                "$dxfw_before_pids" \
+                "$dxfw_after_windows" \
+                "$dxfw_after_pids"; then
+                dxfw_window_id="$DISPLAY_X11_FULLSCREEN_WINDOW_ID"
+                break
+            fi
+
+            sleep 1
+            dxfw_elapsed=$((dxfw_elapsed + 1))
+        done
+
+        if [ -z "$dxfw_window_id" ]; then
+            printf '%s\n' \
+                "SKIP|window-not-found|command=$dxfw_command" \
+                >"$dxfw_status_file"
+            exit 0
+        fi
+
+        while [ ! -e "$dxfw_stop_file" ]; do
+            if ! display_x11__window_is_viewable "$dxfw_window_id"; then
+                break
+            fi
+
+            if display_x11__apply_fullscreen_window \
+                "$dxfw_window_id" \
+                "$dxfw_root_width" \
+                "$dxfw_root_height"; then
+                dxfw_verified=1
+
+                if [ -z "$dxfw_first_apply_elapsed" ]; then
+                    dxfw_first_apply_elapsed="$dxfw_elapsed"
+                    printf '%s\n' \
+                        "PASS|$dxfw_window_id|geometry=${dxfw_root_width}x${dxfw_root_height};detected_after=${dxfw_first_apply_elapsed}s" \
+                        >"$dxfw_status_file"
+                fi
+            fi
+
+            sleep 1
+        done
+
+        if [ "$dxfw_verified" -eq 0 ]; then
+            printf '%s\n' \
+                "WARN|$dxfw_window_id|${DISPLAY_X11_FULLSCREEN_DETAIL:-geometry-not-verified}" \
+                >"$dxfw_status_file"
+        fi
+    ) &
+
+    DISPLAY_X11_FULLSCREEN_WATCH_PID=$!
+
+    export DISPLAY_X11_FULLSCREEN_WATCH_PID
+    export DISPLAY_X11_FULLSCREEN_STATUS_FILE
+    export DISPLAY_X11_FULLSCREEN_STOP_FILE
+
+    return 0
+}
+
+# display_x11_fullscreen_watch_finish
+# Stop and join the active watcher, parse its status file into exported globals,
+# remove transient snapshot files, and log the final fullscreen result.
+# Returns: 0 for PASS, 1 for WARN, and 2 for SKIP/not applied.
+display_x11_fullscreen_watch_finish() {
+    dxfwf_status_file="${DISPLAY_X11_FULLSCREEN_STATUS_FILE:-}"
+    dxfwf_stop_file="${DISPLAY_X11_FULLSCREEN_STOP_FILE:-}"
+
+    DISPLAY_X11_FULLSCREEN_RESULT="SKIP"
+    DISPLAY_X11_FULLSCREEN_WINDOW_ID=""
+    DISPLAY_X11_FULLSCREEN_DETAIL="watcher-not-started"
+
+    if [ -n "$dxfwf_stop_file" ]; then
+        : >"$dxfwf_stop_file" 2>/dev/null ||
+            true
+    fi
+
+    if [ -n "${DISPLAY_X11_FULLSCREEN_WATCH_PID:-}" ]; then
+        wait \
+            "$DISPLAY_X11_FULLSCREEN_WATCH_PID" \
+            2>/dev/null ||
+            true
+    fi
+
+    if [ -n "$dxfwf_status_file" ] && [ -r "$dxfwf_status_file" ]; then
+        IFS='|' read -r \
+            DISPLAY_X11_FULLSCREEN_RESULT \
+            DISPLAY_X11_FULLSCREEN_WINDOW_ID \
+            DISPLAY_X11_FULLSCREEN_DETAIL \
+            <"$dxfwf_status_file"
+    fi
+
+    if [ -n "$dxfwf_status_file" ]; then
+        rm -f \
+            "$dxfwf_stop_file" \
+            "${dxfwf_status_file}.before-windows" \
+            "${dxfwf_status_file}.before-pids" \
+            "${dxfwf_status_file}.after-windows" \
+            "${dxfwf_status_file}.after-pids" \
+            2>/dev/null ||
+            true
+    elif [ -n "$dxfwf_stop_file" ]; then
+        rm -f "$dxfwf_stop_file" 2>/dev/null || true
+    fi
+
+    DISPLAY_X11_FULLSCREEN_WATCH_PID=""
+    DISPLAY_X11_FULLSCREEN_STOP_FILE=""
+
+    export DISPLAY_X11_FULLSCREEN_RESULT
+    export DISPLAY_X11_FULLSCREEN_WINDOW_ID
+    export DISPLAY_X11_FULLSCREEN_DETAIL
+    export DISPLAY_X11_FULLSCREEN_WATCH_PID
+    export DISPLAY_X11_FULLSCREEN_STOP_FILE
+
+    case "$DISPLAY_X11_FULLSCREEN_RESULT" in
+        PASS)
+            log_info "X11 fullscreen applied: window=$DISPLAY_X11_FULLSCREEN_WINDOW_ID $DISPLAY_X11_FULLSCREEN_DETAIL"
+            return 0
+            ;;
+        WARN)
+            log_warn "X11 fullscreen could not be fully verified: window=$DISPLAY_X11_FULLSCREEN_WINDOW_ID detail=$DISPLAY_X11_FULLSCREEN_DETAIL"
+            return 1
+            ;;
+        *)
+            log_warn "X11 fullscreen was not applied: reason=$DISPLAY_X11_FULLSCREEN_WINDOW_ID detail=$DISPLAY_X11_FULLSCREEN_DETAIL"
+            return 2
+            ;;
+    esac
+}
+
+# display_x11_xvideo_available
+# Probe xvinfo on the adopted X11 display and return success only when at least
+# one XVideo adaptor is reported.
+# Returns: 0 when XVideo is usable; 1 otherwise.
+display_x11_xvideo_available() {
+    command -v xvinfo >/dev/null 2>&1 || return 1
+    display_x11_connection_ok || return 1
+
+    dxxv_out="$(LC_ALL=C xvinfo 2>&1)"
+    dxxv_rc=$?
+
+    [ "$dxxv_rc" -eq 0 ] || return 1
+
+    if printf '%s\n' "$dxxv_out" |
+       grep -Eq 'number of adaptors:[[:space:]]*[1-9][0-9]*|Adaptor #[0-9]+'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# display_get_primary_refresh_hz [auto|x11|wayland|weston]
+# Print the primary display refresh rate using the requested backend. Auto mode
+# prefers a usable Wayland/Weston runtime, then X11, and finally a direct Weston
+# fallback when the helper exists.
+# Returns: 0 when a refresh rate is printed; 1 when no backend can provide one.
+display_get_primary_refresh_hz() {
+    dgpr_backend="${1:-auto}"
+
+    case "$dgpr_backend" in
+        x11)
+            display_x11_get_primary_refresh_hz
+            return $?
+            ;;
+        wayland|weston)
+            if command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+                weston_get_primary_refresh_hz
+                return $?
+            fi
+            return 1
+            ;;
+        auto)
+            if command -v egli_wayland_socket_ok >/dev/null 2>&1 &&
+               egli_wayland_socket_ok >/dev/null 2>&1 &&
+               command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+                if weston_get_primary_refresh_hz; then
+                    return 0
+                fi
+            fi
+
+            if display_x11_connection_ok >/dev/null 2>&1 &&
+               command -v xrandr >/dev/null 2>&1; then
+                if display_x11_get_primary_refresh_hz; then
+                    return 0
+                fi
+            fi
+
+            if command -v weston_get_primary_refresh_hz >/dev/null 2>&1; then
+                weston_get_primary_refresh_hz
+                return $?
+            fi
+            ;;
+        *)
+            log_warn "Unsupported display refresh backend: $dgpr_backend"
+            ;;
+    esac
+
+    return 1
+}
+
+
+###############################################################################
+# Weston testcase integration helpers
+#
+# This block is intentionally limited to:
+# - minimal Weston package/client recovery on apt systems
+# - the already validated base/overlay graphics-stack transitions
+# - the existing image-managed Yocto Weston lifecycle
+# - testcase FPS policy
+#
+# It does not create users, TTY sessions, PAM configuration, udev rules,
+# systemd units, seatd instances, or standalone Weston processes.
+###############################################################################
+
+display_ensure_weston_test_dependencies() {
+    dewtd_client="${1:-weston-simple-egl}"
+    dewtd_os_id="unknown"
+    dewtd_provider="check"
+    dewtd_dependencies=""
+    dewtd_rc=0
+    dewtd_old_check_deps_no_exit="${CHECK_DEPS_NO_EXIT-__unset__}"
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dewtd_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        dewtd_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    [ -n "$dewtd_os_id" ] || dewtd_os_id="unknown"
+
+    if command -v pkg_active_provider >/dev/null 2>&1; then
+        dewtd_provider="$(pkg_active_provider 2>/dev/null || true)"
+    fi
+
+    [ -n "$dewtd_provider" ] || dewtd_provider="check"
+
+    case "$dewtd_os_id" in
+        debian|ubuntu)
+            if [ "$dewtd_provider" = "apt" ] &&
+               command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+                if ! pkg_ensure_required_package_set_present weston-runtime; then
+                    log_fail "Failed to ensure the minimal Weston runtime package set"
+                    return 1
+                fi
+            fi
+
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        centos|rhel|fedora)
+            # RPM package names vary by release and repository. Keep this path
+            # check-only until explicit validated mappings are added.
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        *)
+            # Preserve Yocto and other image-provided package behavior.
+            dewtd_dependencies="$dewtd_client"
+            ;;
+    esac
+
+    CHECK_DEPS_NO_EXIT=1
+    export CHECK_DEPS_NO_EXIT
+
+    if ! check_dependencies "$dewtd_dependencies"; then
+        dewtd_rc=1
+    fi
+
+    case "$dewtd_old_check_deps_no_exit" in
+        __unset__)
+            unset CHECK_DEPS_NO_EXIT
+            ;;
+        *)
+            CHECK_DEPS_NO_EXIT="$dewtd_old_check_deps_no_exit"
+            export CHECK_DEPS_NO_EXIT
+            ;;
+    esac
+
+    if [ "$dewtd_rc" -ne 0 ]; then
+        log_fail "Required Weston commands are unavailable, os=$dewtd_os_id commands=$dewtd_dependencies"
+        return 1
+    fi
+
+    log_pass "Weston testcase dependencies are ready, client=$dewtd_client"
+    return 0
+}
+
+
+# Return success when the named systemd unit currently exists.
+display_desktop_weston_unit_exists() {
+    ddwue_unit="${1:-qcom-testkit-weston.service}"
+    ddwue_load_state=""
+
+    command -v systemctl >/dev/null 2>&1 || return 1
+
+    ddwue_load_state="$(
+        systemctl show "$ddwue_unit" \
+            -p LoadState \
+            --value 2>/dev/null ||
+        true
+    )"
+
+    [ -n "$ddwue_load_state" ] &&
+        [ "$ddwue_load_state" != "not-found" ]
+}
+
+# Return success when the Weston log contains a fatal DRM/KMS startup error.
+display_desktop_weston_log_has_fatal_errors() {
+    ddwlhfe_log="${1:-}"
+
+    [ -n "$ddwlhfe_log" ] || return 1
+    [ -r "$ddwlhfe_log" ] || return 1
+
+    grep -Eiq \
+        "atomic: couldn.t commit new state: Permission denied|repaint-flush failed: Permission denied|failed to acquire DRM master|failed to initialize DRM backend|failed to create renderer|failed to open.*DRM" \
+        "$ddwlhfe_log"
+}
+
+# Adopt and validate one desktop Weston socket.
+display_adopt_desktop_weston_socket() {
+    dadws_socket="${1:-}"
+    dadws_log="${2:-}"
+
+    [ -n "$dadws_socket" ] || return 1
+    [ -S "$dadws_socket" ] || return 1
+
+    if command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        if ! adopt_wayland_env_from_socket "$dadws_socket"; then
+            return 1
+        fi
+    else
+        XDG_RUNTIME_DIR="$(dirname "$dadws_socket")"
+        WAYLAND_DISPLAY="$(basename "$dadws_socket")"
+        export XDG_RUNTIME_DIR
+        export WAYLAND_DISPLAY
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1; then
+        if ! wayland_connection_ok; then
+            return 1
+        fi
+    fi
+
+    if [ -n "$dadws_log" ] &&
+       display_desktop_weston_log_has_fatal_errors "$dadws_log"; then
+        log_error "Weston reports fatal DRM/KMS errors: $dadws_log"
+        return 1
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dadws_socket"
+    DISPLAY_RUNTIME_MODEL="desktop-systemd-transient"
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    log_info "Wayland runtime model, $DISPLAY_RUNTIME_MODEL"
+    log_info "Wayland socket, $DISPLAY_WAYLAND_SOCKET"
+    log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
+    log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+
+    return 0
+}
+
+# Stop the qcom-testkit transient Weston runtime.
+#
+# Arguments:
+#   $1 - restore display manager: 1=yes, 0=no, default=1
+#
+# This helper never removes packages or persistent system configuration.
+display_stop_transient_weston_runtime() {
+    dstwr_restore_dm="${1:-1}"
+    dstwr_unit="qcom-testkit-weston.service"
+    dstwr_runtime_dir="/run/qcom-testkit-weston"
+    dstwr_socket_name="wayland-qcom-testkit"
+    dstwr_state_file="$dstwr_runtime_dir/display-manager.state"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "$dstwr_unit" >/dev/null 2>&1 || true
+        systemctl reset-failed "$dstwr_unit" >/dev/null 2>&1 || true
+    fi
+
+    rm -f \
+        "$dstwr_runtime_dir/$dstwr_socket_name" \
+        "$dstwr_runtime_dir/$dstwr_socket_name.lock" \
+        2>/dev/null || true
+
+    if [ "$dstwr_restore_dm" -eq 1 ] 2>/dev/null &&
+       command -v display_restore_service_from_state >/dev/null 2>&1; then
+        display_restore_service_from_state "$dstwr_state_file" || return 1
+    fi
+
+    if [ "$dstwr_restore_dm" -eq 1 ] 2>/dev/null; then
+        rm -rf "$dstwr_runtime_dir" 2>/dev/null || true
+    fi
+
+    if [ "${DISPLAY_WAYLAND_SOCKET:-}" = "$dstwr_runtime_dir/$dstwr_socket_name" ]; then
+        unset DISPLAY_WAYLAND_SOCKET
+        unset DISPLAY_RUNTIME_MODEL
+        unset WAYLAND_DISPLAY
+        unset XDG_RUNTIME_DIR
+    fi
+
+    return 0
+}
+
+# Start the proven desktop Weston runtime through systemd-run.
+#
+# The command path intentionally matches the target-validated manual sequence:
+# - stop display-manager.service and record whether it was active
+# - create a root-owned XDG runtime directory
+# - start Weston as a transient system service
+# - use Weston/libseat default backend selection
+# - do not set LIBSEAT_BACKEND, SEATD_VTBOUND, or a custom seat
+#
+# Arguments:
+#   $1 - testcase/log tag
+#   $2 - socket startup timeout in seconds
+#
+# Return:
+#   0 - runtime is ready
+#   1 - runtime startup or validation failed
+display_start_transient_weston_runtime() {
+    dstwr_testname="${1:-display-test}"
+    dstwr_wait_secs="${2:-10}"
+    dstwr_unit="qcom-testkit-weston.service"
+    dstwr_runtime_dir="/run/qcom-testkit-weston"
+    dstwr_socket_name="wayland-qcom-testkit"
+    dstwr_socket="$dstwr_runtime_dir/$dstwr_socket_name"
+    dstwr_log="/tmp/qcom-testkit-weston.log"
+    dstwr_state_file="$dstwr_runtime_dir/display-manager.state"
+    dstwr_drm_device=""
+    dstwr_drm_card=""
+    dstwr_egl_json="${__EGL_VENDOR_LIBRARY_FILENAMES:-}"
+    dstwr_weston_bin=""
+    dstwr_wait=0
+    dstwr_started=0
+
+    case "$dstwr_wait_secs" in
+        ''|*[!0-9]*)
+            dstwr_wait_secs=10
+            ;;
+    esac
+
+    [ "$dstwr_wait_secs" -gt 0 ] 2>/dev/null || dstwr_wait_secs=10
+
+    for dstwr_command in systemctl systemd-run weston; do
+        if ! command -v "$dstwr_command" >/dev/null 2>&1; then
+            log_error "Cannot start desktop Weston, required command is unavailable: $dstwr_command"
+            return 1
+        fi
+    done
+
+    dstwr_weston_bin="$(command -v weston 2>/dev/null || true)"
+
+    if [ -z "$dstwr_weston_bin" ]; then
+        log_error "Cannot start desktop Weston, weston binary could not be resolved"
+        return 1
+    fi
+
+    if ! command -v display_select_primary_drm_device >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, DRM selection helper is unavailable"
+        return 1
+    fi
+
+    if ! command -v display_stop_service_for_drm >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, display-manager ownership helper is unavailable"
+        return 1
+    fi
+
+    dstwr_drm_device="$(
+        display_select_primary_drm_device 2>/dev/null ||
+        true
+    )"
+
+    if [ -z "$dstwr_drm_device" ] || [ ! -c "$dstwr_drm_device" ]; then
+        log_error "Cannot start desktop Weston, no usable primary DRM device was selected"
+        return 1
+    fi
+
+    dstwr_drm_card="${dstwr_drm_device##*/}"
+
+    if ! install -d -m 0700 -o root -g root "$dstwr_runtime_dir"; then
+        log_error "Failed to create Weston runtime directory: $dstwr_runtime_dir"
+        return 1
+    fi
+
+    # Preserve the original display-manager state across an explicit Weston
+    # relaunch. The stop helper intentionally recreates its state file, so do
+    # not call it again when the manager is already inactive and a valid state
+    # file from the initial startup exists.
+    if [ -s "$dstwr_state_file" ] &&
+       ! systemctl is-active --quiet display-manager.service; then
+        log_info "Display manager is already inactive, preserving recorded restore state"
+    elif ! display_stop_service_for_drm \
+        display-manager.service \
+        "$dstwr_drm_device" \
+        "$dstwr_state_file"; then
+        log_error "Failed to release display-manager DRM ownership"
+        return 1
+    fi
+
+    if command -v fuser >/dev/null 2>&1 &&
+       fuser "$dstwr_drm_device" >/dev/null 2>&1; then
+        log_error "DRM device is still in use after stopping the display manager: $dstwr_drm_device"
+        fuser -v "$dstwr_drm_device" 2>&1 |
+            while IFS= read -r dstwr_owner_line; do
+                [ -n "$dstwr_owner_line" ] || continue
+                log_info "[DRM-OWNER] $dstwr_owner_line"
+            done
+        display_restore_service_from_state "$dstwr_state_file" || true
+        return 1
+    fi
+
+    rm -f \
+        "$dstwr_socket" \
+        "$dstwr_socket.lock" \
+        "$dstwr_log"
+
+    log_info "Starting transient desktop Weston through systemd-run"
+    log_info "Weston unit, $dstwr_unit"
+    log_info "Weston DRM device, $dstwr_drm_device"
+    log_info "Weston runtime directory, $dstwr_runtime_dir"
+    log_info "Weston socket, $dstwr_socket"
+    log_info "Weston log, $dstwr_log"
+
+    if [ -n "$dstwr_egl_json" ]; then
+        log_info "Weston EGL vendor JSON, $dstwr_egl_json"
+    else
+        log_info "Weston EGL vendor JSON, native GLVND discovery"
+    fi
+
+    if display_desktop_weston_unit_exists "$dstwr_unit"; then
+        log_info "Reusing the existing transient unit definition"
+        systemctl reset-failed "$dstwr_unit" >/dev/null 2>&1 || true
+
+        if systemctl start "$dstwr_unit"; then
+            dstwr_started=1
+        fi
+    else
+        if [ -n "$dstwr_egl_json" ]; then
+            if systemd-run \
+                --unit="$dstwr_unit" \
+                --description="QCOM testkit Weston DRM runtime" \
+                --property=Type=simple \
+                --property=Restart=no \
+                --setenv="XDG_RUNTIME_DIR=$dstwr_runtime_dir" \
+                --setenv="__EGL_VENDOR_LIBRARY_FILENAMES=$dstwr_egl_json" \
+                "$dstwr_weston_bin" \
+                    -Bdrm \
+                    --renderer=gl \
+                    --drm-device="$dstwr_drm_card" \
+                    --current-mode \
+                    --continue-without-input \
+                    --idle-time=0 \
+                    --no-config \
+                    --socket="$dstwr_socket_name" \
+                    --log="$dstwr_log"; then
+                dstwr_started=1
+            fi
+        else
+            if systemd-run \
+                --unit="$dstwr_unit" \
+                --description="QCOM testkit Weston DRM runtime" \
+                --property=Type=simple \
+                --property=Restart=no \
+                --setenv="XDG_RUNTIME_DIR=$dstwr_runtime_dir" \
+                "$dstwr_weston_bin" \
+                    -Bdrm \
+                    --renderer=gl \
+                    --drm-device="$dstwr_drm_card" \
+                    --current-mode \
+                    --continue-without-input \
+                    --idle-time=0 \
+                    --no-config \
+                    --socket="$dstwr_socket_name" \
+                    --log="$dstwr_log"; then
+                dstwr_started=1
+            fi
+        fi
+    fi
+
+    if [ "$dstwr_started" -ne 1 ]; then
+        log_error "systemd could not start the transient Weston unit"
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    while [ "$dstwr_wait" -lt "$dstwr_wait_secs" ]; do
+        if [ -S "$dstwr_socket" ]; then
+            break
+        fi
+
+        if ! systemctl is-active --quiet "$dstwr_unit"; then
+            break
+        fi
+
+        sleep 1
+        dstwr_wait=$((dstwr_wait + 1))
+    done
+
+    if [ ! -S "$dstwr_socket" ]; then
+        log_error "Transient Weston did not create its Wayland socket"
+        systemctl status "$dstwr_unit" --no-pager --full 2>&1 || true
+        journalctl -u "$dstwr_unit" -n 80 --no-pager 2>&1 || true
+        tail -n 80 "$dstwr_log" 2>/dev/null || true
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    sleep 1
+
+    if ! display_adopt_desktop_weston_socket \
+        "$dstwr_socket" \
+        "$dstwr_log"; then
+        log_error "Transient Weston runtime validation failed"
+        tail -n 80 "$dstwr_log" 2>/dev/null || true
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    DISPLAY_RUNTIME_OWNER="qcom-testkit-transient"
+    DISPLAY_TRANSIENT_WESTON_UNIT="$dstwr_unit"
+    DISPLAY_TRANSIENT_WESTON_LOG="$dstwr_log"
+    DISPLAY_TRANSIENT_WESTON_DRM_DEVICE="$dstwr_drm_device"
+    export DISPLAY_RUNTIME_OWNER
+    export DISPLAY_TRANSIENT_WESTON_UNIT
+    export DISPLAY_TRANSIENT_WESTON_LOG
+    export DISPLAY_TRANSIENT_WESTON_DRM_DEVICE
+
+    log_pass "Transient desktop Weston runtime is ready"
+    return 0
+}
+
+###############################################################################
+# Desktop Weston runtime, manual command promoted to shared helper
+#
+# This helper uses the exact direct DRM command validated manually on Debian:
+# - no seatd-launch
+# - no LIBSEAT_BACKEND override
+# - no PAM, TTY, udev, user, or systemd-unit creation
+# - no package operations
+#
+# It first adopts an existing Weston socket. When no Weston process exists, it
+# stops only the active display manager through the existing shared helper and
+# starts Weston on the dynamically selected DRM card.
+###############################################################################
+display_prepare_desktop_weston_runtime() {
+    dpdwr_testname="${1:-display-test}"
+    dpdwr_wait_secs="${2:-10}"
+    dpdwr_runtime_dir="${DISPLAY_DESKTOP_WESTON_RUNTIME_DIR:-/run/qcom-weston-manual}"
+    dpdwr_socket_name="${DISPLAY_DESKTOP_WESTON_SOCKET:-wayland-manual-test}"
+    dpdwr_socket_path="$dpdwr_runtime_dir/$dpdwr_socket_name"
+    dpdwr_weston_log="${DISPLAY_DESKTOP_WESTON_LOG:-/tmp/weston-manual.log}"
+    dpdwr_launch_log="${DISPLAY_DESKTOP_WESTON_LAUNCH_LOG:-/tmp/weston-manual-launch.log}"
+    dpdwr_state_file="$dpdwr_runtime_dir/display-manager.state"
+    dpdwr_drm_device=""
+    dpdwr_drm_card=""
+    dpdwr_candidate=""
+    dpdwr_runtime=""
+    dpdwr_socket=""
+    dpdwr_pid=""
+    dpdwr_wait=0
+    dpdwr_started=0
+    dpdwr_display_manager_stopped=0
+    dpdwr_old_xdg="${XDG_RUNTIME_DIR-__unset__}"
+    dpdwr_old_wayland="${WAYLAND_DISPLAY-__unset__}"
+
+    case "$dpdwr_wait_secs" in
+        ''|*[!0-9]*)
+            dpdwr_wait_secs=10
+            ;;
+    esac
+
+    [ "$dpdwr_wait_secs" -gt 0 ] 2>/dev/null || dpdwr_wait_secs=10
+
+    # First honor a working environment already exported by the caller.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] &&
+       [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        dpdwr_candidate="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+
+        if [ -S "$dpdwr_candidate" ] &&
+           command -v wayland_connection_ok >/dev/null 2>&1 &&
+           wayland_connection_ok; then
+            DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+            export DISPLAY_WAYLAND_SOCKET
+            log_pass "Existing desktop Weston runtime is usable, socket=$dpdwr_candidate"
+            return 0
+        fi
+    fi
+
+    # Derive the socket from a live Weston process environment and command line.
+    if command -v pgrep >/dev/null 2>&1; then
+        for dpdwr_pid in $(pgrep -x weston 2>/dev/null || true); do
+            [ -r "/proc/$dpdwr_pid/environ" ] || continue
+            [ -r "/proc/$dpdwr_pid/cmdline" ] || continue
+
+            dpdwr_runtime="$(
+                tr '\000' '\n' <"/proc/$dpdwr_pid/environ" 2>/dev/null |
+                    sed -n 's/^XDG_RUNTIME_DIR=//p' |
+                    head -n 1
+            )"
+
+            dpdwr_socket="$(
+                tr '\000' '\n' <"/proc/$dpdwr_pid/cmdline" 2>/dev/null |
+                    awk '
+                        previous == "--socket" {
+                            print
+                            exit
+                        }
+
+                        /^--socket=/ {
+                            sub(/^--socket=/, "")
+                            print
+                            exit
+                        }
+
+                        {
+                            previous = $0
+                        }
+                    '
+            )"
+
+            [ -n "$dpdwr_runtime" ] || continue
+            [ -n "$dpdwr_socket" ] || continue
+
+            dpdwr_candidate="$dpdwr_runtime/$dpdwr_socket"
+            [ -S "$dpdwr_candidate" ] || continue
+
+            if command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+               adopt_wayland_env_from_socket "$dpdwr_candidate"; then
+                if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+                   wayland_connection_ok; then
+                    DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+                    export DISPLAY_WAYLAND_SOCKET
+                    log_pass "Adopted existing desktop Weston runtime, socket=$dpdwr_candidate pid=$dpdwr_pid"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    # Keep compatibility with existing generic discovery.
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpdwr_candidate="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+
+        if [ -n "$dpdwr_candidate" ] &&
+           [ -S "$dpdwr_candidate" ] &&
+           command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+           adopt_wayland_env_from_socket "$dpdwr_candidate"; then
+            if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+               wayland_connection_ok; then
+                DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+                export DISPLAY_WAYLAND_SOCKET
+                log_pass "Adopted discovered desktop Weston runtime, socket=$dpdwr_candidate"
+                return 0
+            fi
+        fi
+    fi
+
+    # Explicitly check the path used by the manually validated command.
+    if [ -S "$dpdwr_socket_path" ] &&
+       command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+       adopt_wayland_env_from_socket "$dpdwr_socket_path"; then
+        if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+           wayland_connection_ok; then
+            DISPLAY_WAYLAND_SOCKET="$dpdwr_socket_path"
+            export DISPLAY_WAYLAND_SOCKET
+            log_pass "Adopted validated desktop Weston runtime, socket=$dpdwr_socket_path"
+            return 0
+        fi
+    fi
+
+    # Never launch a second compositor over an unknown Weston process.
+    if command -v pgrep >/dev/null 2>&1 &&
+       pgrep -x weston >/dev/null 2>&1; then
+        log_error "A Weston process exists but no usable Wayland socket could be adopted"
+        return 1
+    fi
+
+    if ! command -v weston >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, weston command is unavailable"
+        return 1
+    fi
+
+    if ! command -v display_select_primary_drm_device >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, DRM selection helper is unavailable"
+        return 1
+    fi
+
+    dpdwr_drm_device="$(
+        display_select_primary_drm_device 2>/dev/null ||
+        true
+    )"
+
+    if [ -z "$dpdwr_drm_device" ] ||
+       [ ! -c "$dpdwr_drm_device" ]; then
+        log_error "Cannot start desktop Weston, no usable DRM card was selected"
+        return 1
+    fi
+
+    dpdwr_drm_card=${dpdwr_drm_device##*/}
+
+    if ! mkdir -p "$dpdwr_runtime_dir"; then
+        log_error "Could not create desktop Weston runtime directory, $dpdwr_runtime_dir"
+        return 1
+    fi
+
+    if ! chmod 0700 "$dpdwr_runtime_dir"; then
+        log_error "Could not set desktop Weston runtime directory permissions, $dpdwr_runtime_dir"
+        return 1
+    fi
+
+    rm -f \
+        "$dpdwr_socket_path" \
+        "$dpdwr_socket_path.lock" \
+        "$dpdwr_weston_log" \
+        "$dpdwr_launch_log"
+
+    # Reuse the existing display-manager ownership helper. The manager remains
+    # stopped while Weston owns DRM, matching the manually validated state.
+    if command -v display_stop_service_for_drm >/dev/null 2>&1; then
+        if ! display_stop_service_for_drm \
+            display-manager.service \
+            "$dpdwr_drm_device" \
+            "$dpdwr_state_file"; then
+            log_error "Could not release display-manager DRM ownership"
+            return 1
+        fi
+
+        if [ -s "$dpdwr_state_file" ]; then
+            dpdwr_display_manager_stopped=1
+        fi
+    elif command -v systemctl >/dev/null 2>&1 &&
+         systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        log_error "Display manager is active and the shared DRM ownership helper is unavailable"
+        return 1
+    fi
+
+    log_info "Starting desktop Weston with the manually validated DRM command"
+    log_info "Desktop Weston DRM device, $dpdwr_drm_device"
+    log_info "Desktop Weston runtime directory, $dpdwr_runtime_dir"
+    log_info "Desktop Weston socket, $dpdwr_socket_path"
+    log_info "Desktop Weston log, $dpdwr_weston_log"
+
+    XDG_RUNTIME_DIR="$dpdwr_runtime_dir" \
+        nohup env \
+            -u LIBSEAT_BACKEND \
+            -u SEATD_SOCK \
+            -u SEATD_VTBOUND \
+            weston \
+                -Bdrm \
+                --renderer=gl \
+                --drm-device="$dpdwr_drm_card" \
+                --current-mode \
+                --continue-without-input \
+                --idle-time=0 \
+                --no-config \
+                --socket="$dpdwr_socket_name" \
+                --log="$dpdwr_weston_log" \
+            >"$dpdwr_launch_log" 2>&1 &
+
+    dpdwr_pid=$!
+    dpdwr_started=1
+
+    while [ "$dpdwr_wait" -lt "$dpdwr_wait_secs" ]; do
+        if [ -S "$dpdwr_socket_path" ]; then
+            break
+        fi
+
+        if ! kill -0 "$dpdwr_pid" 2>/dev/null; then
+            break
+        fi
+
+        sleep 1
+        dpdwr_wait=$((dpdwr_wait + 1))
+    done
+
+    if [ ! -S "$dpdwr_socket_path" ]; then
+        log_error "Desktop Weston did not create its Wayland socket"
+        tail -n 80 "$dpdwr_weston_log" 2>/dev/null || true
+        tail -n 40 "$dpdwr_launch_log" 2>/dev/null || true
+
+        if [ "$dpdwr_started" -eq 1 ]; then
+            kill -TERM "$dpdwr_pid" 2>/dev/null || true
+            wait "$dpdwr_pid" 2>/dev/null || true
+        fi
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if ! command -v adopt_wayland_env_from_socket >/dev/null 2>&1 ||
+       ! adopt_wayland_env_from_socket "$dpdwr_socket_path"; then
+        log_error "Could not adopt the desktop Weston Wayland socket"
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1 &&
+       ! wayland_connection_ok; then
+        log_error "Desktop Weston socket exists but the Wayland client probe failed"
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if [ -r "$dpdwr_weston_log" ] &&
+       tail -n 200 "$dpdwr_weston_log" 2>/dev/null |
+           grep -Eiq \
+               "atomic: couldn.t commit new state: Permission denied|repaint-flush failed: Permission denied|failed to acquire DRM master|failed to initialize DRM backend|failed to create renderer"; then
+        log_error "Desktop Weston reports fatal DRM/KMS errors"
+        tail -n 80 "$dpdwr_weston_log" 2>/dev/null || true
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dpdwr_socket_path"
+    DISPLAY_DESKTOP_WESTON_PID="$dpdwr_pid"
+    DISPLAY_DESKTOP_WESTON_LOG="$dpdwr_weston_log"
+    DISPLAY_DESKTOP_WESTON_DRM_DEVICE="$dpdwr_drm_device"
+
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_DESKTOP_WESTON_PID
+    export DISPLAY_DESKTOP_WESTON_LOG
+    export DISPLAY_DESKTOP_WESTON_DRM_DEVICE
+
+    log_pass "Desktop Weston runtime is ready, socket=$dpdwr_socket_path pid=$dpdwr_pid"
+    return 0
+}
+
+display_prepare_desktop_graphics_stack() {
+    dpdgs_testname="${1:-display-test}"
+    dpdgs_mode="${2:-auto}"
+    dpdgs_gpu_module="${3:-msm_kgsl}"
+    dpdgs_gpu_device="${4:-/dev/kgsl-3d0}"
+    dpdgs_gbm_package="${5:-libgbm-msm1}"
+    dpdgs_rc=0
+    dpdgs_package_changed=0
+    dpdgs_boot_changed=0
+
+    case "$dpdgs_mode" in
+        auto)
+            log_info "Desktop graphics mode is auto, preserving the currently installed and booted stack"
+            return 0
+            ;;
+
+        overlay)
+            for dpdgs_helper in \
+                pkg_package_set_contains \
+                pkg_ensure_optional_package_set_present \
+                pkg_package_has_file_matching \
+                mrv_qcom_gpu_validate_boot_mode \
+                display_select_egl_vendor; do
+                if ! command -v "$dpdgs_helper" >/dev/null 2>&1; then
+                    log_fail "$dpdgs_testname FAIL - required desktop overlay helper is unavailable: $dpdgs_helper"
+                    return 1
+                fi
+            done
+
+            if ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
+                log_fail "$dpdgs_testname FAIL - graphics package set is incomplete, missing $dpdgs_gbm_package"
+                return 1
+            fi
+
+            if ! pkg_ensure_optional_package_set_present \
+                graphics \
+                qli-staging \
+                auto \
+                --overlay; then
+                log_fail "$dpdgs_testname FAIL - failed to ensure Qualcomm graphics overlay package set"
+                return 1
+            fi
+
+            if ! pkg_package_has_file_matching \
+                "$dpdgs_gbm_package" \
+                '/gbm/msm_gbm[.]so$'; then
+                log_fail "$dpdgs_testname FAIL - Qualcomm GBM backend is unavailable from $dpdgs_gbm_package"
+                return 1
+            fi
+
+            mrv_qcom_gpu_validate_boot_mode \
+                kgsl \
+                "$dpdgs_gpu_module" \
+                "$dpdgs_gpu_device" \
+                msm
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    ;;
+                2)
+                    log_skip "$dpdgs_testname SKIP - Qualcomm overlay packages are ready, reboot required to activate KGSL"
+                    return 2
+                    ;;
+                *)
+                    log_skip "$dpdgs_testname SKIP - unable to confirm a valid KGSL boot runtime"
+                    return 2
+                    ;;
+            esac
+
+            if command -v ldconfig >/dev/null 2>&1 && ! ldconfig; then
+                log_fail "$dpdgs_testname FAIL - ldconfig failed after overlay package validation"
+                return 1
+            fi
+
+            if ! display_select_egl_vendor adreno; then
+                log_fail "$dpdgs_testname FAIL - failed to select Qualcomm Adreno EGL vendor"
+                return 1
+            fi
+
+            log_pass "Qualcomm overlay packages, GBM backend, and KGSL boot runtime are ready"
+            return 0
+            ;;
+
+        base)
+            for dpdgs_helper in \
+                pkg_restore_package_set \
+                pkg_ensure_required_package_set_present \
+                mrv_qcom_gpu_cleanup_kgsl_boot_artifacts \
+                mrv_qcom_gpu_validate_boot_mode \
+                display_select_egl_vendor; do
+                if ! command -v "$dpdgs_helper" >/dev/null 2>&1; then
+                    log_fail "$dpdgs_testname FAIL - required desktop base helper is unavailable: $dpdgs_helper"
+                    return 1
+                fi
+            done
+
+            dpdgs_package_changed=0
+            dpdgs_boot_changed=0
+
+            pkg_restore_package_set graphics
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    dpdgs_package_changed=0
+                    ;;
+                2)
+                    dpdgs_package_changed=1
+                    ;;
+                *)
+                    log_fail "$dpdgs_testname FAIL - failed to remove Qualcomm graphics overlay package set"
+                    return 1
+                    ;;
+            esac
+
+            mrv_qcom_gpu_cleanup_kgsl_boot_artifacts
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    dpdgs_boot_changed=1
+                    ;;
+                1)
+                    dpdgs_boot_changed=0
+                    ;;
+                2)
+                    log_fail "$dpdgs_testname FAIL - failed to clean stale KGSL boot artifacts"
+                    return 1
+                    ;;
+                *)
+                    log_fail "$dpdgs_testname FAIL - unexpected KGSL boot-artifact cleanup result, rc=$dpdgs_rc"
+                    return 1
+                    ;;
+            esac
+
+            if ! pkg_ensure_required_package_set_present graphics-base; then
+                log_fail "$dpdgs_testname FAIL - failed to ensure upstream Mesa graphics package set"
+                return 1
+            fi
+
+            if [ "$dpdgs_package_changed" -eq 1 ] ||
+               [ "$dpdgs_boot_changed" -eq 1 ]; then
+                    log_skip "$dpdgs_testname SKIP - Qualcomm graphics packages or KGSL boot artifacts changed, reboot required to activate upstream MSM/freedreno"
+                return 2
+            fi
+
+            mrv_qcom_gpu_validate_boot_mode \
+                msm \
+                "$dpdgs_gpu_module" \
+                "$dpdgs_gpu_device" \
+                msm
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    ;;
+                2)
+                    log_skip "$dpdgs_testname SKIP - current boot still uses KGSL, reboot required to restore upstream MSM/freedreno ownership"
+                    return 2
+                    ;;
+                *)
+                    log_skip "$dpdgs_testname SKIP - unable to confirm upstream MSM/freedreno ownership"
+                    return 2
+                    ;;
+            esac
+
+            if ! display_select_egl_vendor mesa; then
+                log_skip "$dpdgs_testname SKIP - Mesa EGL vendor is unavailable"
+                return 2
+            fi
+
+            log_pass "Upstream MSM/freedreno packages and boot runtime are ready"
+            return 0
+            ;;
+
+        *)
+            log_fail "$dpdgs_testname FAIL - unsupported desktop graphics mode: $dpdgs_mode"
+            return 1
+            ;;
+    esac
+}
+
+display_prepare_image_weston_runtime() {
+    dpiwr_testname="${1:-display-test}"
+    dpiwr_wait_secs="${2:-10}"
+    dpiwr_flavour="${3:-base}"
+    dpiwr_sock=""
+    dpiwr_new_sock=""
+
+    log_info "Preserving image-provided Weston runtime behavior"
+
+    if command -v wayland_debug_snapshot >/dev/null 2>&1; then
+        wayland_debug_snapshot "${dpiwr_testname}: start"
+    fi
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpiwr_sock="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+    fi
+
+    if [ -n "$dpiwr_sock" ] &&
+       command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        log_info "Found existing Wayland socket, $dpiwr_sock"
+
+        if ! adopt_wayland_env_from_socket "$dpiwr_sock"; then
+            log_warn "Failed to adopt Wayland environment from $dpiwr_sock"
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ] &&
+       [ "$dpiwr_flavour" = "base" ] &&
+       command -v weston_wait_ready >/dev/null 2>&1; then
+        log_info "No usable Wayland socket yet on base build, waiting briefly for the image-provided Weston runtime"
+
+        if weston_wait_ready "$dpiwr_wait_secs"; then
+            if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                dpiwr_sock="$(
+                    discover_wayland_socket_anywhere 2>/dev/null |
+                        head -n 1 ||
+                        true
+                )"
+            fi
+
+            if [ -n "$dpiwr_sock" ] &&
+               command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                log_info "Base Weston runtime became ready, $dpiwr_sock"
+                adopt_wayland_env_from_socket "$dpiwr_sock" || true
+            fi
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ]; then
+        if [ "$dpiwr_flavour" = "overlay" ] &&
+           command -v overlay_start_weston_drm >/dev/null 2>&1; then
+            log_info "No usable Wayland socket, starting overlay Weston through overlay_start_weston_drm"
+
+            if command -v \
+                weston_force_primary_1080p60_if_not_60 \
+                >/dev/null 2>&1; then
+                log_info "Pre-configuring the primary output to about 60Hz before starting Weston, best effort"
+                weston_force_primary_1080p60_if_not_60 || true
+            fi
+
+            if ! overlay_start_weston_drm; then
+                log_warn "overlay_start_weston_drm returned non-zero"
+                return 1
+            fi
+
+            if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                dpiwr_sock="$(
+                    discover_wayland_socket_anywhere 2>/dev/null |
+                        head -n 1 ||
+                        true
+                )"
+            fi
+
+            if [ -n "$dpiwr_sock" ] &&
+               command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                log_info "Overlay Weston created Wayland socket, $dpiwr_sock"
+                adopt_wayland_env_from_socket "$dpiwr_sock" || true
+            else
+                log_warn "overlay_start_weston_drm reported success but no Wayland socket was found"
+            fi
+        else
+            log_fail "$dpiwr_testname FAIL - no image-provided Wayland socket is available"
+            return 1
+        fi
+    fi
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpiwr_new_sock="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+
+        if [ -n "$dpiwr_new_sock" ]; then
+            dpiwr_sock="$dpiwr_new_sock"
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ]; then
+        log_fail "$dpiwr_testname FAIL - no Wayland socket was found after runtime preparation"
+        return 1
+    fi
+
+    if command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        if ! adopt_wayland_env_from_socket "$dpiwr_sock"; then
+            log_fail "$dpiwr_testname FAIL - failed to adopt the final Wayland socket"
+            return 1
+        fi
+    else
+        XDG_RUNTIME_DIR="$(dirname "$dpiwr_sock")"
+        WAYLAND_DISPLAY="$(basename "$dpiwr_sock")"
+        export XDG_RUNTIME_DIR
+        export WAYLAND_DISPLAY
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1; then
+        if ! wayland_connection_ok; then
+            if [ "$dpiwr_flavour" = "base" ] &&
+               command -v weston_wait_ready >/dev/null 2>&1; then
+                log_warn "Initial Wayland connection test failed, waiting briefly and retrying"
+
+                if weston_wait_ready 5; then
+                    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                        dpiwr_sock="$(
+                            discover_wayland_socket_anywhere 2>/dev/null |
+                                head -n 1 ||
+                                true
+                        )"
+                    fi
+
+                    if [ -n "$dpiwr_sock" ] &&
+                       command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                        adopt_wayland_env_from_socket "$dpiwr_sock" || true
+                    fi
+                fi
+            fi
+
+            if ! wayland_connection_ok; then
+                log_fail "$dpiwr_testname FAIL - Wayland connection test failed"
+                return 1
+            fi
+        fi
+
+        log_info "Wayland connection test, OK"
+    else
+        log_warn "wayland_connection_ok helper is unavailable, continuing with socket validation only"
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dpiwr_sock"
+
+    case "$dpiwr_sock" in
+        /run/user/*/wayland-*)
+            DISPLAY_RUNTIME_MODEL="per-user"
+            ;;
+        /run/wayland-*)
+            DISPLAY_RUNTIME_MODEL="global"
+            ;;
+        *)
+            DISPLAY_RUNTIME_MODEL="custom"
+            ;;
+    esac
+
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    log_info "Wayland runtime model, $DISPLAY_RUNTIME_MODEL"
+    log_info "Wayland socket, $DISPLAY_WAYLAND_SOCKET"
+    log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
+    log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+
+    return 0
+}
+
+display_resolve_test_fps_gate_policy() {
+    drtfgp_os_id="${1:-unknown}"
+    drtfgp_mode="${2:-auto}"
+    drtfgp_explicit="${3:-}"
+    drtfgp_cap="${4:-60}"
+    drtfgp_min_pct="${5:-85}"
+
+    DISPLAY_TEST_FPS_POLICY="shared"
+    DISPLAY_TEST_FPS_REFRESH="${DISPLAY_FPS_DETECTED_HZ:-}"
+    DISPLAY_TEST_FPS_EXPECTED="${DISPLAY_FPS_EXPECTED:-}"
+    DISPLAY_TEST_FPS_MIN_OK="${DISPLAY_FPS_MIN_OK:-}"
+
+    case "$drtfgp_os_id" in
+        debian|ubuntu|centos|rhel|fedora)
+            if [ "$drtfgp_mode" = "auto" ] &&
+               [ -z "$drtfgp_explicit" ]; then
+                DISPLAY_TEST_FPS_POLICY="desktop-functional-cap"
+                DISPLAY_TEST_FPS_EXPECTED="$drtfgp_cap"
+
+                case "$DISPLAY_TEST_FPS_REFRESH" in
+                    ''|*[!0-9]*)
+                        ;;
+                    *)
+                        if [ "$DISPLAY_TEST_FPS_REFRESH" -gt 0 ] &&
+                           [ "$DISPLAY_TEST_FPS_REFRESH" -lt "$DISPLAY_TEST_FPS_EXPECTED" ]; then
+                            DISPLAY_TEST_FPS_EXPECTED="$DISPLAY_TEST_FPS_REFRESH"
+                        fi
+                        ;;
+                esac
+
+                DISPLAY_TEST_FPS_MIN_OK=$((
+                    DISPLAY_TEST_FPS_EXPECTED * drtfgp_min_pct / 100
+                ))
+
+                if [ "$DISPLAY_TEST_FPS_MIN_OK" -le 0 ]; then
+                    DISPLAY_TEST_FPS_MIN_OK=1
+                fi
+            fi
+            ;;
+    esac
+
+    export DISPLAY_TEST_FPS_POLICY
+    export DISPLAY_TEST_FPS_REFRESH
+    export DISPLAY_TEST_FPS_EXPECTED
+    export DISPLAY_TEST_FPS_MIN_OK
+
+    return 0
+}
+
+display_apply_test_fps_gate_policy() {
+    datfgp_avg="${1:--}"
+    datfgp_count="${2:-0}"
+    datfgp_require="${3:-1}"
+
+    case "$datfgp_count" in
+        ''|*[!0-9]*)
+            datfgp_count=0
+            ;;
+    esac
+
+    if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" != "desktop-functional-cap" ]; then
+        if command -v display_fps_gate_avg >/dev/null 2>&1; then
+            display_fps_gate_avg "$datfgp_avg" "$datfgp_count"
+            return $?
+        fi
+
+        if [ "$datfgp_require" -ne 0 ]; then
+            log_fail "FPS gating is required but display_fps_gate_avg is unavailable"
+            return 1
+        fi
+
+        log_warn "display_fps_gate_avg is unavailable, FPS gating was not requested"
+        return 0
+    fi
+
+    if [ "$datfgp_count" -eq 0 ]; then
+        if [ "$datfgp_require" -ne 0 ]; then
+            log_fail "Desktop functional FPS gate enabled but no FPS samples were found"
+            return 1
+        fi
+
+        log_warn "No FPS samples were found, FPS gating was not requested"
+        return 0
+    fi
+
+    if ! printf '%s\n' "$datfgp_avg" |
+        awk -v min="${DISPLAY_TEST_FPS_MIN_OK:-1}" '
+            $1 ~ /^[0-9]+([.][0-9]+)?$/ && ($1 + 0.0) >= (min + 0.0) {
+                exit 0
+            }
+            { exit 1 }
+        '; then
+        datfgp_rounded="$(
+            awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
+        )"
+
+        log_fail "Average FPS below desktop functional threshold, avg=$datfgp_avg (~$datfgp_rounded) < ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
+        return 1
+    fi
+
+    datfgp_rounded="$(
+        awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
+    )"
+
+    log_info "Desktop functional FPS gate passed, avg=$datfgp_avg (~$datfgp_rounded) >= ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
     return 0
 }
 
