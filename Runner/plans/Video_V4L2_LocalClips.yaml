@@ -15,7 +15,7 @@ run:
     - export TARGET="${TARGET:-}"
 
     - |
-      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
+      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run_local_clips_auto.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
 
       # Custom media bundle (local) path
