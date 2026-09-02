@@ -1,0 +1,116 @@
+metadata:
+  format: Lava-Test Test Definition 1.0
+  name: Video_V4L2_LocalClips
+  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco/pakala; run base & overlay (pakala: base only)"
+  maintainer:
+    - smuppand@qti.qualcomm.com
+  os:
+    - openembedded
+  scope:
+    - functional
+run:
+  steps:
+    - cd Runner
+    - export REPO_ROOT="$PWD"
+    - export TARGET="${TARGET:-}"
+
+    - |
+      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
+      RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
+
+      # Custom media bundle (local) path
+      CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
+
+      # Custom downstream module location (directory containing iris_vpu.ko)
+      KO_DIR="/data/vendor/iris_test_app"
+
+      # Optional: downstream firmware needed on Kodiak overlay
+      DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
+
+      # ---------- Platform detection ----------
+      # Priority: explicit TARGET > LAVA device-type env vars > hostname
+      if [ -n "${TARGET:-}" ]; then
+        TL="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
+        DEVTYPE="$TL"
+      else
+        DEVTYPE_RAW="${DEVICE_TYPE:-${LAVA_DEVICE_TYPE:-${LAVA_DEVICE_TYPE_NAME:-${DEVICE_TYPE_NAME:-}}}}"
+
+        # Fallback to hostname if all LAVA env vars are empty
+        if [ -z "$DEVTYPE_RAW" ]; then
+          DEVTYPE_RAW="$(hostname 2>/dev/null || true)"
+        fi
+
+        DEVTYPE="$(printf '%s' "$DEVTYPE_RAW" | tr '[:upper:]' '[:lower:]')"
+
+        case "$DEVTYPE" in
+          # monaco
+          qcs8300-ride|qcs8300-ride-sx|iq-8275-evk)
+            TL="monaco"
+            ;;
+          # lemans
+          qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx)
+            TL="lemans"
+            ;;
+          # kodiak
+          qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit)
+            TL="kodiak"
+            ;;
+          # pakala / SM8750
+          sm8750-mtp|sm8750-hdk|qcs8550-mtp|qcs8550*)
+            TL="pakala"
+            ;;
+          # fallback: let run.sh autodetect
+          *)
+            TL=""
+            ;;
+        esac
+      fi
+
+      case "$TL" in
+        kodiak|lemans|monaco|pakala)
+          PLAT="--platform $TL"
+          ;;
+        *)
+          PLAT=""
+          ;;
+      esac
+
+      echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
+
+      # Common args (local clips; no Wi-Fi/TAR_URL needed)
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
+
+      # --- BASE (upstream): no ko args ---
+      ARGS_BASE="--stack base $ARGS_COMMON"
+
+      # --- OVERLAY (downstream): add ko args; only add FW on kodiak ---
+      # Not run on pakala (upstream-only in this flow).
+      ARGS_OVERLAY="--stack overlay $ARGS_COMMON --ko-dir $KO_DIR --ko-prefer-custom"
+      if [ "$TL" = "kodiak" ]; then
+        ARGS_OVERLAY="$ARGS_OVERLAY --downstream-fw $DS_FW"
+      fi
+
+      echo "BASE ARGS: $ARGS_BASE"
+
+      if [ "$TL" = "pakala" ]; then
+        echo "OVERLAY ARGS: skipped (pakala/sm8750-mtp is upstream-only in this flow)"
+      else
+        echo "OVERLAY ARGS: $ARGS_OVERLAY"
+      fi
+
+      # ---- Run BASE (upstream) ----
+      # shellcheck disable=SC2086
+      sh -lc "$RPATH $ARGS_BASE" || true
+      "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
+
+      # ---- Run OVERLAY (downstream) — skip on pakala ----
+      if [ "$TL" = "pakala" ]; then
+        echo "INFO: pakala/sm8750-mtp detected; skipping overlay/downstream run."
+      else
+        # shellcheck disable=SC2086
+        sh -lc "$RPATH $ARGS_OVERLAY" || true
+        "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
+      fi
+
+      # Optional roll-up (ignored if absent)
+      "$REPO_ROOT/utils/result_parse.sh" || true
