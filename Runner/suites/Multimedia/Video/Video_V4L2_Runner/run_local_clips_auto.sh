@@ -33,11 +33,11 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
 fi
 
 # shellcheck disable=SC1090
-. "$INIT_ENV"
+. "$INIT_ENV" || exit 1
 # shellcheck disable=SC1091
-. "$TOOLS/functestlib.sh"
+. "$TOOLS/functestlib.sh" || exit 1
 # shellcheck disable=SC1091
-. "$TOOLS/lib_video.sh"
+. "$TOOLS/lib_video.sh" || exit 1
 
 TESTNAME="Video_V4L2_Runner"
 RES_FILE="./${TESTNAME}.res"
@@ -97,6 +97,9 @@ if [ -z "${INTER_TEST_SLEEP:-}" ];     then INTER_TEST_SLEEP="2";      fi
 # --- log flavor for --stack both sub-runs ---
 LOG_FLAVOR=""
 
+if [ -z "${VIDEO_DEBUG:-}" ]; then VIDEO_DEBUG="0"; fi
+if [ -z "${VIDEO_SKIP_NETWORK:-}" ]; then VIDEO_SKIP_NETWORK="0"; fi
+
 usage() {
     cat <<EOF
 Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
@@ -104,6 +107,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--loglevel N] [--extract-input-clips true|false]
           [--repeat N] [--repeat-delay S] [--repeat-policy all|any]
           [--junit FILE] [--dry-run] [--verbose]
+          [--debug] [--no-network]
           [--stack auto|upstream|downstream|base|overlay|up|down|both]
           [--platform lemans|monaco|kodiak|pakala]
           [--downstream-fw PATH] [--force]
@@ -145,6 +149,8 @@ while [ $# -gt 0 ]; do
         --dry-run)          DRY=1                       ;;
         --extract-input-clips) shift; EXTRACT_INPUT_CLIPS="$1" ;;
         --verbose)          VERBOSE=1                   ;;
+        --debug)            VIDEO_DEBUG=1               ;;
+        --no-network)       VIDEO_SKIP_NETWORK=1        ;;
         --stack)            shift; VIDEO_STACK="$1"     ;;
         --platform)         shift; VIDEO_PLATFORM="$1"  ;;
         --downstream-fw)    shift; VIDEO_FW_DS="$1"     ;;
@@ -169,6 +175,14 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ "$VIDEO_DEBUG" = "1" ]; then
+    echo "[DEBUG] Video runner started: $(date)"
+    echo "[DEBUG] Script=$0 PID=$$ UID=$(id -u 2>/dev/null || echo unknown) PWD=$(pwd)"
+    echo "[DEBUG] Args=$*"
+    echo "[DEBUG] Kernel=$(uname -a 2>/dev/null || true)"
+    echo "[DEBUG] init_env=$INIT_ENV"
+fi
+
 # Export envs used by lib
 export VIDEO_APP
 export VIDEO_FW_DS
@@ -184,6 +198,8 @@ export WGET_TIMEOUT_SECS
 export WGET_TRIES
 export APP_LAUNCH_SLEEP
 export INTER_TEST_SLEEP
+export VIDEO_DEBUG
+export VIDEO_SKIP_NETWORK
 
 # --- EARLY dependency check (bail out fast) ---
 
@@ -340,8 +356,10 @@ else
     log_info "Sub-run: skipping rootfs size check (already performed)."
 fi
 
-# If we're going to fetch, ensure network is online first — only once
-if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
+# Network setup is optional. --no-network also disables online clip fetching.
+if [ "$VIDEO_SKIP_NETWORK" = "1" ]; then
+    log_info "Network setup/download disabled by --no-network."
+elif [ "$TOP_LEVEL_RUN" -eq 1 ]; then
     if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ] && [ -z "$CLIPS_TAR" ]; then
         net_rc=1
         if command -v check_network_status_rc >/dev/null 2>&1; then
@@ -351,14 +369,11 @@ if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
             check_network_status >/dev/null 2>&1
             net_rc=$?
         fi
-
         if [ "$net_rc" -ne 0 ]; then
             video_step "" "Bring network online (Wi-Fi credentials if provided)"
-            ensure_network_online || true
-            sleep "${NET_STABILIZE_SLEEP:-5}"
-        else
-            sleep "${NET_STABILIZE_SLEEP:-5}"
+            ensure_network_online || log_warn "Network bring-up failed; continuing."
         fi
+        sleep "${NET_STABILIZE_SLEEP:-5}"
     fi
 else
     log_info "Sub-run: skipping initial network bring-up."
@@ -387,7 +402,9 @@ fi
 
 # --- Optional early fetch of bundle (best-effort, ALWAYS in LOG_ROOT) — only once ---
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
-    if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
+    if [ "$VIDEO_SKIP_NETWORK" = "1" ]; then
+        log_info "Skipping online bundle fetch because --no-network is enabled."
+    elif [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
         if [ -n "$CLIPS_TAR" ]; then
             log_info "Custom --clips-tar provided; skipping online early fetch."
         else
@@ -590,6 +607,7 @@ fi
 log_info "----------------------------------------------------------------------"
 log_info "---------------------- Starting $TESTNAME (modular) -------------------"
 log_info "STACK=$VIDEO_STACK PLATFORM=${VIDEO_PLATFORM:-auto} STRICT=$STRICT DMESG_SCAN=$DMESG_SCAN"
+log_info "NETWORK_SKIP=$VIDEO_SKIP_NETWORK VIDEO_NO_REBOOT=$VIDEO_NO_REBOOT DEBUG=$VIDEO_DEBUG"
 log_info "TIMEOUT=${TIMEOUT}s LOGLEVEL=$LOGLEVEL REPEAT=$REPEAT REPEAT_POLICY=$REPEAT_POLICY"
 log_info "APP=$VIDEO_APP"
 if [ -n "$VIDEO_FW_DS" ]; then
@@ -692,7 +710,12 @@ video_step "" "Apply desired stack = $VIDEO_STACK"
 stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
 : > "$stack_tmp"
 
-video_ensure_stack "$VIDEO_STACK" "$plat" >"$stack_tmp" 2>&1 || true
+stack_rc=0
+video_ensure_stack "$VIDEO_STACK" "$plat" >"$stack_tmp" 2>&1 || stack_rc=$?
+if [ "$stack_rc" -ne 0 ]; then
+    log_error "video_ensure_stack failed: stack=$VIDEO_STACK platform=$plat rc=$stack_rc"
+    [ -s "$stack_tmp" ] && cat "$stack_tmp" >&2
+fi
 
 if [ -s "$stack_tmp" ]; then
     total_lines="$(wc -l < "$stack_tmp" 2>/dev/null | tr -d ' ')"
