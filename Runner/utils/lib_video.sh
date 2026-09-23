@@ -679,6 +679,9 @@ video_detect_platform() {
  
     s=$(printf '%s\n%s\n' "$model" "$compat" | tr '[:upper:]' '[:lower:]')
  
+    # Pakala: sm8750, pakala
+    pakala_pat='sm8750|pakala'
+ 
     # Monaco: qcs8300-ride, iq-8275-evk, qcs8275, generic qcs8300, or ride-sx+8300
     monaco_pat='qcs8300-ride|iq-8275-evk|qcs8275|qcs8300|ride-sx.*8300|8300.*ride-sx'
  
@@ -687,6 +690,11 @@ video_detect_platform() {
  
     # Kodiak: qcs6490, qcm6490, or rb3+6490
     kodiak_pat='qcs6490|qcm6490|rb3.*6490|6490.*rb3'
+ 
+    if printf '%s' "$s" | grep -Eq "$pakala_pat"; then
+        printf '%s\n' "pakala"
+        return 0
+    fi
  
     if printf '%s' "$s" | grep -Eq "$lemans_pat"; then
         printf '%s\n' "lemans"
@@ -717,7 +725,7 @@ video_validate_upstream_loaded() {
     fi
  
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             # Any upstream build has qcom_iris present
             if video_has_module_loaded qcom_iris; then
                 return 0
@@ -745,7 +753,7 @@ video_validate_upstream_loaded() {
 video_validate_downstream_loaded() {
     plat="$1"
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             if video_has_module_loaded "$IRIS_VPU_MOD" && ! video_has_module_loaded "$IRIS_UP_MOD"; then
                 return 0
             fi
@@ -817,7 +825,7 @@ video_stack_status() {
     fi
  
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             # Upstream accepted if:
             # - pure upstream build: qcom_iris present and iris_vpu absent
             # - base+overlay build: qcom_iris and iris_vpu both present
@@ -888,7 +896,7 @@ video_unload_all_video_modules() {
     }
 
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             tryrmmod "$IRIS_UP_MOD"
             tryrmmod "$IRIS_VPU_MOD"
             tryrmmod "$IRIS_UP_MOD"
@@ -921,7 +929,7 @@ video_hot_switch_modules() {
     rc=0
 
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             if [ "$stack" = "downstream" ]; then
                 video_block_upstream_strict
                 video_unblock_mod_now "$IRIS_VPU_MOD"
@@ -1911,7 +1919,7 @@ video_apply_blacklist_for_stack() {
     stack="$2"
 
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             if [ "$stack" = "downstream" ]; then
                 video_ensure_blacklist "qcom-iris"
                 video_ensure_blacklist "qcom_iris"
@@ -1967,7 +1975,7 @@ video_auto_preference_from_blacklist() {
     plat="$1"
 
     case "$plat" in
-        lemans|monaco)
+        lemans|monaco|pakala)
             if video_is_blacklisted "qcom-iris" || video_is_blacklisted "qcom_iris"; then
                 printf '%s\n' "downstream"
                 return 0
