@@ -682,6 +682,15 @@ video_detect_platform() {
     # Pakala: sm8750, pakala
     pakala_pat='sm8750|pakala'
  
+    # Shikra: shikra, cq2390, cq2390m, iq2390, iq2390s
+    shikra_pat='shikra|cq2390|cq2390m|iq2390|iq2390s'
+ 
+    # Glymur: glymur, sc8480xp
+    glymur_pat='glymur|sc8480xp'
+ 
+    # talos: talos, sm6150, sdm6150
+    talos_pat='talos|sm6150|sdm6150'
+ 
     # Monaco: qcs8300-ride, iq-8275-evk, qcs8275, generic qcs8300, or ride-sx+8300
     monaco_pat='qcs8300-ride|iq-8275-evk|qcs8275|qcs8300|ride-sx.*8300|8300.*ride-sx'
  
@@ -693,6 +702,21 @@ video_detect_platform() {
  
     if printf '%s' "$s" | grep -Eq "$pakala_pat"; then
         printf '%s\n' "pakala"
+        return 0
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$shikra_pat"; then
+        printf '%s\n' "shikra"
+        return 0
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$glymur_pat"; then
+        printf '%s\n' "glymur"
+        return 0
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$talos_pat"; then
+        printf '%s\n' "talos"
         return 0
     fi
  
@@ -725,7 +749,7 @@ video_validate_upstream_loaded() {
     fi
  
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|pakala|shikra|glymur|talos)
             # Any upstream build has qcom_iris present
             if video_has_module_loaded qcom_iris; then
                 return 0
@@ -753,10 +777,14 @@ video_validate_upstream_loaded() {
 video_validate_downstream_loaded() {
     plat="$1"
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|glymur)
             if video_has_module_loaded "$IRIS_VPU_MOD" && ! video_has_module_loaded "$IRIS_UP_MOD"; then
                 return 0
             fi
+            return 1
+            ;;
+        pakala|shikra|talos)
+            # These platforms only support base/upstream testing
             return 1
             ;;
         kodiak)
@@ -825,7 +853,7 @@ video_stack_status() {
     fi
  
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|glymur)
             # Upstream accepted if:
             # - pure upstream build: qcom_iris present and iris_vpu absent
             # - base+overlay build: qcom_iris and iris_vpu both present
@@ -842,6 +870,14 @@ video_stack_status() {
             # Downstream if only iris_vpu is present (no qcom_iris)
             if video_has_module_loaded iris_vpu && ! video_has_module_loaded qcom_iris; then
                 printf '%s\n' "downstream"
+                return 0
+            fi
+            ;;
+ 
+        pakala|shikra|talos)
+            # These platforms only support upstream/base testing
+            if video_has_module_loaded qcom_iris; then
+                printf '%s\n' "upstream"
                 return 0
             fi
             ;;
@@ -896,7 +932,7 @@ video_unload_all_video_modules() {
     }
 
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|pakala|shikra|glymur|talos)
             tryrmmod "$IRIS_UP_MOD"
             tryrmmod "$IRIS_VPU_MOD"
             tryrmmod "$IRIS_UP_MOD"
@@ -929,7 +965,7 @@ video_hot_switch_modules() {
     rc=0
 
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|glymur)
             if [ "$stack" = "downstream" ]; then
                 video_block_upstream_strict
                 video_unblock_mod_now "$IRIS_VPU_MOD"
@@ -961,6 +997,28 @@ video_hot_switch_modules() {
                     video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
                 fi
                 video_modprobe_or_insmod "$IRIS_VPU_MOD" || true
+                video_usleep "${MOD_SETTLE_SLEEP}"
+            fi
+            ;;
+ 
+        pakala|shikra|talos)
+            # These platforms only support upstream/base testing
+            if [ "$stack" = "downstream" ]; then
+                log_warn "Platform $plat does not support downstream/overlay stack"
+                rc=1
+            else
+                video_unblock_mod_now "$IRIS_UP_MOD"
+                video_usleep "${MOD_SETTLE_SLEEP}"
+
+                video_unload_all_video_modules "$plat"
+
+                if ! video_modprobe_or_insmod "$IRIS_UP_MOD"; then
+                    log_warn "modprobe $IRIS_UP_MOD failed; printing current runtime blocks & retrying"
+                    video_list_runtime_blocks
+                    video_unblock_mod_now "$IRIS_UP_MOD"
+                    video_usleep "${MOD_SETTLE_SLEEP}"
+                    video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
+                fi
                 video_usleep "${MOD_SETTLE_SLEEP}"
             fi
             ;;
@@ -1919,7 +1977,7 @@ video_apply_blacklist_for_stack() {
     stack="$2"
 
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|glymur)
             if [ "$stack" = "downstream" ]; then
                 video_ensure_blacklist "qcom-iris"
                 video_ensure_blacklist "qcom_iris"
@@ -1931,6 +1989,13 @@ video_apply_blacklist_for_stack() {
                 video_remove_blacklist "iris-vpu"
                 video_remove_blacklist "iris_vpu"
             fi
+            ;;
+ 
+        pakala|shikra|talos)
+            # These platforms only support upstream/base - always unblock upstream
+            video_remove_blacklist "qcom-iris"
+            video_remove_blacklist "qcom_iris"
+            # Downstream not supported, so no blacklist changes for iris_vpu
             ;;
         kodiak)
             if [ "$stack" = "downstream" ]; then
@@ -1975,11 +2040,16 @@ video_auto_preference_from_blacklist() {
     plat="$1"
 
     case "$plat" in
-        lemans|monaco|pakala)
+        lemans|monaco|glymur)
             if video_is_blacklisted "qcom-iris" || video_is_blacklisted "qcom_iris"; then
                 printf '%s\n' "downstream"
                 return 0
             fi
+            ;;
+ 
+        pakala|shikra|talos)
+            # These platforms only support upstream/base
+            # Always return unknown to force upstream as default
             ;;
         kodiak)
             if video_is_blacklisted "venus-core" || video_is_blacklisted "venus_core" \
