@@ -48,7 +48,7 @@ run:
       fi
 
       case "$TL" in
-        kodiak|lemans|monaco|pakala|shikra|talos|glymur) PLAT="--platform $TL" ;;
+        kodiak|lemans|monaco|pakala|shikra|tolos|glymur) PLAT="--platform $TL" ;;
         *) PLAT="" ;; # autodetect
       esac
 
@@ -73,6 +73,16 @@ run:
       # shellcheck disable=SC2086
       sh -lc "$RPATH $ARGS_BASE" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
+
+      # Detect actual platform if TL is empty (auto-detect case)
+      if [ -z "$TL" ]; then
+        # Source the lib_video.sh to get platform detection
+        if [ -f "$REPO_ROOT/utils/lib_video.sh" ]; then
+          . "$REPO_ROOT/utils/lib_video.sh"
+          TL="$(video_detect_platform)"
+          echo "INFO: Auto-detected platform: $TL"
+        fi
+      fi
 
       # Run OVERLAY (downstream) - only for platforms that support it
       # pakala, shikra, talos only support upstream/base testing
