@@ -703,6 +703,12 @@ video_detect_platform() {
     # Kodiak: qcs6490, qcm6490, or rb3+6490
     kodiak_pat='qcs6490|qcm6490|rb3.*6490|6490.*rb3'
  
+    # Hamoa: Hamoa, IQ-X7181 EVK, or generic IQ-X7181
+    hamoa_pat='hamoa|iq-x7181-evk|iq-x7181'
+ 
+    # Purwa: Purwa, IQ-X5121 EVK, or generic IQ-X5121
+    purwa_pat='purwa|iq-x5121-evk|iq-x5121'
+    
     if printf '%s' "$s" | grep -Eq "$pakala_pat"; then
         printf '%s\n' "pakala"
         return 0
@@ -735,6 +741,16 @@ video_detect_platform() {
  
     if printf '%s' "$s" | grep -Eq "$kodiak_pat"; then
         printf '%s\n' "kodiak"
+        return 0
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$hamoa_pat"; then
+        printf '%s\n' "hamoa"
+        return 0
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$purwa_pat"; then
+        printf '%s\n' "purwa"
         return 0
     fi
  

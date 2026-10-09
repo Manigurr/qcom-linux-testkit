@@ -42,13 +42,17 @@ run:
           qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit) TL="kodiak" ;;
           # pakala (sm8750) - upstream only
           *pakala*|*sm8750*) TL="pakala" ;;
+          # hamoa
+          hamoa|iq-x7181-evk|iq-x7181) TL="hamoa" ;;
+          # purwa
+          purwa|iq-x5121-evk|iq-x5121) TL="purwa" ;;
           # fallback to autodetect in run.sh
           *) TL="" ;;
         esac
       fi
 
       case "$TL" in
-        kodiak|lemans|monaco|pakala|shikra|tolos|glymur) PLAT="--platform $TL" ;;
+        kodiak|lemans|monaco|pakala|shikra|tolos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
         *) PLAT="" ;; # autodetect
       esac
 
@@ -85,9 +89,9 @@ run:
       fi
 
       # Run OVERLAY (downstream) - only for platforms that support it
-      # pakala, shikra, talos only support upstream/base testing
+      # pakala, shikra, talos, purwa, hamoa only support upstream/base testing
       case "$TL" in
-        pakala|shikra|talos)
+        pakala|shikra|talos|purwa|hamoa)
           echo "INFO: Platform $TL does not support downstream/overlay testing - skipping overlay run"
           ;;
         *)
