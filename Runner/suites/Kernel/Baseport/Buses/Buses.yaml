@@ -1,11 +1,39 @@
 metadata:
-  name: buses
+  name: Buses
   format: "Lava-Test Test Definition 1.0"
-  description: "Test I2C busses"
+  description: "Validate I2C runtime state, adapter capabilities, and dynamically discovered EEPROM access"
   os:
     - linux
   scope:
     - functional
+
+params:
+  # Safe CI defaults: use the in-repository read-only EEPROM path and do not
+  # invoke the optional legacy binary or any active bus operation.
+  I2C_LEGACY_TEST_ENABLE: "0"
+  I2C_EEPROM_MODE: "auto"
+  I2C_EEPROM_DEVICE: "auto"
+  # Integrity mode must receive a target-approved range and explicit write
+  # authorization from the job definition.
+  I2C_EEPROM_OFFSET: ""
+  I2C_EEPROM_LENGTH: ""
+  I2C_EEPROM_TIMEOUT: "60"
+  I2C_TEST_ADAPTER: "auto"
+  I2C_TEST_TIMEOUT: "15"
+  I2C_DMESG_STRICT: "0"
+  I2C_TOOLS_TIMEOUT: "10"
+  I2C_SCAN_ENABLE: "0"
+  I2C_SCAN_MODE: "quick"
+  I2C_READ_ADDRESS: ""
+  I2C_READ_REGISTER: ""
+  I2C_READ_MODE: "b"
+  I2C_READ_EXPECTED: ""
+  I2C_READ_MASK: ""
+  I2C_WRITE_ADDRESS: ""
+  I2C_WRITE_REGISTER: ""
+  I2C_WRITE_VALUE: ""
+  I2C_WRITE_MODE: "b"
+  I2C_ALLOW_WRITE: "0"
 
 run:
   steps:
@@ -13,4 +41,3 @@ run:
     - cd Runner/suites/Kernel/Baseport/Buses
     - ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh Buses.res
-

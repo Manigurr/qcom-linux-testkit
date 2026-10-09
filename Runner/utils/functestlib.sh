@@ -28,7 +28,13 @@ test_result_init() {
         return 3
     fi
 
-    rm -f "$TEST_RESULT_FILE"
+    if [ "${TEST_RESULT_FILE_PREPARED:-0}" -eq 1 ] &&
+       [ -f "$TEST_RESULT_FILE" ] &&
+       [ ! -L "$TEST_RESULT_FILE" ]; then
+        : >"$TEST_RESULT_FILE"
+    else
+        rm -f "$TEST_RESULT_FILE"
+    fi
 }
 
 # test_result_record <PASS|FAIL|SKIP> <message>
@@ -295,6 +301,8 @@ check_dependencies() {
     # Support both:
     # check_dependencies date awk sed
     # check_dependencies "$deps" where deps="date awk sed"
+    # Set CHECK_DEPS_RECOVER=0 for image-validation suites that must never
+    # install packages while running on the target.
     if [ "$#" -eq 1 ]; then
         # Split the single string into args
         # shellcheck disable=SC2086
@@ -316,7 +324,8 @@ check_dependencies() {
             continue
         fi
  
-        if command -v pkg_check_dependencies_recover_enabled >/dev/null 2>&1; then
+        if [ "${CHECK_DEPS_RECOVER:-1}" = "1" ] &&
+           command -v pkg_check_dependencies_recover_enabled >/dev/null 2>&1; then
             if pkg_check_dependencies_recover_enabled; then
                 if pkg_ensure_command "$cmd"; then
                     if command -v "$cmd" >/dev/null 2>&1; then
@@ -928,12 +937,80 @@ find_test_case_script_by_name() {
 # CONFIG_BAZ=m
 # passes only when the exact expected value matches
 # Logs PASS or FAIL for each config and returns 0 on success, 1 on first mismatch.
+
+kernel_config_source() {
+    kcs_kver="$(uname -r 2>/dev/null)"
+
+    if [ -r /proc/config.gz ]; then
+        kcs_gz_format=""
+
+        if command -v gzip >/dev/null 2>&1; then
+            # Canonical integrity check: confirms the archive actually
+            # decompresses, not just that the path is readable.
+            if gzip -t /proc/config.gz >/dev/null 2>&1; then
+                # Integrity alone only proves the archive decompresses;
+                # it does not prove the payload is a kernel configuration.
+                # Also require at least one recognizable CONFIG_...= or
+                # # CONFIG_... is not set record before accepting this
+                # source.
+                if gzip -dc /proc/config.gz 2>/dev/null |
+                    grep -m 1 -qE '^(CONFIG_[A-Za-z0-9_]+=|# CONFIG_[A-Za-z0-9_]+ is not set$)'; then
+                    kcs_gz_format="gz-gzip"
+                fi
+            fi
+        elif command -v zgrep >/dev/null 2>&1; then
+            # No gzip binary available to run "gzip -t" with; fall back to a
+            # lightweight decompression probe using zgrep itself.
+            if zgrep -m 1 -qE '^CONFIG_' /proc/config.gz 2>/dev/null; then
+                kcs_gz_format="gz-zgrep"
+            fi
+        fi
+
+        if [ -n "$kcs_gz_format" ]; then
+            printf '%s|%s\n' "/proc/config.gz" "$kcs_gz_format"
+            return 0
+        fi
+    fi
+
+    for kcs_cand in \
+        "/boot/config-${kcs_kver}" \
+        "/lib/modules/${kcs_kver}/build/.config" \
+        "/usr/src/linux-headers-${kcs_kver}/.config"
+    do
+        if [ -n "$kcs_kver" ] && [ -r "$kcs_cand" ]; then
+
+            if grep -m 1 -qE '^(CONFIG_[A-Za-z0-9_]+=|# CONFIG_[A-Za-z0-9_]+ is not set$)' "$kcs_cand" 2>/dev/null; then
+                printf '%s|%s\n' "$kcs_cand" "plain"
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
 check_kernel_config() {
     cfgs=$1
+    kver="$(uname -r 2>/dev/null)"
 
-    if [ ! -r /proc/config.gz ]; then
-        log_fail "Kernel config source /proc/config.gz is not available"
+    cfg_info="$(kernel_config_source 2>/dev/null)"
+    if [ -z "$cfg_info" ]; then
+        log_fail "No readable/usable kernel config source found (checked /proc/config.gz [must pass decompression validation], /boot/config-${kver:-<unknown>}, /lib/modules/${kver:-<unknown>}/build/.config, /usr/src/linux-headers-${kver:-<unknown>}/.config)"
         return 1
+    fi
+
+    cfg_source="${cfg_info%%|*}"
+    cfg_format="${cfg_info#*|}"
+
+    if command -v detect_platform >/dev/null 2>&1; then
+        detect_platform >/dev/null 2>&1 || true
+    fi
+    cfg_os_family="${PLATFORM_OS_FAMILY:-unknown}"
+
+    if [ -n "${PLATFORM_OS_NAME:-}" ]; then
+        log_info "Using kernel config source: $cfg_source (OS: $PLATFORM_OS_NAME, family: $cfg_os_family)"
+    else
+        log_info "Using kernel config source: $cfg_source (family: $cfg_os_family)"
     fi
 
     for cfg in $cfgs; do
@@ -952,20 +1029,25 @@ check_kernel_config() {
                 ;;
         esac
 
-        if command -v zgrep >/dev/null 2>&1; then
-            if zgrep -qE "$pattern" /proc/config.gz 2>/dev/null; then
-                log_pass "$pass_msg"
-            else
-                log_fail "$fail_msg"
-                return 1
-            fi
+        cfg_matched=0
+
+        case "$cfg_format" in
+            gz-gzip)
+                gzip -dc "$cfg_source" 2>/dev/null | grep -qE "$pattern" && cfg_matched=1
+                ;;
+            gz-zgrep)
+                zgrep -qE "$pattern" "$cfg_source" 2>/dev/null && cfg_matched=1
+                ;;
+            *)
+                grep -qE "$pattern" "$cfg_source" 2>/dev/null && cfg_matched=1
+                ;;
+        esac
+
+        if [ "$cfg_matched" -eq 1 ]; then
+            log_pass "$pass_msg"
         else
-            if gzip -dc /proc/config.gz 2>/dev/null | grep -qE "$pattern"; then
-                log_pass "$pass_msg"
-            else
-                log_fail "$fail_msg"
-                return 1
-            fi
+            log_fail "$fail_msg"
+            return 1
         fi
     done
 
@@ -977,41 +1059,45 @@ check_kernel_config() {
 # Prints CONFIG_NAME=value from the running kernel configuration, including
 # CONFIG_NAME=n for an explicitly disabled option. Returns 0 when found, 1
 # when unavailable or absent, and 3 when the name is omitted.
+#
+# Uses kernel_config_source() for source discovery, the same shared helper
+# used by check_kernel_config(), so precedence and decompressor handling
+# cannot drift between the two.
 ###############################################################################
 kernel_config_value() {
     config_name="$1"
     [ -n "$config_name" ] || return 3
 
-    if [ -r /proc/config.gz ]; then
-        if command -v zgrep >/dev/null 2>&1; then
-            config_line=$(zgrep -m 1 -E "^${config_name}=" /proc/config.gz 2>/dev/null || true)
-            config_disabled=$(zgrep -m 1 -E "^# ${config_name} is not set$" /proc/config.gz 2>/dev/null || true)
-        else
-            config_line=$(gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^${config_name}=" || true)
-            config_disabled=$(gzip -dc /proc/config.gz 2>/dev/null | grep -m 1 -E "^# ${config_name} is not set$" || true)
-        fi
+    kcv_info="$(kernel_config_source 2>/dev/null)"
+    [ -n "$kcv_info" ] || return 1
 
-        if [ -n "$config_line" ]; then
-            printf '%s\n' "$config_line"
-            return 0
-        fi
-        if [ -n "$config_disabled" ]; then
-            printf '%s=n\n' "$config_name"
-            return 0
-        fi
+    kcv_source="${kcv_info%%|*}"
+    kcv_format="${kcv_info#*|}"
+
+
+    case "$kcv_format" in
+        gz-gzip)
+            kcv_line=$(gzip -dc "$kcv_source" 2>/dev/null | grep -m 1 -E "^${config_name}=" || true)
+            kcv_disabled=$(gzip -dc "$kcv_source" 2>/dev/null | grep -m 1 -E "^# ${config_name} is not set$" || true)
+            ;;
+        gz-zgrep)
+            kcv_line=$(zgrep -m 1 -E "^${config_name}=" "$kcv_source" 2>/dev/null || true)
+            kcv_disabled=$(zgrep -m 1 -E "^# ${config_name} is not set$" "$kcv_source" 2>/dev/null || true)
+            ;;
+        *)
+            kcv_line=$(grep -m 1 -E "^${config_name}=" "$kcv_source" 2>/dev/null || true)
+            kcv_disabled=$(grep -m 1 -E "^# ${config_name} is not set$" "$kcv_source" 2>/dev/null || true)
+            ;;
+    esac
+
+    if [ -n "$kcv_line" ]; then
+        printf '%s\n' "$kcv_line"
+        return 0
     fi
 
-    boot_config="/boot/config-$(uname -r 2>/dev/null)"
-    if [ -r "$boot_config" ]; then
-        config_line=$(grep -m 1 -E "^${config_name}=" "$boot_config" 2>/dev/null || true)
-        if [ -n "$config_line" ]; then
-            printf '%s\n' "$config_line"
-            return 0
-        fi
-        if grep -q -E "^# ${config_name} is not set$" "$boot_config" 2>/dev/null; then
-            printf '%s=n\n' "$config_name"
-            return 0
-        fi
+    if [ -n "$kcv_disabled" ]; then
+        printf '%s=n\n' "$config_name"
+        return 0
     fi
 
     return 1
@@ -1747,8 +1833,9 @@ extract_tar_from_url() {
                     fi
  
                     log_info "Downloading $url -> $tarfile"
-                    if ! try_download "$url" "$tarfile"; then
-                        rc=$?
+                    try_download "$url" "$tarfile"
+                    rc=$?
+                    if [ "$rc" -ne 0 ]; then
                         if [ $rc -eq 60 ]; then
                             log_warn "TLS/handshake problem while downloading (cert/clock/firewall or minimal wget). Marking SKIP."
                             : > "$skip_sentinel" 2>/dev/null || true
@@ -2869,6 +2956,141 @@ run_with_timeout() {
     return $status
 }
 
+# Purpose: Opt-in managed timeout runner with explicit watcher lifecycle cleanup.
+#
+# This intentionally does not change run_with_timeout(), which has existing
+# callers and historical behavior. Suites that need stronger lifecycle handling
+# can opt in to this helper without affecting existing users.
+#
+# Usage:
+#   run_with_managed_timeout TIMEOUT_SECS TEMP_DIR LABEL COMMAND [ARG...]
+#
+# Arguments:
+#   TIMEOUT_SECS - positive integer to enable timeout enforcement. Empty, zero,
+#                  or non-numeric values run COMMAND directly without a watcher.
+#   TEMP_DIR     - directory for temporary watcher PID and timeout marker files;
+#                  /tmp is used when empty.
+#   LABEL        - caller-provided label for temp-file names. Callers should use
+#                  a simple filename-safe value.
+#   COMMAND...   - command and arguments to execute.
+#
+# Optional caller-provided hook:
+#   MANAGED_TIMEOUT_PRE_EXEC_HOOK - function/command invoked in the child command
+#                                   and watcher before they do work.
+#
+# State exposed while the command is running, for caller cleanup traps:
+#   MANAGED_TIMEOUT_CMD_PID
+#   MANAGED_TIMEOUT_WATCHER_PID
+#   MANAGED_TIMEOUT_WATCHER_SLEEP_PID
+#   MANAGED_TIMEOUT_SLEEP_PID_FILE
+#   MANAGED_TIMEOUT_MARKER_FILE
+#
+# Return:
+#   COMMAND status on normal completion; 124 when this helper's watcher expires.
+run_with_managed_timeout() {
+    mt_timeout_secs="$1"
+    mt_temp_dir="$2"
+    mt_label="$3"
+    shift 3
+    mt_command_display="$*"
+    mt_pre_exec_hook="${MANAGED_TIMEOUT_PRE_EXEC_HOOK:-}"
+
+    mt_run_pre_exec_hook() {
+        [ -n "$mt_pre_exec_hook" ] || return 0
+        "$mt_pre_exec_hook"
+    }
+
+    MANAGED_TIMEOUT_CMD_PID=""
+    MANAGED_TIMEOUT_WATCHER_PID=""
+    MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+    MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+    MANAGED_TIMEOUT_MARKER_FILE=""
+
+    case "$mt_timeout_secs" in
+        ''|*[!0-9]*|0)
+            (
+                mt_run_pre_exec_hook
+                exec "$@"
+            )
+            return $?
+            ;;
+    esac
+
+    [ -n "$mt_temp_dir" ] || mt_temp_dir="/tmp"
+    [ -n "$mt_label" ] || mt_label="managed-timeout"
+
+    (
+        mt_run_pre_exec_hook
+        exec "$@"
+    ) &
+    mt_cmd_pid=$!
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_CMD_PID="$mt_cmd_pid"
+
+    mt_sleep_pid_file="$mt_temp_dir/.${mt_label}.timeout-sleep.$$.$mt_cmd_pid"
+    mt_timeout_marker_file="$mt_temp_dir/.${mt_label}.timeout-expired.$$.$mt_cmd_pid"
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_SLEEP_PID_FILE="$mt_sleep_pid_file"
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_MARKER_FILE="$mt_timeout_marker_file"
+
+    (
+        mt_run_pre_exec_hook
+        sleep "$mt_timeout_secs" &
+        mt_sleep_pid=$!
+        printf '%s\n' "$mt_sleep_pid" >"$mt_sleep_pid_file" 2>/dev/null || true
+        trap 'kill "$mt_sleep_pid" >/dev/null 2>&1 || true; wait "$mt_sleep_pid" 2>/dev/null || true; rm -f "$mt_sleep_pid_file" 2>/dev/null || true; exit 0' INT TERM
+        wait "$mt_sleep_pid" 2>/dev/null
+        mt_sleep_rc=$?
+        trap - INT TERM
+        rm -f "$mt_sleep_pid_file" 2>/dev/null || true
+        if [ "$mt_sleep_rc" -eq 0 ]; then
+            printf 'timeout after %ss: %s\n' "$mt_timeout_secs" "$mt_command_display" >"$mt_timeout_marker_file" 2>/dev/null || true
+            echo "[TIMEOUT] command exceeded ${mt_timeout_secs}s: $mt_command_display" >&2
+            kill "$mt_cmd_pid" >/dev/null 2>&1 || true
+            sleep 2
+            kill -KILL "$mt_cmd_pid" >/dev/null 2>&1 || true
+        fi
+    ) &
+    mt_watcher_pid=$!
+    # shellcheck disable=SC2034  # Exposed for caller cleanup traps while command is running.
+    MANAGED_TIMEOUT_WATCHER_PID="$mt_watcher_pid"
+
+    wait "$mt_cmd_pid" 2>/dev/null
+    mt_status=$?
+
+    if [ -r "$mt_timeout_marker_file" ]; then
+        mt_status=124
+    fi
+
+    if [ -r "$mt_sleep_pid_file" ]; then
+        MANAGED_TIMEOUT_WATCHER_SLEEP_PID="$(cat "$mt_sleep_pid_file" 2>/dev/null || true)"
+    fi
+
+    kill "$mt_watcher_pid" >/dev/null 2>&1 || true
+    wait "$mt_watcher_pid" 2>/dev/null || true
+
+    if [ -n "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" ]; then
+        kill "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" >/dev/null 2>&1 || true
+        wait "$MANAGED_TIMEOUT_WATCHER_SLEEP_PID" 2>/dev/null || true
+    fi
+
+    rm -f "$mt_sleep_pid_file" "$mt_timeout_marker_file" 2>/dev/null || true
+
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_CMD_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_WATCHER_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_WATCHER_SLEEP_PID=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_SLEEP_PID_FILE=""
+    # shellcheck disable=SC2034  # Clear externally-consumed timeout state after normal return.
+    MANAGED_TIMEOUT_MARKER_FILE=""
+
+    return "$mt_status"
+}
+
 # Purpose: Run a command with a timeout and capture stdout and stderr.
 # Arguments:
 #   $1 - Timeout in seconds.
@@ -2887,10 +3109,13 @@ run_with_timeout_log() {
     run_with_timeout "$rwtl_timeout" "$@" > "$rwtl_log_file" 2>&1
 }
 
-# Purpose: Replay every line from a file through the common information logger.
+# Purpose: Replay a bounded number of lines from a file through the common
+# information logger.
 # Arguments:
 #   $1 - Label prepended to each logged line.
 #   $2 - Log-file path to replay.
+#   $3 - Optional maximum lines. Empty or zero preserves the historical full
+#        replay behavior.
 # Output:
 #   Sends each readable input line through log_info().
 # Returns:
@@ -2898,11 +3123,37 @@ run_with_timeout_log() {
 log_file_with_label() {
     lfwl_label="$1"
     lfwl_file="$2"
+    lfwl_max_lines="${3:-0}"
+    lfwl_total=0
+    lfwl_emitted=0
 
     [ -r "$lfwl_file" ] || return 0
+    case "$lfwl_max_lines" in
+        ''|*[!0-9]*)
+            lfwl_max_lines=0
+            ;;
+    esac
+
+    lfwl_total=$(wc -l <"$lfwl_file" 2>/dev/null | tr -d '[:space:]')
+    case "$lfwl_total" in
+        ''|*[!0-9]*)
+            lfwl_total=0
+            ;;
+    esac
+
     while IFS= read -r lfwl_line || [ -n "$lfwl_line" ]; do
+        if [ "$lfwl_max_lines" -gt 0 ] &&
+           [ "$lfwl_emitted" -ge "$lfwl_max_lines" ]; then
+            break
+        fi
         log_info "[$lfwl_label] $lfwl_line"
+        lfwl_emitted=$((lfwl_emitted + 1))
     done < "$lfwl_file"
+
+    if [ "$lfwl_max_lines" -gt 0 ] &&
+       [ "$lfwl_total" -gt "$lfwl_emitted" ]; then
+        log_info "[$lfwl_label] omitted=$((lfwl_total - lfwl_emitted)) total=$lfwl_total artifact=$lfwl_file"
+    fi
 
     return 0
 }
@@ -3544,6 +3795,14 @@ dt_list_compatible_nodes() {
     esac
 
     dtlc_found=0
+    if [ -r "${DT_COMPATIBLE_INDEX:-}" ]; then
+        if [ "$dtlc_mode" = "regex" ]; then
+            awk -F '|' -v pattern="$dtlc_pattern" '$2 ~ pattern { print $1; found=1 } END { exit !found }' "$DT_COMPATIBLE_INDEX"
+        else
+            awk -F '|' -v pattern="$dtlc_pattern" 'index($2, pattern) { print $1; found=1 } END { exit !found }' "$DT_COMPATIBLE_INDEX"
+        fi
+        return $?
+    fi
     dtlc_previous_root=""
     for dtlc_root in /proc/device-tree /sys/firmware/devicetree/base; do
         [ -d "$dtlc_root" ] || continue
@@ -3579,6 +3838,162 @@ dt_list_compatible_nodes() {
     done
 
     [ "$dtlc_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_build_runtime_indexes <dt-root> <result-dir>
+# Builds reusable enabled-compatible, provider-property, and platform-device
+# indexes. The files are retained with the suite artifacts for diagnosis.
+###############################################################################
+dt_build_runtime_indexes() {
+    dbri_root="$1"
+    dbri_result_dir="$2"
+    dbri_compatible_file="$dbri_result_dir/dt_compatible_index.log"
+    dbri_property_file="$dbri_result_dir/dt_property_index.log"
+    dbri_platform_file="$dbri_result_dir/platform_device_index.log"
+    [ -d "$dbri_root" ] && [ -n "$dbri_result_dir" ] || return 3
+
+    : >"$dbri_compatible_file"
+    : >"$dbri_property_file"
+    : >"$dbri_platform_file"
+
+    find "$dbri_root" -type f \( \
+        -name compatible -o \
+        -name numa-node-id -o \
+        -name interrupt-controller -o \
+        -name '#clock-cells' -o \
+        -name '#reset-cells' -o \
+        -name regulator-name -o \
+        -name '#power-domain-cells' -o \
+        -name '#cooling-cells' -o \
+        -name '#mbox-cells' -o \
+        -name '#interconnect-cells' \
+    \) 2>/dev/null |
+    while IFS= read -r dbri_path; do
+        dbri_node=$(dirname "$dbri_path")
+        dt_node_enabled "$dbri_node" || continue
+        dbri_property=$(basename "$dbri_path")
+        if [ "$dbri_property" = "compatible" ]; then
+            dbri_text=$(dt_property_text "$dbri_node" compatible 2>/dev/null || true)
+            [ -n "$dbri_text" ] || continue
+            printf '%s|%s\n' "$dbri_node" "$dbri_text" >>"$dbri_compatible_file"
+        else
+            printf '%s|%s\n' "$dbri_property" "$dbri_node" >>"$dbri_property_file"
+        fi
+    done
+
+    for dbri_of_node in /sys/bus/platform/devices/*/of_node; do
+        [ -e "$dbri_of_node" ] || continue
+        dbri_node=$(readlink -f "$dbri_of_node" 2>/dev/null || true)
+        [ -n "$dbri_node" ] || continue
+        dbri_device=$(dirname "$dbri_of_node")
+        printf '%s|%s\n' "$dbri_node" "$dbri_device" >>"$dbri_platform_file"
+    done
+
+    DT_COMPATIBLE_INDEX="$dbri_compatible_file"
+    DT_PROPERTY_INDEX="$dbri_property_file"
+    DT_PLATFORM_DEVICE_INDEX="$dbri_platform_file"
+    export DT_COMPATIBLE_INDEX DT_PROPERTY_INDEX DT_PLATFORM_DEVICE_INDEX
+    log_info "Runtime DT indexes: compatible=$(wc -l <"$dbri_compatible_file" | tr -d '[:space:]') property=$(wc -l <"$dbri_property_file" | tr -d '[:space:]') platform=$(wc -l <"$dbri_platform_file" | tr -d '[:space:]')"
+}
+
+###############################################################################
+# dt_hw_capability_parse_args [--area <list>] [--list-areas] [--help]
+# Validates suite area selection and stores the comma-separated selection in
+# DTRHC_AREAS. Returns 2 after printing informational output.
+###############################################################################
+dt_hw_capability_parse_args() {
+    DTRHC_AREAS="all"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --area)
+                shift
+                [ "$#" -gt 0 ] || return 3
+                DTRHC_AREAS="$1"
+                ;;
+            --list-areas)
+                printf '%s\n' "identity boot cpu-memory interrupts fabric storage usb pcie network multimedia remoteproc security health"
+                return 2
+                ;;
+            --help|-h)
+                printf '%s\n' "Usage: ./run.sh [--area all|identity,boot,cpu-memory,interrupts,fabric,storage,usb,pcie,network,multimedia,remoteproc,security,health] [--list-areas]"
+                return 2
+                ;;
+            *)
+                return 3
+                ;;
+        esac
+        shift
+    done
+    DTRHC_AREAS=$(printf '%s' "$DTRHC_AREAS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [ -n "$DTRHC_AREAS" ] || return 3
+    dthc_remaining=$DTRHC_AREAS
+    while [ -n "$dthc_remaining" ]; do
+        dthc_area=${dthc_remaining%%,*}
+        case "$dthc_area" in
+            all|identity|boot|cpu-memory|interrupts|fabric|storage|usb|pcie|network|multimedia|remoteproc|security|health)
+                ;;
+            *)
+                return 3
+                ;;
+        esac
+        [ "$dthc_remaining" = "$dthc_area" ] && break
+        dthc_remaining=${dthc_remaining#*,}
+    done
+    export DTRHC_AREAS
+}
+
+# dt_hw_capability_area_enabled <area>
+# Returns success when all areas or the supplied area was selected.
+dt_hw_capability_area_enabled() {
+    dthcae_area="$1"
+    case ",${DTRHC_AREAS:-all}," in
+        *,all,*|*,$dthcae_area,*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# dt_summary_begin_area <result-dir> <area-label>
+# Snapshots shared result counters before one validation area runs.
+dt_summary_begin_area() {
+    DTSUMMARY_RESULT_DIR="$1"
+    DTSUMMARY_AREA="$2"
+    DTSUMMARY_PASS_BEFORE=$TEST_RESULT_PASS_COUNT
+    DTSUMMARY_FAIL_BEFORE=$TEST_RESULT_FAIL_COUNT
+    DTSUMMARY_SKIP_BEFORE=$TEST_RESULT_SKIP_COUNT
+    [ -n "$DTSUMMARY_RESULT_DIR" ] && [ -n "$DTSUMMARY_AREA" ] || return 3
+}
+
+# dt_summary_end_area
+# Appends the selected area's result delta to the retained summary artifact.
+dt_summary_end_area() {
+    dtsummary_file="$DTSUMMARY_RESULT_DIR/dt_area_summary.tsv"
+    dtsummary_pass=$((TEST_RESULT_PASS_COUNT - DTSUMMARY_PASS_BEFORE))
+    dtsummary_fail=$((TEST_RESULT_FAIL_COUNT - DTSUMMARY_FAIL_BEFORE))
+    dtsummary_skip=$((TEST_RESULT_SKIP_COUNT - DTSUMMARY_SKIP_BEFORE))
+    if [ "$dtsummary_fail" -gt 0 ]; then
+        dtsummary_result="FAIL"
+    elif [ "$dtsummary_pass" -gt 0 ]; then
+        dtsummary_result="PASS"
+    else
+        dtsummary_result="SKIP"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$DTSUMMARY_AREA" "$dtsummary_result" "$dtsummary_pass" "$dtsummary_fail" "$dtsummary_skip" >>"$dtsummary_file"
+}
+
+# dt_summary_print <result-dir>
+# Prints a compact area-level summary from the retained TSV artifact.
+dt_summary_print() {
+    dtsummary_file="$1/dt_area_summary.tsv"
+    [ -r "$dtsummary_file" ] || return 1
+    log_info "Device Tree Capability Summary"
+    printf '%-26s %-6s %5s %5s %5s\n' "Area" "Result" "Pass" "Fail" "Skip"
+    dtsummary_tab=$(printf '\t')
+    while IFS="$dtsummary_tab" read -r dtsummary_area dtsummary_result dtsummary_pass dtsummary_fail dtsummary_skip; do
+        printf '%-26s %-6s %5s %5s %5s\n' "$dtsummary_area" "$dtsummary_result" "$dtsummary_pass" "$dtsummary_fail" "$dtsummary_skip"
+    done <"$dtsummary_file"
 }
 
 # dt_list_qcom_icc_provider_nodes
@@ -3645,6 +4060,15 @@ find_platform_device_for_dt_node() {
     fpdd_target_node=$(readlink -f "$fpdd_node_dir" 2>/dev/null || true)
     [ -n "$fpdd_target_node" ] || fpdd_target_node="$fpdd_node_dir"
 
+    if [ -r "${DT_PLATFORM_DEVICE_INDEX:-}" ]; then
+        fpdd_index_device=$(awk -F '|' -v node="$fpdd_target_node" '$1 == node { print $2; exit }' "$DT_PLATFORM_DEVICE_INDEX")
+        if [ -n "$fpdd_index_device" ]; then
+            printf '%s\n' "$fpdd_index_device"
+            return 0
+        fi
+        return 1
+    fi
+
     for fpdd_of_node_link in /sys/bus/platform/devices/*/of_node; do
         [ -e "$fpdd_of_node_link" ] || continue
         fpdd_device_node=$(readlink -f "$fpdd_of_node_link" 2>/dev/null || true)
@@ -3668,6 +4092,51 @@ platform_device_driver_name() {
     pddn_driver_path=$(readlink -f "$pddn_device_dir/driver" 2>/dev/null || true)
     [ -n "$pddn_driver_path" ] || return 1
     basename "$pddn_driver_path"
+}
+
+# kernel_modules_for_modalias <modalias>
+# Prints kernel module candidates resolved from the running image's alias
+# database. Returns 0 when candidates are found, 1 when no alias matches, 2
+# when alias resolution is unavailable, and 3 for an empty modalias.
+kernel_modules_for_modalias() {
+    kmfm_modalias="$1"
+    [ -n "$kmfm_modalias" ] || return 3
+    command -v modprobe >/dev/null 2>&1 || return 2
+
+    kmfm_modules=$(modprobe -R "$kmfm_modalias" 2>/dev/null | awk 'NF && !seen[$0]++')
+    [ -n "$kmfm_modules" ] || return 1
+    printf '%s\n' "$kmfm_modules"
+}
+
+# kernel_module_runtime_origin <module-name>
+# Prints builtin, loaded, or the module file reported by the running image.
+# Returns 1 when the optional runtime metadata is unavailable.
+kernel_module_runtime_origin() {
+    kmro_module="$1"
+    [ -n "$kmro_module" ] || return 3
+
+    if command -v modinfo >/dev/null 2>&1; then
+        kmro_filename=$(modinfo -F filename "$kmro_module" 2>/dev/null || true)
+        case "$kmro_filename" in
+            '(builtin)')
+                printf '%s\n' "builtin"
+                return 0
+                ;;
+            '')
+                ;;
+            *)
+                printf '%s\n' "module:$kmro_filename"
+                return 0
+                ;;
+        esac
+    fi
+
+    if is_module_loaded "$kmro_module"; then
+        printf '%s\n' "loaded"
+        return 0
+    fi
+
+    return 1
 }
 
 # interconnect_debugfs_dir
@@ -3727,6 +4196,2096 @@ dt_property_text() {
 }
 
 ###############################################################################
+# dt_runtime_root
+# Prints the resolved runtime device-tree root, preferring sysfs over procfs.
+###############################################################################
+dt_runtime_root() {
+    dtrr_candidate=""
+
+    for dtrr_candidate in /sys/firmware/devicetree/base /proc/device-tree; do
+        [ -d "$dtrr_candidate" ] || continue
+        dtrr_resolved=$(readlink -f "$dtrr_candidate" 2>/dev/null || true)
+        if [ -n "$dtrr_resolved" ] && [ -d "$dtrr_resolved" ]; then
+            printf '%s\n' "$dtrr_resolved"
+        else
+            printf '%s\n' "$dtrr_candidate"
+        fi
+        return 0
+    done
+
+    return 1
+}
+
+###############################################################################
+# dt_node_enabled <node-directory>
+# Returns success unless the node status explicitly disables or fails the node.
+###############################################################################
+dt_node_enabled() {
+    dtne_node_dir="$1"
+    [ -n "$dtne_node_dir" ] || return 3
+    dtne_status=$(dt_property_text "$dtne_node_dir" status 2>/dev/null || true)
+
+    case "$dtne_status" in
+        disabled|fail|failed)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+###############################################################################
+# dt_count_enabled_cpu_nodes <dt-root>
+# Prints the number of enabled CPU nodes described by the supplied DT root.
+###############################################################################
+dt_count_enabled_cpu_nodes() {
+    dtcec_root="$1"
+    dtcec_count=0
+    [ -d "$dtcec_root/cpus" ] || {
+        printf '%s\n' 0
+        return 1
+    }
+
+    for dtcec_type_file in "$dtcec_root"/cpus/*/device_type; do
+        [ -r "$dtcec_type_file" ] || continue
+        dtcec_type=$(tr -d '\000[:space:]' <"$dtcec_type_file" 2>/dev/null)
+        [ "$dtcec_type" = "cpu" ] || continue
+        dtcec_node=$(dirname "$dtcec_type_file")
+        dt_node_enabled "$dtcec_node" || continue
+        dtcec_count=$((dtcec_count + 1))
+    done
+
+    printf '%s\n' "$dtcec_count"
+    [ "$dtcec_count" -gt 0 ]
+}
+
+###############################################################################
+# dt_count_kernel_cpu_nodes
+# Prints the number of CPU directories exposed by the running kernel.
+###############################################################################
+dt_count_kernel_cpu_nodes() {
+    find /sys/devices/system/cpu -maxdepth 1 -type d -name 'cpu[0-9]*' 2>/dev/null |
+        wc -l |
+        tr -d '[:space:]'
+}
+
+###############################################################################
+# dt_list_enabled_memory_nodes <dt-root>
+# Prints enabled memory nodes directly below the supplied DT root.
+###############################################################################
+dt_list_enabled_memory_nodes() {
+    dtlem_root="$1"
+    dtlem_found=0
+    [ -d "$dtlem_root" ] || return 3
+
+    for dtlem_node in "$dtlem_root"/memory@* "$dtlem_root"/memory; do
+        [ -d "$dtlem_node" ] || continue
+        dt_node_enabled "$dtlem_node" || continue
+        printf '%s\n' "$dtlem_node"
+        dtlem_found=1
+    done
+
+    [ "$dtlem_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_list_enabled_reserved_memory_nodes <dt-root>
+# Prints enabled reserved-memory child nodes from the supplied DT root.
+###############################################################################
+dt_list_enabled_reserved_memory_nodes() {
+    dtlrm_root="$1"
+    dtlrm_found=0
+    dtlrm_reserved_root="$dtlrm_root/reserved-memory"
+    [ -d "$dtlrm_reserved_root" ] || return 1
+
+    for dtlrm_node in "$dtlrm_reserved_root"/*; do
+        [ -d "$dtlrm_node" ] || continue
+        dt_node_enabled "$dtlrm_node" || continue
+        printf '%s\n' "$dtlrm_node"
+        dtlrm_found=1
+    done
+
+    [ "$dtlrm_found" -eq 1 ]
+}
+
+###############################################################################
+# dt_profile_id <dt-root>
+# Prints a stable profile identifier derived from the first root compatible.
+###############################################################################
+dt_profile_id() {
+    dtpi_root="$1"
+    dtpi_first_compatible=""
+    [ -d "$dtpi_root" ] || return 3
+
+    if [ -r "$dtpi_root/compatible" ]; then
+        dtpi_first_compatible=$(tr '\000' '\n' <"$dtpi_root/compatible" 2>/dev/null | sed -n '1p')
+    fi
+    [ -n "$dtpi_first_compatible" ] || return 1
+
+    printf '%s\n' "$dtpi_first_compatible" |
+        tr '[:upper:]' '[:lower:]' |
+        tr ',.-' '___' |
+        tr -cd '[:alnum:]_'
+}
+
+###############################################################################
+# dt_list_enabled_property_nodes <dt-root> <property>
+# Prints enabled DT node directories that expose the exact property name.
+###############################################################################
+dt_list_enabled_property_nodes() {
+    dtlep_root="$1"
+    dtlep_property="$2"
+    dtlep_file=""
+    [ -d "$dtlep_root" ] && [ -n "$dtlep_property" ] || return 3
+
+    if [ -r "${DT_PROPERTY_INDEX:-}" ]; then
+        awk -F '|' -v property="$dtlep_property" '$1 == property { print $2; found=1 } END { exit !found }' "$DT_PROPERTY_INDEX"
+        return $?
+    fi
+
+    dtlep_file=$(mktemp "${TMPDIR:-/tmp}/dt-property.XXXXXX") || return 1
+    find "$dtlep_root" -type f -name "$dtlep_property" 2>/dev/null |
+    while IFS= read -r dtlep_property_file; do
+        dtlep_node=$(dirname "$dtlep_property_file")
+        dt_node_enabled "$dtlep_node" || continue
+        printf '%s\n' "$dtlep_node" >>"$dtlep_file"
+    done
+
+    if [ -s "$dtlep_file" ]; then
+        sort -u "$dtlep_file"
+        rm -f "$dtlep_file"
+        return 0
+    fi
+
+    rm -f "$dtlep_file"
+    return 1
+}
+
+###############################################################################
+# dt_validate_property_provider <dt-root> <label> <property> <result-dir>
+# Records enabled provider nodes and optional platform-driver binding evidence.
+###############################################################################
+dt_validate_property_provider() {
+    dtvpp_root="$1"
+    dtvpp_label="$2"
+    dtvpp_property="$3"
+    dtvpp_result_dir="$4"
+    dtvpp_node_file="$dtvpp_result_dir/${dtvpp_label}_providers.log"
+    dtvpp_count=0
+    dtvpp_no_device_count=0
+    dtvpp_unbound_count=0
+
+    [ -d "$dtvpp_root" ] && [ -n "$dtvpp_label" ] &&
+        [ -n "$dtvpp_property" ] && [ -n "$dtvpp_result_dir" ] || return 3
+    : >"$dtvpp_node_file"
+
+    if ! dt_list_enabled_property_nodes "$dtvpp_root" "$dtvpp_property" >"$dtvpp_node_file"; then
+        test_result_record "SKIP" "$dtvpp_label provider property is not present in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvpp_node_dir; do
+        [ -n "$dtvpp_node_dir" ] || continue
+        dtvpp_count=$((dtvpp_count + 1))
+        dtvpp_compatible=$(dt_property_text "$dtvpp_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvpp_label-DT] node=$dtvpp_node_dir compatible=$dtvpp_compatible"
+        test_result_record "PASS" "$dtvpp_label provider exposes $dtvpp_property: ${dtvpp_node_dir##*/}"
+
+        if dtvpp_device_dir=$(find_platform_device_for_dt_node "$dtvpp_node_dir"); then
+            dtvpp_device_name=$(basename "$dtvpp_device_dir")
+            if dtvpp_driver_name=$(platform_device_driver_name "$dtvpp_device_dir"); then
+                test_result_record "PASS" "$dtvpp_label provider is bound: device=$dtvpp_device_name driver=$dtvpp_driver_name"
+            else
+                dtvpp_unbound_count=$((dtvpp_unbound_count + 1))
+                log_info "$dtvpp_label provider platform device is not bound: $dtvpp_device_name"
+            fi
+        else
+            dtvpp_no_device_count=$((dtvpp_no_device_count + 1))
+            log_info "$dtvpp_label provider has no platform-device representation: ${dtvpp_node_dir##*/}"
+        fi
+    done <"$dtvpp_node_file"
+
+    log_info "$dtvpp_label provider totals: discovered=$dtvpp_count"
+    if [ "$dtvpp_no_device_count" -gt 0 ] || [ "$dtvpp_unbound_count" -gt 0 ]; then
+        test_result_record "SKIP" "$dtvpp_label provider runtime binding is not exposed for $((dtvpp_no_device_count + dtvpp_unbound_count)) framework provider nodes"
+    fi
+}
+
+###############################################################################
+# dt_validate_runtime_path <label> <path-pattern>
+# Records PASS when a runtime sysfs or device path pattern has an existing match.
+###############################################################################
+dt_validate_runtime_path() {
+    dtvrp_label="$1"
+    dtvrp_pattern="$2"
+    dtvrp_match=""
+
+    [ -n "$dtvrp_label" ] && [ -n "$dtvrp_pattern" ] || return 3
+
+    for dtvrp_candidate in $dtvrp_pattern; do
+        [ -e "$dtvrp_candidate" ] || continue
+        dtvrp_match="$dtvrp_candidate"
+        break
+    done
+
+    if [ -n "$dtvrp_match" ]; then
+        test_result_record "PASS" "$dtvrp_label runtime evidence is present: $dtvrp_match"
+    else
+        test_result_record "SKIP" "$dtvrp_label runtime evidence is not exposed"
+    fi
+}
+
+###############################################################################
+# dt_validate_network_runtime <label>
+# Records runtime network evidence only for a non-loopback, non-virtual
+# interface, avoiding container bridges such as docker0.
+###############################################################################
+dt_validate_network_runtime() {
+    dtvnr_label="$1"
+    [ -n "$dtvnr_label" ] || return 3
+
+    for dtvnr_path in /sys/class/net/*; do
+        [ -d "$dtvnr_path" ] || continue
+        dtvnr_name=${dtvnr_path##*/}
+        [ "$dtvnr_name" = "lo" ] && continue
+        dtvnr_resolved=$(readlink -f "$dtvnr_path" 2>/dev/null || true)
+        case "$dtvnr_resolved" in
+            /sys/devices/virtual/*|"")
+                continue
+                ;;
+        esac
+        test_result_record "PASS" "$dtvnr_label runtime evidence is present: $dtvnr_path"
+        return 0
+    done
+
+    test_result_record "SKIP" "$dtvnr_label runtime evidence is not exposed"
+}
+
+###############################################################################
+# dt_validate_usb_host_runtime
+# Records host-controller evidence or reports the current USB role when host
+# mode is inactive, distinguishing a missing fixture from a missing driver.
+###############################################################################
+dt_validate_usb_host_runtime() {
+    for dtvuhr_host in /sys/bus/usb/devices/usb*; do
+        [ -d "$dtvuhr_host" ] || continue
+        test_result_record "PASS" "USB host controller runtime evidence is present: $dtvuhr_host"
+        return 0
+    done
+
+    for dtvuhr_role in /sys/class/usb_role/*/role /sys/class/typec/*/data_role; do
+        [ -r "$dtvuhr_role" ] || continue
+        dtvuhr_value=$(tr -d '[:space:]' <"$dtvuhr_role" 2>/dev/null)
+        [ -n "$dtvuhr_value" ] || continue
+        test_result_record "SKIP" "USB host controller is not active, current role=$dtvuhr_value"
+        return 0
+    done
+
+    test_result_record "SKIP" "USB host controller runtime evidence is not exposed"
+}
+
+###############################################################################
+# i2c_collect_runtime_inventory <result-dir>
+# Correlates enabled Qualcomm I2C controllers with runtime adapters and clients.
+# Returns 0 for healthy applicable hardware, 1 for inconsistent runtime state,
+# 2 when I2C is not exposed, and 3 for invalid arguments.
+###############################################################################
+i2c_collect_runtime_inventory() {
+    icri_result_dir="$1"
+    I2C_RUNTIME_CONTROLLER_COUNT=0
+    I2C_RUNTIME_ADAPTER_COUNT=0
+    I2C_RUNTIME_CLIENT_COUNT=0
+    I2C_RUNTIME_BOUND_CLIENT_COUNT=0
+    I2C_RUNTIME_WAITING_CLIENT_COUNT=0
+    I2C_RUNTIME_REGISTERED_DRIVER_COUNT=0
+    I2C_RUNTIME_FAILURE_REASON=""
+    icri_controller_unbound=0
+    icri_declared_client_unbound=0
+    icri_seen_adapters=""
+    icri_unbound_clients=""
+    icri_waiting_clients=""
+
+    [ -n "$icri_result_dir" ] || return 3
+    mkdir -p "$icri_result_dir" || return 1
+    : >"$icri_result_dir/i2c_controllers.tsv"
+    : >"$icri_result_dir/i2c_adapters.tsv"
+    : >"$icri_result_dir/i2c_clients.tsv"
+    : >"$icri_result_dir/i2c_registered_drivers.log"
+
+    for icri_driver_path in /sys/bus/i2c/drivers/*; do
+        [ -d "$icri_driver_path" ] || continue
+        I2C_RUNTIME_REGISTERED_DRIVER_COUNT=$((I2C_RUNTIME_REGISTERED_DRIVER_COUNT + 1))
+        basename "$icri_driver_path" >>"$icri_result_dir/i2c_registered_drivers.log"
+    done
+    log_info "I2C driver registry: registered=$I2C_RUNTIME_REGISTERED_DRIVER_COUNT artifact=$icri_result_dir/i2c_registered_drivers.log"
+
+    log_info "I2C validation: correlating enabled Qualcomm controllers, adapters, clients, and bound drivers"
+
+    if dt_runtime_root >/dev/null 2>&1; then
+        if dt_list_compatible_nodes \
+            'qcom,(geni-i2c|i2c-geni)' \
+            regex >"$icri_result_dir/i2c_controller_nodes.log"; then
+            while IFS= read -r icri_node; do
+                [ -n "$icri_node" ] || continue
+                I2C_RUNTIME_CONTROLLER_COUNT=$((I2C_RUNTIME_CONTROLLER_COUNT + 1))
+                icri_compatible=$(dt_property_text "$icri_node" compatible 2>/dev/null || true)
+                icri_device=""
+                icri_driver=""
+
+                if icri_device=$(find_platform_device_for_dt_node "$icri_node" 2>/dev/null); then
+                    icri_driver=$(platform_device_driver_name "$icri_device" 2>/dev/null || true)
+                fi
+
+                printf '%s\tcompatible=%s\tdevice=%s\tdriver=%s\n' \
+                    "$icri_node" \
+                    "${icri_compatible:-unknown}" \
+                    "${icri_device##*/}" \
+                    "${icri_driver:-unbound}" >>"$icri_result_dir/i2c_controllers.tsv"
+                log_info "[I2C-CONTROLLER] node=$icri_node device=${icri_device##*/} driver=${icri_driver:-unbound}"
+
+                if [ -z "$icri_device" ] || [ -z "$icri_driver" ]; then
+                    icri_controller_unbound=$((icri_controller_unbound + 1))
+                fi
+            done <"$icri_result_dir/i2c_controller_nodes.log"
+        fi
+    fi
+
+    for icri_adapter in \
+        /sys/class/i2c-adapter/i2c-* \
+        /sys/bus/i2c/devices/i2c-*; do
+        [ -d "$icri_adapter" ] || continue
+        icri_adapter_id=${icri_adapter##*/}
+        case " $icri_seen_adapters " in
+            *" $icri_adapter_id "*)
+                continue
+                ;;
+        esac
+        icri_seen_adapters="$icri_seen_adapters $icri_adapter_id"
+        I2C_RUNTIME_ADAPTER_COUNT=$((I2C_RUNTIME_ADAPTER_COUNT + 1))
+        icri_adapter_name=$(cat "$icri_adapter/name" 2>/dev/null || true)
+        icri_adapter_path=$(readlink -f "$icri_adapter/device" 2>/dev/null || true)
+        icri_adapter_driver=$(platform_device_driver_name "$icri_adapter/device" 2>/dev/null || true)
+        icri_devnode="absent"
+        [ -c "/dev/$icri_adapter_id" ] && icri_devnode="present"
+
+        printf '%s\tname=%s\tdriver=%s\tdevnode=%s\tpath=%s\n' \
+            "$icri_adapter_id" \
+            "${icri_adapter_name:-unknown}" \
+            "${icri_adapter_driver:-framework-or-unexposed}" \
+            "$icri_devnode" \
+            "${icri_adapter_path:-unknown}" >>"$icri_result_dir/i2c_adapters.tsv"
+        log_info "[I2C-ADAPTER] adapter=$icri_adapter_id name=${icri_adapter_name:-unknown} driver=${icri_adapter_driver:-framework-or-unexposed} devnode=$icri_devnode"
+    done
+
+    for icri_client in /sys/bus/i2c/devices/[0-9]*-[0-9a-fA-F]*; do
+        [ -d "$icri_client" ] || continue
+        I2C_RUNTIME_CLIENT_COUNT=$((I2C_RUNTIME_CLIENT_COUNT + 1))
+        icri_client_name=$(cat "$icri_client/name" 2>/dev/null || true)
+        icri_client_driver=$(platform_device_driver_name "$icri_client" 2>/dev/null || true)
+        icri_client_of_node=$(readlink -f "$icri_client/of_node" 2>/dev/null || true)
+        icri_client_modalias=$(cat "$icri_client/modalias" 2>/dev/null || true)
+        icri_client_waiting=$(cat "$icri_client/waiting_for_supplier" 2>/dev/null || true)
+        icri_client_modules=""
+        icri_client_module_state=""
+        icri_client_dt_status=""
+        icri_client_dt_children=0
+        icri_client_resources=""
+        icri_client_channels=0
+        if [ -n "$icri_client_modalias" ] &&
+           icri_client_module_lines=$(kernel_modules_for_modalias "$icri_client_modalias" 2>/dev/null); then
+            icri_client_modules=$(printf '%s\n' "$icri_client_module_lines" | tr '\n' ',' | sed 's/,$//')
+            for icri_client_module in $icri_client_module_lines; do
+                icri_client_origin=$(kernel_module_runtime_origin "$icri_client_module" 2>/dev/null || true)
+                [ -n "$icri_client_origin" ] || icri_client_origin="alias-resolved"
+                if [ -n "$icri_client_module_state" ]; then
+                    icri_client_module_state="$icri_client_module_state,$icri_client_module=$icri_client_origin"
+                else
+                    icri_client_module_state="$icri_client_module=$icri_client_origin"
+                fi
+            done
+        fi
+        if [ -n "$icri_client_of_node" ]; then
+            icri_client_dt_status=$(dt_property_text "$icri_client_of_node" status 2>/dev/null || true)
+            [ -n "$icri_client_dt_status" ] || icri_client_dt_status="okay-default"
+            icri_client_dt_children=$(
+                find "$icri_client_of_node" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                    wc -l |
+                    tr -d '[:space:]'
+            )
+            for icri_client_property in \
+                vdd-supply reset-gpios resets clocks power-domains; do
+                [ -e "$icri_client_of_node/$icri_client_property" ] || continue
+                if [ -n "$icri_client_resources" ]; then
+                    icri_client_resources="$icri_client_resources,$icri_client_property"
+                else
+                    icri_client_resources="$icri_client_property"
+                fi
+            done
+        fi
+        [ -n "$icri_client_resources" ] || icri_client_resources="none-exposed"
+        for icri_client_channel in "$icri_client"/channel-*; do
+            [ -L "$icri_client_channel" ] || continue
+            icri_client_channels=$((icri_client_channels + 1))
+        done
+
+        if [ -n "$icri_client_driver" ]; then
+            I2C_RUNTIME_BOUND_CLIENT_COUNT=$((I2C_RUNTIME_BOUND_CLIENT_COUNT + 1))
+        elif [ -n "$icri_client_of_node" ]; then
+            icri_declared_client_unbound=$((icri_declared_client_unbound + 1))
+            icri_unbound_clients="$icri_unbound_clients ${icri_client##*/}(${icri_client_name:-unknown})"
+            case "$icri_client_waiting" in
+                1|Y|y|yes|true)
+                    I2C_RUNTIME_WAITING_CLIENT_COUNT=$((I2C_RUNTIME_WAITING_CLIENT_COUNT + 1))
+                    icri_waiting_clients="$icri_waiting_clients ${icri_client##*/}(${icri_client_name:-unknown})"
+                    ;;
+            esac
+            log_warn "[I2C-UNBOUND] client=${icri_client##*/} name=${icri_client_name:-unknown} dt_status=$icri_client_dt_status waiting_for_supplier=${icri_client_waiting:-unexposed} module_state=${icri_client_module_state:-unresolved} dt_children=$icri_client_dt_children runtime_channels=$icri_client_channels resources=$icri_client_resources"
+        fi
+
+        printf '%s\tname=%s\tdriver=%s\tmodalias=%s\tmodule_candidates=%s\tmodule_state=%s\twaiting_for_supplier=%s\tdt_status=%s\tdt_children=%s\truntime_channels=%s\tresources=%s\tof_node=%s\n' \
+            "${icri_client##*/}" \
+            "${icri_client_name:-unknown}" \
+            "${icri_client_driver:-unbound}" \
+            "${icri_client_modalias:-unexposed}" \
+            "${icri_client_modules:-unresolved}" \
+            "${icri_client_module_state:-unresolved}" \
+            "${icri_client_waiting:-unexposed}" \
+            "${icri_client_dt_status:-unknown}" \
+            "$icri_client_dt_children" \
+            "$icri_client_channels" \
+            "$icri_client_resources" \
+            "${icri_client_of_node:-none}" >>"$icri_result_dir/i2c_clients.tsv"
+        log_info "[I2C-CLIENT] client=${icri_client##*/} name=${icri_client_name:-unknown} driver=${icri_client_driver:-unbound} modalias=${icri_client_modalias:-unexposed} module_candidates=${icri_client_modules:-unresolved} waiting_for_supplier=${icri_client_waiting:-unexposed} of_node=${icri_client_of_node:-none}"
+    done
+
+    log_info "I2C runtime summary: controllers=$I2C_RUNTIME_CONTROLLER_COUNT adapters=$I2C_RUNTIME_ADAPTER_COUNT clients=$I2C_RUNTIME_CLIENT_COUNT bound_clients=$I2C_RUNTIME_BOUND_CLIENT_COUNT waiting_for_supplier=$I2C_RUNTIME_WAITING_CLIENT_COUNT artifact=$icri_result_dir/i2c_adapters.tsv"
+
+    if [ "$I2C_RUNTIME_CONTROLLER_COUNT" -eq 0 ] &&
+       [ "$I2C_RUNTIME_ADAPTER_COUNT" -eq 0 ]; then
+        return 2
+    fi
+
+    if [ "$I2C_RUNTIME_CONTROLLER_COUNT" -gt 0 ] &&
+       [ "$I2C_RUNTIME_ADAPTER_COUNT" -eq 0 ]; then
+        I2C_RUNTIME_FAILURE_REASON="enabled Qualcomm I2C controllers expose no runtime adapters"
+    elif [ "$icri_controller_unbound" -gt 0 ]; then
+        I2C_RUNTIME_FAILURE_REASON="$icri_controller_unbound enabled Qualcomm I2C controller(s) have no bound platform driver"
+    elif [ "$I2C_RUNTIME_WAITING_CLIENT_COUNT" -gt 0 ]; then
+        I2C_RUNTIME_FAILURE_REASON="$I2C_RUNTIME_WAITING_CLIENT_COUNT DT-declared I2C client(s) are waiting for unresolved suppliers:${icri_waiting_clients}"
+    elif [ "$icri_declared_client_unbound" -gt 0 ]; then
+        I2C_RUNTIME_FAILURE_REASON="$icri_declared_client_unbound DT-declared I2C client(s) are unbound:${icri_unbound_clients}"
+    fi
+
+    [ -z "$I2C_RUNTIME_FAILURE_REASON" ] || return 1
+    return 0
+}
+
+###############################################################################
+# I2C userspace-tool validation helpers.
+###############################################################################
+# i2c_tools_select_adapter
+# Prints the unique exposed I2C character adapter number.
+i2c_tools_select_adapter() {
+    itsa_dev_root="${I2C_DEV_ROOT:-/dev}"
+    itsa_selected=""
+    itsa_count=0
+
+    for itsa_devnode in "$itsa_dev_root"/i2c-*; do
+        [ -c "$itsa_devnode" ] || continue
+        itsa_bus=${itsa_devnode##*-}
+        case "$itsa_bus" in
+            ''|*[!0-9]*)
+                continue
+                ;;
+        esac
+        itsa_selected=$itsa_bus
+        itsa_count=$((itsa_count + 1))
+    done
+
+    [ "$itsa_count" -gt 0 ] || return 2
+    [ "$itsa_count" -eq 1 ] || return 1
+    printf '%s\n' "$itsa_selected"
+}
+
+# i2c_tools_adapter_number <adapter>
+# Normalizes BUS or /dev/i2c-BUS and verifies that its character device exists.
+i2c_tools_adapter_number() {
+    itan_adapter="$1"
+    itan_dev_root="${I2C_DEV_ROOT:-/dev}"
+
+    case "$itan_adapter" in
+        "$itan_dev_root"/i2c-*)
+            itan_bus=${itan_adapter##*-}
+            ;;
+        /dev/i2c-*)
+            itan_bus=${itan_adapter##*-}
+            ;;
+        *)
+            itan_bus=$itan_adapter
+            ;;
+    esac
+
+    case "$itan_bus" in
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+
+    [ -c "$itan_dev_root/i2c-$itan_bus" ] || return 2
+    printf '%s\n' "$itan_bus"
+}
+
+# i2c_tools_value_decimal <value>
+# Converts a validated decimal or hexadecimal i2c-tools argument to decimal.
+i2c_tools_value_decimal() {
+    itvd_value="$1"
+
+    case "$itvd_value" in
+        0x[0-9a-fA-F]*)
+            itvd_digits=${itvd_value#0x}
+            case "$itvd_digits" in
+                ''|*[!0-9a-fA-F]*)
+                    return 3
+                    ;;
+            esac
+            ;;
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+
+    printf '%d\n' "$itvd_value" 2>/dev/null
+}
+
+# i2c_tools_value_in_range <value> <minimum> <maximum>
+# Validates a decimal or hexadecimal value against inclusive decimal bounds.
+i2c_tools_value_in_range() {
+    itvir_value="$1"
+    itvir_minimum="$2"
+    itvir_maximum="$3"
+    itvir_decimal=$(i2c_tools_value_decimal "$itvir_value") || return 3
+
+    [ "$itvir_decimal" -ge "$itvir_minimum" ] 2>/dev/null &&
+        [ "$itvir_decimal" -le "$itvir_maximum" ] 2>/dev/null
+}
+
+# i2c_tools_validate_adapters <result-dir> <timeout-seconds>
+# Lists adapters and queries each exposed character adapter's functionality.
+i2c_tools_validate_adapters() {
+    itva_result_dir="$1"
+    itva_timeout="$2"
+    itva_dev_root="${I2C_DEV_ROOT:-/dev}"
+    I2C_TOOLS_CAPABILITY_COUNT=0
+    I2C_TOOLS_CAPABILITY_FAILURES=0
+
+    [ -n "$itva_result_dir" ] || return 3
+    case "$itva_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+    command -v i2cdetect >/dev/null 2>&1 || return 2
+    mkdir -p "$itva_result_dir" || return 1
+
+    if ! run_with_timeout_log \
+        "$itva_timeout" \
+        "$itva_result_dir/i2cdetect_list.log" \
+        i2cdetect -l; then
+        log_file_with_label "I2C-TOOLS-LIST" "$itva_result_dir/i2cdetect_list.log"
+        log_fail "[I2C-TOOLS] expected=adapter-list observed=command-failed-or-timeout artifact=$itva_result_dir/i2cdetect_list.log"
+        return 1
+    fi
+    if [ ! -s "$itva_result_dir/i2cdetect_list.log" ]; then
+        log_fail "[I2C-TOOLS] expected=nonempty-adapter-list observed=empty artifact=$itva_result_dir/i2cdetect_list.log"
+        return 1
+    fi
+    log_file_with_label "I2C-TOOLS-LIST" "$itva_result_dir/i2cdetect_list.log"
+
+    for itva_devnode in "$itva_dev_root"/i2c-*; do
+        [ -c "$itva_devnode" ] || continue
+        itva_bus=${itva_devnode##*-}
+        case "$itva_bus" in
+            ''|*[!0-9]*)
+                continue
+                ;;
+        esac
+        I2C_TOOLS_CAPABILITY_COUNT=$((I2C_TOOLS_CAPABILITY_COUNT + 1))
+        itva_log="$itva_result_dir/i2cdetect_functionality_${itva_bus}.log"
+        if run_with_timeout_log "$itva_timeout" "$itva_log" i2cdetect -F "$itva_bus" &&
+           grep -Eq 'I2C|SMBus' "$itva_log"; then
+            log_info "[I2C-TOOLS] adapter=i2c-$itva_bus functionality=readable artifact=$itva_log"
+        else
+            I2C_TOOLS_CAPABILITY_FAILURES=$((I2C_TOOLS_CAPABILITY_FAILURES + 1))
+            log_file_with_label "I2C-TOOLS-F$itva_bus" "$itva_log"
+            log_fail "[I2C-TOOLS] adapter=i2c-$itva_bus expected=readable-functionality observed=command-failed-or-timeout artifact=$itva_log"
+        fi
+    done
+
+    [ "$I2C_TOOLS_CAPABILITY_COUNT" -gt 0 ] || return 2
+    [ "$I2C_TOOLS_CAPABILITY_FAILURES" -eq 0 ]
+}
+
+# i2c_tools_scan_adapter <adapter> <quick|read> <timeout-seconds> <result-dir>
+# Runs an explicitly requested address scan and retains the complete matrix.
+i2c_tools_scan_adapter() {
+    itsa_adapter="$1"
+    itsa_mode="$2"
+    itsa_timeout="$3"
+    itsa_result_dir="$4"
+
+    [ -n "$itsa_result_dir" ] || return 3
+    case "$itsa_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+    case "$itsa_mode" in
+        quick|read)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    command -v i2cdetect >/dev/null 2>&1 || return 2
+    itsa_bus=$(i2c_tools_adapter_number "$itsa_adapter") || return $?
+    mkdir -p "$itsa_result_dir" || return 1
+    itsa_log="$itsa_result_dir/i2cdetect_scan_${itsa_bus}_${itsa_mode}.log"
+
+    set -- i2cdetect -y "$itsa_bus"
+    if [ "$itsa_mode" = "read" ]; then
+        set -- i2cdetect -r -y "$itsa_bus"
+    fi
+    if ! run_with_timeout_log "$itsa_timeout" "$itsa_log" "$@"; then
+        log_file_with_label "I2C-SCAN" "$itsa_log"
+        log_fail "[I2C-SCAN] adapter=i2c-$itsa_bus mode=$itsa_mode expected=completed-scan observed=command-failed-or-timeout artifact=$itsa_log"
+        return 1
+    fi
+    if ! grep -Eq '(^|[[:space:]])0[[:space:]]+1[[:space:]]+2' "$itsa_log"; then
+        log_file_with_label "I2C-SCAN" "$itsa_log"
+        log_fail "[I2C-SCAN] adapter=i2c-$itsa_bus mode=$itsa_mode expected=address-matrix observed=malformed-output artifact=$itsa_log"
+        return 1
+    fi
+
+    log_file_with_label "I2C-SCAN" "$itsa_log"
+    log_info "[I2C-SCAN] adapter=i2c-$itsa_bus mode=$itsa_mode state=completed artifact=$itsa_log"
+    return 0
+}
+
+# i2c_tools_read_register <adapter> <address> <register> <b|w> <timeout> <result-dir> [expected] [mask]
+# Reads one explicitly selected register and optionally validates masked data.
+i2c_tools_read_register() {
+    itrr_adapter="$1"
+    itrr_address="$2"
+    itrr_register="$3"
+    itrr_mode="$4"
+    itrr_timeout="$5"
+    itrr_result_dir="$6"
+    itrr_expected="${7:-}"
+    itrr_mask="${8:-}"
+    I2C_TOOLS_LAST_READ=""
+
+    [ -n "$itrr_result_dir" ] || return 3
+    case "$itrr_mode" in
+        b|w)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    case "$itrr_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+    i2c_tools_value_in_range "$itrr_address" 3 119 || return 3
+    i2c_tools_value_in_range "$itrr_register" 0 255 || return 3
+    if [ -n "$itrr_expected" ]; then
+        if [ "$itrr_mode" = "w" ]; then
+            i2c_tools_value_in_range "$itrr_expected" 0 65535 || return 3
+        else
+            i2c_tools_value_in_range "$itrr_expected" 0 255 || return 3
+        fi
+    fi
+    if [ -n "$itrr_mask" ]; then
+        if [ "$itrr_mode" = "w" ]; then
+            i2c_tools_value_in_range "$itrr_mask" 0 65535 || return 3
+        else
+            i2c_tools_value_in_range "$itrr_mask" 0 255 || return 3
+        fi
+    fi
+    command -v i2cget >/dev/null 2>&1 || return 2
+    itrr_bus=$(i2c_tools_adapter_number "$itrr_adapter") || return $?
+    mkdir -p "$itrr_result_dir" || return 1
+    itrr_log="$itrr_result_dir/i2cget_${itrr_bus}_${itrr_address}_${itrr_register}_${itrr_mode}.log"
+
+    if ! run_with_timeout_log \
+        "$itrr_timeout" \
+        "$itrr_log" \
+        i2cget -y "$itrr_bus" "$itrr_address" "$itrr_register" "$itrr_mode"; then
+        log_file_with_label "I2C-READ" "$itrr_log"
+        log_fail "[I2C-READ] adapter=i2c-$itrr_bus address=$itrr_address register=$itrr_register mode=$itrr_mode expected=successful-read observed=command-failed-or-timeout artifact=$itrr_log"
+        return 1
+    fi
+
+    I2C_TOOLS_LAST_READ=$(awk '/^0x[0-9a-fA-F]+$/ { value=$0 } END { print value }' "$itrr_log")
+    i2c_tools_value_decimal "$I2C_TOOLS_LAST_READ" >/dev/null || {
+        log_file_with_label "I2C-READ" "$itrr_log"
+        log_fail "[I2C-READ] adapter=i2c-$itrr_bus address=$itrr_address register=$itrr_register expected=numeric-value observed=${I2C_TOOLS_LAST_READ:-missing} artifact=$itrr_log"
+        return 1
+    }
+
+    if [ -n "$itrr_expected" ]; then
+        itrr_actual_decimal=$(i2c_tools_value_decimal "$I2C_TOOLS_LAST_READ") || return 1
+        itrr_expected_decimal=$(i2c_tools_value_decimal "$itrr_expected") || return 3
+        if [ -n "$itrr_mask" ]; then
+            itrr_mask_decimal=$(i2c_tools_value_decimal "$itrr_mask") || return 3
+        elif [ "$itrr_mode" = "w" ]; then
+            itrr_mask_decimal=65535
+        else
+            itrr_mask_decimal=255
+        fi
+        if [ $((itrr_actual_decimal & itrr_mask_decimal)) -ne $((itrr_expected_decimal & itrr_mask_decimal)) ]; then
+            log_fail "[I2C-READ] adapter=i2c-$itrr_bus address=$itrr_address register=$itrr_register mask=$itrr_mask_decimal expected=$itrr_expected observed=$I2C_TOOLS_LAST_READ artifact=$itrr_log"
+            return 1
+        fi
+    fi
+
+    log_info "[I2C-READ] adapter=i2c-$itrr_bus address=$itrr_address register=$itrr_register mode=$itrr_mode value=$I2C_TOOLS_LAST_READ artifact=$itrr_log"
+    return 0
+}
+
+I2C_TOOLS_RESTORE_PENDING=0
+I2C_TOOLS_RESTORE_ADAPTER=""
+I2C_TOOLS_RESTORE_ADDRESS=""
+I2C_TOOLS_RESTORE_REGISTER=""
+I2C_TOOLS_RESTORE_VALUE=""
+I2C_TOOLS_RESTORE_MODE=""
+I2C_TOOLS_RESTORE_TIMEOUT=""
+I2C_TOOLS_RESTORE_RESULT_DIR=""
+
+# i2c_tools_restore_pending_write
+# Restores the original register value after an interrupted transactional write.
+i2c_tools_restore_pending_write() {
+    [ "$I2C_TOOLS_RESTORE_PENDING" -eq 1 ] || return 0
+    if ! i2c_tools_write_register_value \
+        "$I2C_TOOLS_RESTORE_ADAPTER" \
+        "$I2C_TOOLS_RESTORE_ADDRESS" \
+        "$I2C_TOOLS_RESTORE_REGISTER" \
+        "$I2C_TOOLS_RESTORE_VALUE" \
+        "$I2C_TOOLS_RESTORE_MODE" \
+        "$I2C_TOOLS_RESTORE_TIMEOUT" \
+        "$I2C_TOOLS_RESTORE_RESULT_DIR/i2cset_emergency_restore.log"; then
+        return 1
+    fi
+    if ! i2c_tools_read_register \
+        "$I2C_TOOLS_RESTORE_ADAPTER" \
+        "$I2C_TOOLS_RESTORE_ADDRESS" \
+        "$I2C_TOOLS_RESTORE_REGISTER" \
+        "$I2C_TOOLS_RESTORE_MODE" \
+        "$I2C_TOOLS_RESTORE_TIMEOUT" \
+        "$I2C_TOOLS_RESTORE_RESULT_DIR" \
+        "$I2C_TOOLS_RESTORE_VALUE"; then
+        return 1
+    fi
+    I2C_TOOLS_RESTORE_PENDING=0
+    return 0
+}
+
+# i2c_tools_write_register_value <adapter> <address> <register> <value> <b|w> <timeout> <log>
+# Writes one validated register value for transactional helper use.
+i2c_tools_write_register_value() {
+    itwrv_adapter="$1"
+    itwrv_address="$2"
+    itwrv_register="$3"
+    itwrv_value="$4"
+    itwrv_mode="$5"
+    itwrv_timeout="$6"
+    itwrv_log="$7"
+
+    case "$itwrv_mode" in
+        b|w)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    case "$itwrv_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+    i2c_tools_value_in_range "$itwrv_address" 3 119 || return 3
+    i2c_tools_value_in_range "$itwrv_register" 0 255 || return 3
+    if [ "$itwrv_mode" = "w" ]; then
+        i2c_tools_value_in_range "$itwrv_value" 0 65535 || return 3
+    else
+        i2c_tools_value_in_range "$itwrv_value" 0 255 || return 3
+    fi
+    command -v i2cset >/dev/null 2>&1 || return 2
+    itwrv_bus=$(i2c_tools_adapter_number "$itwrv_adapter") || return $?
+
+    run_with_timeout_log \
+        "$itwrv_timeout" \
+        "$itwrv_log" \
+        i2cset -y "$itwrv_bus" "$itwrv_address" "$itwrv_register" "$itwrv_value" "$itwrv_mode"
+}
+
+# i2c_tools_write_restore_register <adapter> <address> <register> <value> <b|w> <timeout> <result-dir>
+# Writes, reads back, restores, and verifies one explicitly selected register.
+i2c_tools_write_restore_register() {
+    itwrr_adapter="$1"
+    itwrr_address="$2"
+    itwrr_register="$3"
+    itwrr_value="$4"
+    itwrr_mode="$5"
+    itwrr_timeout="$6"
+    itwrr_result_dir="$7"
+
+    [ -n "$itwrr_result_dir" ] || return 3
+    command -v i2cget >/dev/null 2>&1 || return 2
+    command -v i2cset >/dev/null 2>&1 || return 2
+    mkdir -p "$itwrr_result_dir" || return 1
+
+    i2c_tools_read_register \
+        "$itwrr_adapter" "$itwrr_address" "$itwrr_register" \
+        "$itwrr_mode" "$itwrr_timeout" "$itwrr_result_dir"
+    itwrr_read_status=$?
+    [ "$itwrr_read_status" -eq 0 ] || return "$itwrr_read_status"
+    itwrr_original=$I2C_TOOLS_LAST_READ
+    itwrr_original_decimal=$(i2c_tools_value_decimal "$itwrr_original") || return 1
+    itwrr_requested_decimal=$(i2c_tools_value_decimal "$itwrr_value") || return 3
+    if [ "$itwrr_original_decimal" -eq "$itwrr_requested_decimal" ]; then
+        log_fail "[I2C-WRITE] address=$itwrr_address register=$itwrr_register expected=different-test-value observed=request-equals-original-$itwrr_original"
+        return 3
+    fi
+
+    I2C_TOOLS_RESTORE_PENDING=1
+    I2C_TOOLS_RESTORE_ADAPTER=$itwrr_adapter
+    I2C_TOOLS_RESTORE_ADDRESS=$itwrr_address
+    I2C_TOOLS_RESTORE_REGISTER=$itwrr_register
+    I2C_TOOLS_RESTORE_VALUE=$itwrr_original
+    I2C_TOOLS_RESTORE_MODE=$itwrr_mode
+    I2C_TOOLS_RESTORE_TIMEOUT=$itwrr_timeout
+    I2C_TOOLS_RESTORE_RESULT_DIR=$itwrr_result_dir
+
+    itwrr_write_log="$itwrr_result_dir/i2cset_test_write.log"
+    if ! i2c_tools_write_register_value \
+        "$itwrr_adapter" "$itwrr_address" "$itwrr_register" \
+        "$itwrr_value" "$itwrr_mode" "$itwrr_timeout" "$itwrr_write_log"; then
+        log_file_with_label "I2C-WRITE" "$itwrr_write_log"
+        if i2c_tools_restore_pending_write; then
+            log_info "[I2C-RESTORE] original value restored after test-write failure"
+        else
+            log_fail "[I2C-RESTORE] expected=$itwrr_original observed=emergency-restore-failed"
+        fi
+        return 1
+    fi
+
+    if ! i2c_tools_read_register \
+        "$itwrr_adapter" "$itwrr_address" "$itwrr_register" \
+        "$itwrr_mode" "$itwrr_timeout" "$itwrr_result_dir" \
+        "$itwrr_value"; then
+        if i2c_tools_restore_pending_write; then
+            log_info "[I2C-RESTORE] original value restored after read-back failure"
+        else
+            log_fail "[I2C-RESTORE] expected=$itwrr_original observed=emergency-restore-failed"
+        fi
+        return 1
+    fi
+
+    itwrr_restore_log="$itwrr_result_dir/i2cset_restore.log"
+    if ! i2c_tools_write_register_value \
+        "$itwrr_adapter" "$itwrr_address" "$itwrr_register" \
+        "$itwrr_original" "$itwrr_mode" "$itwrr_timeout" "$itwrr_restore_log"; then
+        log_file_with_label "I2C-RESTORE" "$itwrr_restore_log"
+        log_fail "[I2C-RESTORE] address=$itwrr_address register=$itwrr_register expected=$itwrr_original observed=restore-write-failed artifact=$itwrr_restore_log"
+        return 1
+    fi
+    if ! i2c_tools_read_register \
+        "$itwrr_adapter" "$itwrr_address" "$itwrr_register" \
+        "$itwrr_mode" "$itwrr_timeout" "$itwrr_result_dir" \
+        "$itwrr_original"; then
+        log_fail "[I2C-RESTORE] address=$itwrr_address register=$itwrr_register expected=$itwrr_original observed=restore-verification-failed"
+        return 1
+    fi
+
+    I2C_TOOLS_RESTORE_PENDING=0
+    log_info "[I2C-WRITE] adapter=$itwrr_adapter address=$itwrr_address register=$itwrr_register test_value=$itwrr_value original=$itwrr_original state=write-readback-restored"
+    return 0
+}
+
+###############################################################################
+# i2c_run_legacy_test <result-dir> <adapter> <timeout-seconds>
+# Runs the image-provided i2c-msm-test compatibility path and verifies both its
+# status and transfer markers. Returns 0 for success, 1 for a failed transfer,
+# 2 when the tool is absent, 3 for invalid arguments, and 4 without an adapter.
+###############################################################################
+i2c_run_legacy_test() {
+    irlt_result_dir="$1"
+    irlt_requested_adapter="$2"
+    irlt_timeout="$3"
+    I2C_LEGACY_SELECTED_ADAPTER=""
+
+    [ -n "$irlt_result_dir" ] && [ -n "$irlt_requested_adapter" ] || return 3
+    case "$irlt_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+
+    command -v i2c-msm-test >/dev/null 2>&1 || return 2
+
+    case "$irlt_requested_adapter" in
+        auto)
+            for irlt_devnode in /dev/i2c-*; do
+                [ -c "$irlt_devnode" ] || continue
+                I2C_LEGACY_SELECTED_ADAPTER="$irlt_devnode"
+                break
+            done
+            ;;
+        /dev/i2c-*)
+            I2C_LEGACY_SELECTED_ADAPTER="$irlt_requested_adapter"
+            ;;
+        *)
+            I2C_LEGACY_SELECTED_ADAPTER="/dev/i2c-$irlt_requested_adapter"
+            ;;
+    esac
+
+    [ -n "$I2C_LEGACY_SELECTED_ADAPTER" ] &&
+        [ -c "$I2C_LEGACY_SELECTED_ADAPTER" ] || return 4
+
+    log_info "I2C functional target: adapter=$I2C_LEGACY_SELECTED_ADAPTER command=i2c-msm-test timeout=${irlt_timeout}s"
+    if ! run_with_timeout_log \
+        "$irlt_timeout" \
+        "$irlt_result_dir/i2c_msm_test.log" \
+        i2c-msm-test -v -D "$I2C_LEGACY_SELECTED_ADAPTER" -l; then
+        log_file_with_label "I2C-LEGACY" "$irlt_result_dir/i2c_msm_test.log"
+        return 1
+    fi
+
+    if ! grep -q 'Reading' "$irlt_result_dir/i2c_msm_test.log" ||
+       ! grep -q 'ret:1' "$irlt_result_dir/i2c_msm_test.log"; then
+        log_file_with_label "I2C-LEGACY" "$irlt_result_dir/i2c_msm_test.log"
+        return 1
+    fi
+
+    return 0
+}
+
+###############################################################################
+# pcie_collect_runtime_health <result-dir>
+# Captures PCI device link, MSI, driver, and runtime-power evidence without
+# changing link or power state. Returns 0 when inventory is readable, 1 when
+# malformed, 2 when PCI is absent, and 3 for invalid arguments.
+###############################################################################
+pcie_collect_runtime_health() {
+    pcrh_result_dir="$1"
+    PCIE_RUNTIME_DEVICE_COUNT=0
+    PCIE_RUNTIME_LINK_COUNT=0
+    PCIE_RUNTIME_MSI_DEVICE_COUNT=0
+    PCIE_RUNTIME_POWER_COUNT=0
+    PCIE_RUNTIME_INACTIVE_PORT_COUNT=0
+    PCIE_RUNTIME_FAILURE_REASON=""
+    pcrh_invalid_link_count=0
+
+    [ -n "$pcrh_result_dir" ] || return 3
+    mkdir -p "$pcrh_result_dir" || return 1
+    : >"$pcrh_result_dir/pcie_runtime.tsv"
+
+    log_info "PCIe runtime validation: collecting driver, link, MSI, and runtime-power evidence"
+
+    for pcrh_device in /sys/bus/pci/devices/*; do
+        [ -d "$pcrh_device" ] || continue
+        PCIE_RUNTIME_DEVICE_COUNT=$((PCIE_RUNTIME_DEVICE_COUNT + 1))
+        pcrh_vendor=$(cat "$pcrh_device/vendor" 2>/dev/null || true)
+        pcrh_device_id=$(cat "$pcrh_device/device" 2>/dev/null || true)
+        pcrh_class=$(cat "$pcrh_device/class" 2>/dev/null || true)
+        pcrh_driver=$(platform_device_driver_name "$pcrh_device" 2>/dev/null || true)
+        pcrh_current_speed=$(cat "$pcrh_device/current_link_speed" 2>/dev/null || true)
+        pcrh_max_speed=$(cat "$pcrh_device/max_link_speed" 2>/dev/null || true)
+        pcrh_current_width=$(cat "$pcrh_device/current_link_width" 2>/dev/null || true)
+        pcrh_max_width=$(cat "$pcrh_device/max_link_width" 2>/dev/null || true)
+        pcrh_runtime_status=$(cat "$pcrh_device/power/runtime_status" 2>/dev/null || true)
+        pcrh_msi_count=0
+        pcrh_link_state="unexposed"
+
+        if [ -d "$pcrh_device/msi_irqs" ]; then
+            pcrh_msi_count=$(find "$pcrh_device/msi_irqs" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d '[:space:]')
+        fi
+        case "$pcrh_msi_count" in
+            ''|*[!0-9]*)
+                pcrh_msi_count=0
+                ;;
+        esac
+        if [ "$pcrh_msi_count" -gt 0 ]; then
+            PCIE_RUNTIME_MSI_DEVICE_COUNT=$((PCIE_RUNTIME_MSI_DEVICE_COUNT + 1))
+        fi
+
+        if [ -n "$pcrh_current_speed" ] || [ -n "$pcrh_current_width" ]; then
+            PCIE_RUNTIME_LINK_COUNT=$((PCIE_RUNTIME_LINK_COUNT + 1))
+            pcrh_link_state="up"
+            case "$pcrh_current_width" in
+                0|0x|0X)
+                    case "$pcrh_class" in
+                        0x0604*|0604*)
+                            pcrh_link_state="inactive-bridge-port"
+                            PCIE_RUNTIME_INACTIVE_PORT_COUNT=$((PCIE_RUNTIME_INACTIVE_PORT_COUNT + 1))
+                            ;;
+                        *)
+                            pcrh_link_state="invalid-zero-width"
+                            pcrh_invalid_link_count=$((pcrh_invalid_link_count + 1))
+                            ;;
+                    esac
+                    ;;
+            esac
+        fi
+        [ -n "$pcrh_runtime_status" ] && PCIE_RUNTIME_POWER_COUNT=$((PCIE_RUNTIME_POWER_COUNT + 1))
+
+        printf '%s\tvendor=%s\tdevice=%s\tclass=%s\tdriver=%s\tcurrent_speed=%s\tmax_speed=%s\tcurrent_width=%s\tmax_width=%s\tlink_state=%s\tmsi_irqs=%s\truntime_status=%s\n' \
+            "${pcrh_device##*/}" \
+            "${pcrh_vendor:-unknown}" \
+            "${pcrh_device_id:-unknown}" \
+            "${pcrh_class:-unknown}" \
+            "${pcrh_driver:-unbound}" \
+            "${pcrh_current_speed:-unexposed}" \
+            "${pcrh_max_speed:-unexposed}" \
+            "${pcrh_current_width:-unexposed}" \
+            "${pcrh_max_width:-unexposed}" \
+            "$pcrh_link_state" \
+            "$pcrh_msi_count" \
+            "${pcrh_runtime_status:-unexposed}" >>"$pcrh_result_dir/pcie_runtime.tsv"
+        log_info "[PCIE] bdf=${pcrh_device##*/} id=${pcrh_vendor:-unknown}:${pcrh_device_id:-unknown} class=${pcrh_class:-unknown} driver=${pcrh_driver:-unbound} link=${pcrh_current_speed:-unexposed}/x${pcrh_current_width:-unexposed} link_state=$pcrh_link_state max=${pcrh_max_speed:-unexposed}/x${pcrh_max_width:-unexposed} msi_irqs=$pcrh_msi_count runtime_status=${pcrh_runtime_status:-unexposed}"
+    done
+
+    if [ "$PCIE_RUNTIME_DEVICE_COUNT" -eq 0 ]; then
+        return 2
+    fi
+
+    if [ "$pcrh_invalid_link_count" -gt 0 ]; then
+        # Exported result for suite orchestration after this helper returns.
+        # shellcheck disable=SC2034
+        PCIE_RUNTIME_FAILURE_REASON="$pcrh_invalid_link_count non-bridge PCIe device(s) report zero negotiated link width"
+        return 1
+    fi
+
+    log_info "PCIe runtime summary: devices=$PCIE_RUNTIME_DEVICE_COUNT links=$PCIE_RUNTIME_LINK_COUNT inactive_bridge_ports=$PCIE_RUNTIME_INACTIVE_PORT_COUNT msi_devices=$PCIE_RUNTIME_MSI_DEVICE_COUNT power_nodes=$PCIE_RUNTIME_POWER_COUNT artifact=$pcrh_result_dir/pcie_runtime.tsv"
+    return 0
+}
+
+###############################################################################
+# usb_collect_host_inventory <result-dir>
+# Captures USB root hubs, connected devices, interfaces, speeds, drivers, and
+# runtime-power state. Returns 0 for host runtime, 1 for malformed host state,
+# 2 when host mode is inactive, and 3 for invalid arguments.
+###############################################################################
+usb_collect_host_inventory() {
+    uchi_result_dir="$1"
+    USB_RUNTIME_ROOT_HUB_COUNT=0
+    USB_RUNTIME_DEVICE_COUNT=0
+    USB_RUNTIME_INTERFACE_COUNT=0
+    USB_RUNTIME_BOUND_INTERFACE_COUNT=0
+    USB_RUNTIME_FAILURE_REASON=""
+
+    [ -n "$uchi_result_dir" ] || return 3
+    mkdir -p "$uchi_result_dir" || return 1
+    : >"$uchi_result_dir/usb_host_runtime.tsv"
+
+    log_info "USB host validation: collecting root-hub, device, interface, speed, driver, and runtime-power evidence"
+
+    for uchi_hub in /sys/bus/usb/devices/usb*; do
+        [ -d "$uchi_hub" ] || continue
+        USB_RUNTIME_ROOT_HUB_COUNT=$((USB_RUNTIME_ROOT_HUB_COUNT + 1))
+        uchi_speed=$(cat "$uchi_hub/speed" 2>/dev/null || true)
+        uchi_runtime=$(cat "$uchi_hub/power/runtime_status" 2>/dev/null || true)
+        uchi_path=$(readlink -f "$uchi_hub" 2>/dev/null || true)
+        printf 'root-hub\t%s\tspeed=%s\truntime_status=%s\tpath=%s\n' \
+            "${uchi_hub##*/}" \
+            "${uchi_speed:-unknown}" \
+            "${uchi_runtime:-unexposed}" \
+            "${uchi_path:-unknown}" >>"$uchi_result_dir/usb_host_runtime.tsv"
+        log_info "[USB-ROOT] hub=${uchi_hub##*/} speed=${uchi_speed:-unknown} runtime_status=${uchi_runtime:-unexposed} path=${uchi_path:-unknown}"
+    done
+
+    if [ "$USB_RUNTIME_ROOT_HUB_COUNT" -eq 0 ]; then
+        for uchi_role in /sys/class/usb_role/*/role /sys/class/typec/*/data_role; do
+            [ -r "$uchi_role" ] || continue
+            uchi_role_value=$(tr -d '[:space:]' <"$uchi_role" 2>/dev/null)
+            [ -n "$uchi_role_value" ] || continue
+            log_info "USB host mode is inactive: role_node=$uchi_role role=$uchi_role_value"
+            return 2
+        done
+        # Exported result for suite orchestration after this helper returns.
+        # shellcheck disable=SC2034
+        USB_RUNTIME_FAILURE_REASON="no USB root hubs are exposed and no inactive device role could be confirmed"
+        return 1
+    fi
+
+    for uchi_device in /sys/bus/usb/devices/*-*; do
+        [ -d "$uchi_device" ] || continue
+        case "${uchi_device##*/}" in
+            *:*)
+                continue
+                ;;
+        esac
+        [ -r "$uchi_device/idVendor" ] || continue
+
+        USB_RUNTIME_DEVICE_COUNT=$((USB_RUNTIME_DEVICE_COUNT + 1))
+        uchi_vendor=$(cat "$uchi_device/idVendor" 2>/dev/null || true)
+        uchi_product_id=$(cat "$uchi_device/idProduct" 2>/dev/null || true)
+        uchi_product=$(tr -d '\000' <"$uchi_device/product" 2>/dev/null || true)
+        uchi_speed=$(cat "$uchi_device/speed" 2>/dev/null || true)
+        uchi_runtime=$(cat "$uchi_device/power/runtime_status" 2>/dev/null || true)
+        log_info "[USB-DEVICE] device=${uchi_device##*/} id=${uchi_vendor:-unknown}:${uchi_product_id:-unknown} product=${uchi_product:-unknown} speed_mbps=${uchi_speed:-unknown} runtime_status=${uchi_runtime:-unexposed}"
+
+        for uchi_interface in "$uchi_device":*; do
+            [ -d "$uchi_interface" ] || continue
+            [ -r "$uchi_interface/bInterfaceClass" ] || continue
+            USB_RUNTIME_INTERFACE_COUNT=$((USB_RUNTIME_INTERFACE_COUNT + 1))
+            uchi_class=$(cat "$uchi_interface/bInterfaceClass" 2>/dev/null || true)
+            uchi_driver=$(platform_device_driver_name "$uchi_interface" 2>/dev/null || true)
+            [ -n "$uchi_driver" ] && USB_RUNTIME_BOUND_INTERFACE_COUNT=$((USB_RUNTIME_BOUND_INTERFACE_COUNT + 1))
+            printf 'interface\t%s\tclass=%s\tdriver=%s\tparent=%s\n' \
+                "${uchi_interface##*/}" \
+                "${uchi_class:-unknown}" \
+                "${uchi_driver:-unbound}" \
+                "${uchi_device##*/}" >>"$uchi_result_dir/usb_host_runtime.tsv"
+            log_info "[USB-INTERFACE] interface=${uchi_interface##*/} class=${uchi_class:-unknown} driver=${uchi_driver:-unbound}"
+        done
+    done
+
+    log_info "USB host summary: root_hubs=$USB_RUNTIME_ROOT_HUB_COUNT devices=$USB_RUNTIME_DEVICE_COUNT interfaces=$USB_RUNTIME_INTERFACE_COUNT bound_interfaces=$USB_RUNTIME_BOUND_INTERFACE_COUNT artifact=$uchi_result_dir/usb_host_runtime.tsv"
+    return 0
+}
+
+###############################################################################
+# usb_validate_hid_runtime <result-dir>
+# Validates binding for connected USB HID class interfaces. Returns 0 when all
+# discovered interfaces are bound, 1 when any is unbound, 2 when absent, and 3
+# for invalid arguments.
+###############################################################################
+usb_validate_hid_runtime() {
+    uvhr_result_dir="$1"
+    USB_HID_INTERFACE_COUNT=0
+    USB_HID_BOUND_COUNT=0
+    USB_HID_UNBOUND_COUNT=0
+
+    [ -n "$uvhr_result_dir" ] || return 3
+    mkdir -p "$uvhr_result_dir" || return 1
+    : >"$uvhr_result_dir/usb_hid_runtime.tsv"
+
+    log_info "USB HID validation: checking class interfaces and kernel-driver binding"
+
+    for uvhr_class_file in /sys/bus/usb/devices/*:*/bInterfaceClass; do
+        [ -r "$uvhr_class_file" ] || continue
+        [ "$(cat "$uvhr_class_file" 2>/dev/null)" = "03" ] || continue
+
+        uvhr_interface=$(dirname "$uvhr_class_file")
+        uvhr_interface_name=${uvhr_interface##*/}
+        uvhr_device_name=${uvhr_interface_name%%:*}
+        uvhr_device="/sys/bus/usb/devices/$uvhr_device_name"
+        uvhr_driver=$(platform_device_driver_name "$uvhr_interface" 2>/dev/null || true)
+        uvhr_vendor=$(cat "$uvhr_device/idVendor" 2>/dev/null || true)
+        uvhr_product_id=$(cat "$uvhr_device/idProduct" 2>/dev/null || true)
+        uvhr_product=$(tr -d '\000' <"$uvhr_device/product" 2>/dev/null || true)
+        USB_HID_INTERFACE_COUNT=$((USB_HID_INTERFACE_COUNT + 1))
+
+        if [ -n "$uvhr_driver" ]; then
+            USB_HID_BOUND_COUNT=$((USB_HID_BOUND_COUNT + 1))
+        else
+            USB_HID_UNBOUND_COUNT=$((USB_HID_UNBOUND_COUNT + 1))
+        fi
+
+        printf '%s\tdevice=%s\tid=%s:%s\tproduct=%s\tdriver=%s\n' \
+            "$uvhr_interface_name" \
+            "$uvhr_device_name" \
+            "${uvhr_vendor:-unknown}" \
+            "${uvhr_product_id:-unknown}" \
+            "${uvhr_product:-unknown}" \
+            "${uvhr_driver:-unbound}" >>"$uvhr_result_dir/usb_hid_runtime.tsv"
+        log_info "[USB-HID] interface=$uvhr_interface_name device=$uvhr_device_name id=${uvhr_vendor:-unknown}:${uvhr_product_id:-unknown} product=${uvhr_product:-unknown} driver=${uvhr_driver:-unbound}"
+    done
+
+    [ "$USB_HID_INTERFACE_COUNT" -gt 0 ] || return 2
+    [ "$USB_HID_UNBOUND_COUNT" -eq 0 ] || return 1
+    return 0
+}
+
+###############################################################################
+# usb_validate_mass_storage_runtime <result-dir> <read-verify> <wait-seconds>
+# Validates USB mass-storage binding and block nodes, then optionally performs
+# a non-destructive 512-byte read. Returns 0 for healthy devices, 1 for a
+# runtime failure, 2 when no fixture is present, and 3 for invalid arguments.
+###############################################################################
+usb_validate_mass_storage_runtime() {
+    uvms_result_dir="$1"
+    uvms_read_verify="$2"
+    uvms_wait_seconds="$3"
+    USB_MSD_DEVICE_COUNT=0
+    USB_MSD_FAILURE_COUNT=0
+
+    [ -n "$uvms_result_dir" ] || return 3
+    case "$uvms_read_verify" in
+        0|1)
+            ;;
+        *)
+            return 3
+            ;;
+    esac
+    case "$uvms_wait_seconds" in
+        ''|*[!0-9]*)
+            return 3
+            ;;
+    esac
+
+    mkdir -p "$uvms_result_dir" || return 1
+    : >"$uvms_result_dir/usb_msd_runtime.tsv"
+    uvms_device_file="$uvms_result_dir/usb_msd_devices.list"
+    : >"$uvms_device_file"
+
+    log_info "USB mass-storage validation: checking class binding, block-device creation, and optional read access"
+
+    for uvms_class_file in /sys/bus/usb/devices/*:*/bInterfaceClass; do
+        [ -r "$uvms_class_file" ] || continue
+        [ "$(cat "$uvms_class_file" 2>/dev/null)" = "08" ] || continue
+        uvms_interface_name=$(basename "$(dirname "$uvms_class_file")")
+        uvms_device_name=${uvms_interface_name%%:*}
+        if ! grep -Fqx "$uvms_device_name" "$uvms_device_file"; then
+            printf '%s\n' "$uvms_device_name" >>"$uvms_device_file"
+        fi
+    done
+
+    while IFS= read -r uvms_device_name; do
+        [ -n "$uvms_device_name" ] || continue
+        USB_MSD_DEVICE_COUNT=$((USB_MSD_DEVICE_COUNT + 1))
+        uvms_device="/sys/bus/usb/devices/$uvms_device_name"
+        uvms_vendor=$(cat "$uvms_device/idVendor" 2>/dev/null || true)
+        uvms_product_id=$(cat "$uvms_device/idProduct" 2>/dev/null || true)
+        uvms_product=$(tr -d '\000' <"$uvms_device/product" 2>/dev/null || true)
+        uvms_driver=""
+        uvms_block_list=""
+
+        for uvms_interface in "$uvms_device":*; do
+            [ -d "$uvms_interface" ] || continue
+            [ "$(cat "$uvms_interface/bInterfaceClass" 2>/dev/null)" = "08" ] || continue
+            uvms_driver=$(platform_device_driver_name "$uvms_interface" 2>/dev/null || true)
+
+            if [ -z "$uvms_driver" ]; then
+                break
+            fi
+
+            uvms_waited=0
+            while [ "$uvms_waited" -le "$uvms_wait_seconds" ]; do
+                uvms_block_list="$({
+                    for uvms_block_path in \
+                        "$uvms_interface"/host*/target*/*/block/* \
+                        "$uvms_interface"/host*/target*/*/*/block/* \
+                        "$uvms_interface"/host*/target*/block/*; do
+                        [ -e "$uvms_block_path" ] || continue
+                        basename "$uvms_block_path"
+                    done
+                } | sort -u)"
+                [ -n "$uvms_block_list" ] && break
+                [ "$uvms_waited" -eq "$uvms_wait_seconds" ] && break
+                sleep 1
+                uvms_waited=$((uvms_waited + 1))
+            done
+            break
+        done
+
+        printf '%s\tid=%s:%s\tproduct=%s\tdriver=%s\tblocks=%s\n' \
+            "$uvms_device_name" \
+            "${uvms_vendor:-unknown}" \
+            "${uvms_product_id:-unknown}" \
+            "${uvms_product:-unknown}" \
+            "${uvms_driver:-unbound}" \
+            "${uvms_block_list:-none}" >>"$uvms_result_dir/usb_msd_runtime.tsv"
+        log_info "[USB-MSD] device=$uvms_device_name id=${uvms_vendor:-unknown}:${uvms_product_id:-unknown} product=${uvms_product:-unknown} driver=${uvms_driver:-unbound} blocks=${uvms_block_list:-none}"
+
+        if [ -z "$uvms_driver" ]; then
+            USB_MSD_FAILURE_COUNT=$((USB_MSD_FAILURE_COUNT + 1))
+            log_warn "USB mass-storage interface is unbound: device=$uvms_device_name"
+            continue
+        fi
+
+        if [ -z "$uvms_block_list" ]; then
+            USB_MSD_FAILURE_COUNT=$((USB_MSD_FAILURE_COUNT + 1))
+            log_warn "USB mass-storage device has no block device after ${uvms_wait_seconds}s: device=$uvms_device_name driver=$uvms_driver"
+            continue
+        fi
+
+        if [ "$uvms_read_verify" -eq 1 ]; then
+            for uvms_block in $uvms_block_list; do
+                if [ ! -b "/dev/$uvms_block" ]; then
+                    USB_MSD_FAILURE_COUNT=$((USB_MSD_FAILURE_COUNT + 1))
+                    log_warn "USB mass-storage block node is missing: /dev/$uvms_block"
+                    continue
+                fi
+
+                log_info "USB mass-storage read validation: device=/dev/$uvms_block bytes=512"
+                if ! dd \
+                    if="/dev/$uvms_block" \
+                    of=/dev/null \
+                    bs=512 \
+                    count=1 >"$uvms_result_dir/read_${uvms_block}.log" 2>&1; then
+                    USB_MSD_FAILURE_COUNT=$((USB_MSD_FAILURE_COUNT + 1))
+                    log_file_with_label "USB-MSD-READ" "$uvms_result_dir/read_${uvms_block}.log"
+                fi
+            done
+        fi
+    done <"$uvms_device_file"
+
+    [ "$USB_MSD_DEVICE_COUNT" -gt 0 ] || return 2
+    [ "$USB_MSD_FAILURE_COUNT" -eq 0 ] || return 1
+    return 0
+}
+
+###############################################################################
+# dt_validate_pmic_glink_ucsi <result-dir>
+# Validates the Qualcomm PMIC GLINK parent, UCSI auxiliary driver, and Type-C
+# runtime exposure only when an enabled PMIC GLINK DT node declares support.
+###############################################################################
+dt_validate_pmic_glink_ucsi() {
+    dtvpgu_result_dir="$1"
+    dtvpgu_nodes_file="$dtvpgu_result_dir/pmic_glink_nodes.log"
+    dtvpgu_parent_count=0
+    dtvpgu_aux_count=0
+    dtvpgu_typec_count=0
+    dtvpgu_role_invalid_count=0
+
+    [ -n "$dtvpgu_result_dir" ] || return 3
+    : >"$dtvpgu_nodes_file"
+
+    log_info "PMIC GLINK/UCSI validation: checking enabled DT parents, auxiliary binding, Type-C ports, and role state"
+
+    if ! dt_list_compatible_nodes \
+        '(^|[[:space:]])qcom,([^[:space:]]+-)?pmic-glink([[:space:]]|$)' \
+        regex >"$dtvpgu_nodes_file"; then
+        test_result_record "SKIP" "Qualcomm PMIC GLINK UCSI capability is not enabled in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvpgu_node; do
+        [ -n "$dtvpgu_node" ] || continue
+        dtvpgu_parent_count=$((dtvpgu_parent_count + 1))
+        dtvpgu_compatible="$(dt_property_text "$dtvpgu_node" compatible 2>/dev/null || true)"
+        log_info "[PMIC-GLINK-DT] node=$dtvpgu_node compatible=${dtvpgu_compatible:-unknown}"
+
+        if dtvpgu_device="$(find_platform_device_for_dt_node "$dtvpgu_node" 2>/dev/null)" &&
+           dtvpgu_driver="$(platform_device_driver_name "$dtvpgu_device" 2>/dev/null)"; then
+            test_result_record "PASS" "PMIC GLINK parent is bound: device=$(basename "$dtvpgu_device") driver=$dtvpgu_driver"
+        else
+            test_result_record "FAIL" "Enabled PMIC GLINK node has no bound runtime platform driver: ${dtvpgu_node##*/}"
+        fi
+    done <"$dtvpgu_nodes_file"
+
+    for dtvpgu_aux in /sys/bus/auxiliary/devices/pmic_glink.ucsi.*; do
+        [ -d "$dtvpgu_aux" ] || continue
+        dtvpgu_aux_count=$((dtvpgu_aux_count + 1))
+        if [ -L "$dtvpgu_aux/driver" ]; then
+            dtvpgu_aux_driver="$(basename "$(readlink -f "$dtvpgu_aux/driver" 2>/dev/null)" 2>/dev/null || true)"
+            log_info "[PMIC-GLINK-UCSI] auxiliary=${dtvpgu_aux##*/} driver=${dtvpgu_aux_driver:-unknown}"
+            case "$dtvpgu_aux_driver" in
+                *pmic_glink_ucsi)
+                    test_result_record "PASS" "PMIC GLINK UCSI auxiliary device is bound: device=${dtvpgu_aux##*/} driver=$dtvpgu_aux_driver"
+                    ;;
+                *)
+                    test_result_record "FAIL" "PMIC GLINK UCSI auxiliary device has unexpected driver: device=${dtvpgu_aux##*/} driver=${dtvpgu_aux_driver:-unknown}"
+                    ;;
+            esac
+        else
+            log_info "[PMIC-GLINK-UCSI] auxiliary=${dtvpgu_aux##*/} driver=unbound"
+            test_result_record "FAIL" "PMIC GLINK UCSI auxiliary device is present but unbound: ${dtvpgu_aux##*/}"
+        fi
+    done
+
+    if [ "$dtvpgu_aux_count" -eq 0 ]; then
+        test_result_record "FAIL" "PMIC GLINK is declared but no UCSI auxiliary device is exposed"
+    elif [ "$dtvpgu_aux_count" -lt "$dtvpgu_parent_count" ]; then
+        test_result_record "FAIL" "Only $dtvpgu_aux_count UCSI auxiliary device(s) are exposed for $dtvpgu_parent_count PMIC GLINK parent(s)"
+    fi
+
+    : >"$dtvpgu_result_dir/typec_ports.log"
+    for dtvpgu_port in /sys/class/typec/port*; do
+        [ -d "$dtvpgu_port" ] || continue
+        case "${dtvpgu_port##*/}" in
+            *-partner*)
+                continue
+                ;;
+        esac
+        dtvpgu_port_path="$(readlink -f "$dtvpgu_port" 2>/dev/null || true)"
+        case "$dtvpgu_port_path" in
+            *pmic_glink.ucsi.*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        dtvpgu_typec_count=$((dtvpgu_typec_count + 1))
+        dtvpgu_power_role="$(cat "$dtvpgu_port/power_role" 2>/dev/null || true)"
+        dtvpgu_data_role="$(cat "$dtvpgu_port/data_role" 2>/dev/null || true)"
+        printf '%s\tpower_role=%s\tdata_role=%s\tpath=%s\n' \
+            "${dtvpgu_port##*/}" \
+            "${dtvpgu_power_role:-unknown}" \
+            "${dtvpgu_data_role:-unknown}" \
+            "${dtvpgu_port_path:-unknown}" >>"$dtvpgu_result_dir/typec_ports.log"
+        log_info "[PMIC-GLINK-UCSI] port=${dtvpgu_port##*/} power_role=${dtvpgu_power_role:-unknown} data_role=${dtvpgu_data_role:-unknown}"
+
+        case "$dtvpgu_power_role" in
+            source|sink|*'[source]'*|*'[sink]'*)
+                ;;
+            *)
+                dtvpgu_role_invalid_count=$((dtvpgu_role_invalid_count + 1))
+                continue
+                ;;
+        esac
+        case "$dtvpgu_data_role" in
+            host|device|*'[host]'*|*'[device]'*)
+                ;;
+            *)
+                dtvpgu_role_invalid_count=$((dtvpgu_role_invalid_count + 1))
+                ;;
+        esac
+    done
+
+    if [ "$dtvpgu_typec_count" -eq 0 ]; then
+        test_result_record "FAIL" "PMIC GLINK UCSI is declared but no UCSI-backed Type-C ports are exposed"
+    elif [ "$dtvpgu_role_invalid_count" -gt 0 ]; then
+        test_result_record "FAIL" "PMIC GLINK UCSI has $dtvpgu_role_invalid_count Type-C port(s) with unreadable or invalid role state"
+    else
+        test_result_record "PASS" "PMIC GLINK UCSI exposes $dtvpgu_typec_count Type-C port(s) with valid power and data roles"
+    fi
+}
+
+###############################################################################
+# dt_validate_thermal_runtime <dt-root> <result-dir>
+# Validates readable and plausible thermal-zone data when thermal zones are
+# declared. Cooling devices are required only when a cooling provider exists.
+###############################################################################
+dt_validate_thermal_runtime() {
+    dtvtr_root="$1"
+    dtvtr_result_dir="$2"
+    dtvtr_zone_file="$dtvtr_result_dir/thermal_zones.log"
+    dtvtr_cooling_file="$dtvtr_result_dir/cooling_devices.log"
+    dtvtr_zone_count=0
+    dtvtr_readable_count=0
+    dtvtr_unreadable_count=0
+    dtvtr_invalid_count=0
+    dtvtr_cooling_count=0
+    dtvtr_cooling_invalid_count=0
+    dtvtr_declared_count=0
+
+    [ -d "$dtvtr_root" ] && [ -n "$dtvtr_result_dir" ] || return 3
+
+    log_info "Thermal validation: checking enabled DT thermal zones, runtime temperatures, and cooling-device state"
+
+    if [ ! -d "$dtvtr_root/thermal-zones" ]; then
+        test_result_record "SKIP" "Runtime device tree does not declare thermal zones"
+        return 0
+    fi
+
+    for dtvtr_declared in "$dtvtr_root/thermal-zones"/*; do
+        [ -d "$dtvtr_declared" ] || continue
+        dt_node_enabled "$dtvtr_declared" || continue
+        dtvtr_declared_count=$((dtvtr_declared_count + 1))
+    done
+
+    if [ "$dtvtr_declared_count" -eq 0 ]; then
+        test_result_record "SKIP" "Runtime device tree has no enabled thermal zones"
+        return 0
+    fi
+
+    : >"$dtvtr_zone_file"
+    for dtvtr_zone in /sys/class/thermal/thermal_zone*; do
+        [ -d "$dtvtr_zone" ] || continue
+        dtvtr_zone_count=$((dtvtr_zone_count + 1))
+        dtvtr_type="$(cat "$dtvtr_zone/type" 2>/dev/null || true)"
+        dtvtr_temp="$(cat "$dtvtr_zone/temp" 2>/dev/null || true)"
+        printf '%s\ttype=%s\ttemp_mC=%s\n' \
+            "${dtvtr_zone##*/}" \
+            "${dtvtr_type:-unknown}" \
+            "${dtvtr_temp:-unreadable}" >>"$dtvtr_zone_file"
+        log_info "[THERMAL] zone=${dtvtr_zone##*/} type=${dtvtr_type:-unknown} temp_mC=${dtvtr_temp:-unreadable}"
+
+        if [ -z "$dtvtr_type" ]; then
+            dtvtr_invalid_count=$((dtvtr_invalid_count + 1))
+            continue
+        fi
+
+        if [ -z "$dtvtr_temp" ]; then
+            dtvtr_unreadable_count=$((dtvtr_unreadable_count + 1))
+            continue
+        fi
+
+        case "$dtvtr_temp" in
+            -*)
+                dtvtr_temp_digits=${dtvtr_temp#-}
+                ;;
+            *)
+                dtvtr_temp_digits=$dtvtr_temp
+                ;;
+        esac
+
+        case "$dtvtr_temp_digits" in
+            ''|*[!0-9]*)
+                dtvtr_invalid_count=$((dtvtr_invalid_count + 1))
+                ;;
+            *)
+                if [ "$dtvtr_temp" -lt -100000 ] || [ "$dtvtr_temp" -gt 250000 ]; then
+                    dtvtr_invalid_count=$((dtvtr_invalid_count + 1))
+                else
+                    dtvtr_readable_count=$((dtvtr_readable_count + 1))
+                fi
+                ;;
+        esac
+    done
+
+    if [ "$dtvtr_zone_count" -eq 0 ]; then
+        test_result_record "FAIL" "Thermal zones are declared but no runtime thermal zones are exposed"
+    elif [ "$dtvtr_invalid_count" -gt 0 ]; then
+        test_result_record "FAIL" "Thermal runtime has $dtvtr_invalid_count malformed or implausible zone(s) out of $dtvtr_zone_count"
+    elif [ "$dtvtr_readable_count" -eq 0 ]; then
+        test_result_record "FAIL" "Thermal zones are exposed but none currently provide a readable temperature"
+    else
+        test_result_record "PASS" "Thermal runtime exposes $dtvtr_readable_count readable zone(s) with plausible temperatures"
+        if [ "$dtvtr_unreadable_count" -gt 0 ]; then
+            test_result_record "SKIP" "$dtvtr_unreadable_count optional or aggregate thermal zone(s) do not currently expose temperature data"
+        fi
+    fi
+
+    : >"$dtvtr_cooling_file"
+    for dtvtr_cooling in /sys/class/thermal/cooling_device*; do
+        [ -d "$dtvtr_cooling" ] || continue
+        dtvtr_cooling_count=$((dtvtr_cooling_count + 1))
+        dtvtr_cooling_type="$(cat "$dtvtr_cooling/type" 2>/dev/null || true)"
+        dtvtr_cooling_state="$(cat "$dtvtr_cooling/cur_state" 2>/dev/null || true)"
+        dtvtr_cooling_max="$(cat "$dtvtr_cooling/max_state" 2>/dev/null || true)"
+        printf '%s\ttype=%s\tstate=%s\tmax_state=%s\n' \
+            "${dtvtr_cooling##*/}" \
+            "${dtvtr_cooling_type:-unknown}" \
+            "${dtvtr_cooling_state:-unknown}" \
+            "${dtvtr_cooling_max:-unknown}" >>"$dtvtr_cooling_file"
+        log_info "[THERMAL] cooling=${dtvtr_cooling##*/} type=${dtvtr_cooling_type:-unknown} state=${dtvtr_cooling_state:-unknown} max_state=${dtvtr_cooling_max:-unknown}"
+
+        dtvtr_cooling_valid=1
+        case "$dtvtr_cooling_state" in
+            ''|*[!0-9]*)
+                dtvtr_cooling_valid=0
+                ;;
+        esac
+        case "$dtvtr_cooling_max" in
+            ''|*[!0-9]*)
+                dtvtr_cooling_valid=0
+                ;;
+        esac
+
+        if [ "$dtvtr_cooling_valid" -eq 0 ] ||
+           [ "$dtvtr_cooling_state" -gt "$dtvtr_cooling_max" ]; then
+            dtvtr_cooling_invalid_count=$((dtvtr_cooling_invalid_count + 1))
+        fi
+    done
+
+    if dt_list_enabled_property_nodes "$dtvtr_root" '#cooling-cells' >/dev/null 2>&1; then
+        if [ "$dtvtr_cooling_count" -gt 0 ]; then
+            if [ "$dtvtr_cooling_invalid_count" -eq 0 ]; then
+                test_result_record "PASS" "Thermal runtime exposes $dtvtr_cooling_count valid cooling device(s)"
+            else
+                test_result_record "FAIL" "Thermal runtime has $dtvtr_cooling_invalid_count malformed cooling device(s) out of $dtvtr_cooling_count"
+            fi
+        else
+            test_result_record "FAIL" "Cooling providers are declared but no runtime cooling devices are exposed"
+        fi
+    else
+        test_result_record "SKIP" "Runtime device tree does not declare a cooling-device provider"
+    fi
+}
+
+###############################################################################
+# dt_capture_power_runtime <result-dir>
+# Retains optional regulator and generic power-domain debugfs summaries. Their
+# absence is not a failure because production images may disable debugfs.
+###############################################################################
+dt_capture_power_runtime() {
+    dtcpr_result_dir="$1"
+    dtcpr_regulator="/sys/kernel/debug/regulator/regulator_summary"
+    dtcpr_genpd="/sys/kernel/debug/pm_genpd/pm_genpd_summary"
+
+    [ -n "$dtcpr_result_dir" ] || return 3
+
+    log_info "Power evidence validation: checking optional regulator and generic power-domain debugfs summaries"
+
+    if [ -r "$dtcpr_regulator" ]; then
+        if cp "$dtcpr_regulator" "$dtcpr_result_dir/regulator_summary.log"; then
+            dtcpr_regulator_lines=$(wc -l <"$dtcpr_result_dir/regulator_summary.log" | tr -d '[:space:]')
+            log_info "[POWER] regulator_summary source=$dtcpr_regulator lines=${dtcpr_regulator_lines:-0} artifact=$dtcpr_result_dir/regulator_summary.log"
+            test_result_record "PASS" "Regulator runtime summary was captured"
+        else
+            test_result_record "FAIL" "Regulator runtime summary is readable but could not be captured"
+        fi
+    else
+        test_result_record "SKIP" "Regulator debugfs summary is not exposed"
+    fi
+
+    if [ -r "$dtcpr_genpd" ]; then
+        if cp "$dtcpr_genpd" "$dtcpr_result_dir/power_domain_summary.log"; then
+            dtcpr_genpd_lines=$(wc -l <"$dtcpr_result_dir/power_domain_summary.log" | tr -d '[:space:]')
+            log_info "[POWER] power_domain_summary source=$dtcpr_genpd lines=${dtcpr_genpd_lines:-0} artifact=$dtcpr_result_dir/power_domain_summary.log"
+            test_result_record "PASS" "Generic power-domain runtime summary was captured"
+        else
+            test_result_record "FAIL" "Generic power-domain summary is readable but could not be captured"
+        fi
+    else
+        test_result_record "SKIP" "Generic power-domain debugfs summary is not exposed"
+    fi
+}
+
+###############################################################################
+# dt_validate_tee_runtime <result-dir>
+# Distinguishes declared OP-TEE from a generic TEE device, which is commonly
+# the Qualcomm TEE flow on platforms without an OP-TEE DT node.
+###############################################################################
+dt_validate_tee_runtime() {
+    dtvtr_result_dir="$1"
+    [ -n "$dtvtr_result_dir" ] || return 3
+
+    if dt_list_compatible_nodes '(^|[[:space:]])linaro,optee-tz([[:space:]]|$)' regex >/dev/null; then
+        dt_validate_node_inventory "OP-TEE" '(^|[[:space:]])linaro,optee-tz([[:space:]]|$)' "$dtvtr_result_dir"
+        dt_validate_runtime_path "OP-TEE device" '/dev/tee*'
+        return 0
+    fi
+
+    for dtvtr_tee in /dev/tee*; do
+        [ -e "$dtvtr_tee" ] || continue
+        test_result_record "PASS" "TEE device runtime evidence is present: $dtvtr_tee"
+        test_result_record "SKIP" "OP-TEE is not declared in the runtime device tree, Qualcomm TEE flow is likely"
+        return 0
+    done
+
+    test_result_record "SKIP" "OP-TEE is not declared and no TEE device runtime evidence is exposed"
+}
+
+###############################################################################
+# dt_validate_node_inventory <label> <compatible-regex> <result-dir>
+# Records enabled matching DT nodes without assuming a platform-device binding.
+###############################################################################
+dt_validate_node_inventory() {
+    dtvni_label="$1"
+    dtvni_regex="$2"
+    dtvni_result_dir="$3"
+    dtvni_node_file="$dtvni_result_dir/${dtvni_label}_nodes.log"
+    dtvni_count=0
+
+    [ -n "$dtvni_label" ] && [ -n "$dtvni_regex" ] && [ -n "$dtvni_result_dir" ] || return 3
+    : >"$dtvni_node_file"
+
+    if ! dt_list_compatible_nodes "$dtvni_regex" regex >"$dtvni_node_file"; then
+        test_result_record "SKIP" "$dtvni_label capability is not enabled in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvni_node_dir; do
+        [ -n "$dtvni_node_dir" ] || continue
+        dtvni_count=$((dtvni_count + 1))
+        dtvni_compatible=$(dt_property_text "$dtvni_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvni_label-DT] node=$dtvni_node_dir compatible=$dtvni_compatible"
+        test_result_record "PASS" "$dtvni_label capability is enabled: ${dtvni_node_dir##*/}"
+
+        if dtvni_device_dir=$(find_platform_device_for_dt_node "$dtvni_node_dir"); then
+            dtvni_device_name=$(basename "$dtvni_device_dir")
+            if dtvni_driver_name=$(platform_device_driver_name "$dtvni_device_dir"); then
+                test_result_record "PASS" "$dtvni_label platform device is bound: device=$dtvni_device_name driver=$dtvni_driver_name"
+            else
+                test_result_record "SKIP" "$dtvni_label platform device is not bound: $dtvni_device_name"
+            fi
+        else
+            test_result_record "SKIP" "$dtvni_label capability has no platform-device representation: ${dtvni_node_dir##*/}"
+        fi
+    done <"$dtvni_node_file"
+
+    log_info "$dtvni_label capability totals: discovered=$dtvni_count"
+}
+
+###############################################################################
+# dt_validate_platform_capability <label> <compatible-regex> <result-dir>
+# Records structural and platform-driver checks for enabled matching controllers.
+###############################################################################
+dt_validate_platform_capability() {
+    dtvpc_label="$1"
+    dtvpc_regex="$2"
+    dtvpc_result_dir="$3"
+    dtvpc_node_file="$dtvpc_result_dir/${dtvpc_label}_nodes.log"
+    dtvpc_count=0
+
+    [ -n "$dtvpc_label" ] && [ -n "$dtvpc_regex" ] && [ -n "$dtvpc_result_dir" ] || return 3
+    : >"$dtvpc_node_file"
+
+    if ! dt_list_compatible_nodes "$dtvpc_regex" regex >"$dtvpc_node_file"; then
+        test_result_record "SKIP" "$dtvpc_label capability is not enabled in the runtime device tree"
+        return 0
+    fi
+
+    while IFS= read -r dtvpc_node_dir; do
+        [ -n "$dtvpc_node_dir" ] || continue
+        dtvpc_count=$((dtvpc_count + 1))
+        dtvpc_compatible=$(dt_property_text "$dtvpc_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[$dtvpc_label-DT] node=$dtvpc_node_dir compatible=$dtvpc_compatible"
+
+        if dt_node_has_property "$dtvpc_node_dir" reg; then
+            test_result_record "PASS" "$dtvpc_label controller exposes reg property: ${dtvpc_node_dir##*/}"
+        else
+            test_result_record "FAIL" "$dtvpc_label controller lacks reg property: ${dtvpc_node_dir##*/}"
+        fi
+
+        if ! dtvpc_device_dir=$(find_platform_device_for_dt_node "$dtvpc_node_dir"); then
+            test_result_record "FAIL" "$dtvpc_label controller has no runtime platform device: ${dtvpc_node_dir##*/}"
+            continue
+        fi
+
+        dtvpc_device_name=$(basename "$dtvpc_device_dir")
+        if dtvpc_driver_name=$(platform_device_driver_name "$dtvpc_device_dir"); then
+            test_result_record "PASS" "$dtvpc_label controller is bound: device=$dtvpc_device_name driver=$dtvpc_driver_name"
+        else
+            test_result_record "FAIL" "$dtvpc_label controller platform device is unbound: $dtvpc_device_name"
+        fi
+    done <"$dtvpc_node_file"
+
+    log_info "$dtvpc_label capability totals: discovered=$dtvpc_count"
+}
+
+###############################################################################
+# dt_validate_remoteproc_inventory <result-dir>
+# Records enabled Qualcomm remoteproc DT nodes and exposed runtime instances.
+###############################################################################
+dt_validate_remoteproc_inventory() {
+    dvri_result_dir="$1"
+    dvri_node_file="$dvri_result_dir/remoteproc_nodes.log"
+    dvri_runtime_file="$dvri_result_dir/remoteproc_runtime.log"
+    dvri_node_count=0
+    dvri_runtime_count=0
+
+    [ -n "$dvri_result_dir" ] || return 3
+    : >"$dvri_node_file"
+    : >"$dvri_runtime_file"
+
+    if ! dt_list_compatible_nodes 'qcom,.*(adsp|cdsp|gpdsp|mpss|wpss|remoteproc)' regex >"$dvri_node_file"; then
+        test_result_record "SKIP" "No enabled Qualcomm remoteproc nodes were discovered"
+        return 0
+    fi
+
+    while IFS= read -r dvri_node_dir; do
+        [ -n "$dvri_node_dir" ] || continue
+        dvri_node_count=$((dvri_node_count + 1))
+        dvri_compatible=$(dt_property_text "$dvri_node_dir" compatible 2>/dev/null || printf '%s\n' unknown)
+        log_info "[REMOTEPROC-DT] node=$dvri_node_dir compatible=$dvri_compatible"
+
+        if dt_node_has_property "$dvri_node_dir" memory-region; then
+            test_result_record "PASS" "Remoteproc node exposes memory-region: ${dvri_node_dir##*/}"
+        else
+            test_result_record "SKIP" "Remoteproc node does not expose an optional memory-region: ${dvri_node_dir##*/}"
+        fi
+
+        dvri_firmware=$(dt_property_text "$dvri_node_dir" firmware-name 2>/dev/null || true)
+        if [ -n "$dvri_firmware" ]; then
+            log_info "[REMOTEPROC-DT] firmware-name=$dvri_firmware"
+            if find_image_firmware "$dvri_firmware" >/dev/null 2>&1; then
+                test_result_record "PASS" "Remoteproc firmware is provisioned: $dvri_firmware"
+            else
+                test_result_record "SKIP" "Remoteproc firmware is not provisioned in the image: $dvri_firmware"
+            fi
+        else
+            test_result_record "SKIP" "Remoteproc node does not expose an optional firmware-name: ${dvri_node_dir##*/}"
+        fi
+    done <"$dvri_node_file"
+
+    if list_remoteproc_instances "$dvri_runtime_file"; then
+        while IFS= read -r dvri_entry; do
+            [ -n "$dvri_entry" ] || continue
+            dvri_runtime_count=$((dvri_runtime_count + 1))
+            log_info "[REMOTEPROC-RUNTIME] $dvri_entry"
+        done <"$dvri_runtime_file"
+        test_result_record "PASS" "Remoteproc runtime inventory is available: dt_nodes=$dvri_node_count runtime_instances=$dvri_runtime_count"
+    else
+        test_result_record "SKIP" "Remoteproc DT nodes are present but no runtime remoteproc instance is exposed"
+    fi
+}
+
+###############################################################################
+# dt_validate_runtime_hardware_capabilities <dt-root> <result-dir>
+# Records baseline DT, controller binding, remoteproc, and kernel-health checks.
+###############################################################################
+dt_validate_runtime_hardware_capabilities() {
+    dtrhc_root="$1"
+    dtrhc_result_dir="$2"
+    dtrhc_compatible=""
+    dtrhc_model=""
+    dtrhc_profile_id=""
+    dtrhc_stdout_path=""
+    dtrhc_stdout_target=""
+    dtrhc_bootargs=""
+    dtrhc_dt_cpu_count=0
+    dtrhc_kernel_cpu_count=0
+    dtrhc_memory_file="$dtrhc_result_dir/memory_nodes.log"
+    dtrhc_reserved_file="$dtrhc_result_dir/reserved_memory_nodes.log"
+
+    [ -d "$dtrhc_root" ] && [ -n "$dtrhc_result_dir" ] || return 3
+    mkdir -p "$dtrhc_result_dir" || return 1
+    : >"$dtrhc_result_dir/dt_area_summary.tsv"
+    dt_build_runtime_indexes "$dtrhc_root" "$dtrhc_result_dir" || return 1
+
+    dtrhc_compatible=$(dt_property_text "$dtrhc_root" compatible 2>/dev/null || true)
+    dtrhc_model=$(dt_property_text "$dtrhc_root" model 2>/dev/null || true)
+    log_info "Runtime device-tree root: $dtrhc_root"
+
+    if dt_hw_capability_area_enabled "health"; then
+        scan_dmesg_errors \
+            "$dtrhc_result_dir" \
+            'of|device.tree|devicetree|qcom.*(smmu|pcie|ufs|sdhci|dwc3|usb|ethqos|dpu|mdss)|pmic.gl|ucsi|thermal|tsens|rpmh|regulator|power.domain' \
+            '-517|EPROBE_DEFER|deferred probe|dummy regulator|supply [^ ]+ not found' || true
+        log_info "Captured DT and controller kernel-health snapshot"
+    fi
+
+    if dt_hw_capability_area_enabled "identity"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Identity"
+    if [ -z "$dtrhc_compatible" ]; then
+        test_result_record "FAIL" "Runtime device tree does not expose a readable compatible property"
+    else
+        log_info "Runtime device-tree compatible: $dtrhc_compatible"
+        test_result_record "PASS" "Runtime device tree exposes compatible identity"
+        dtrhc_profile_id=$(dt_profile_id "$dtrhc_root" 2>/dev/null || true)
+        if [ -n "$dtrhc_profile_id" ]; then
+            log_info "Selected runtime DT profile: $dtrhc_profile_id"
+            test_result_record "PASS" "Runtime device-tree profile was selected from the first compatible string"
+        else
+            test_result_record "SKIP" "Runtime device-tree profile could not be derived from compatible"
+        fi
+        case "$dtrhc_compatible" in
+            *qcom,*|*qcom.*)
+                test_result_record "PASS" "Runtime device tree identifies a Qualcomm platform"
+                ;;
+            *)
+                test_result_record "SKIP" "Runtime device tree has no Qualcomm compatible string"
+                ;;
+        esac
+    fi
+
+    if dt_node_has_property "$dtrhc_root" '#address-cells' &&
+       dt_node_has_property "$dtrhc_root" '#size-cells'; then
+        test_result_record "PASS" "Runtime device tree exposes root address and size cell properties"
+    else
+        test_result_record "FAIL" "Runtime device tree lacks root address or size cell properties"
+    fi
+
+    if [ -n "$dtrhc_model" ]; then
+        log_info "Runtime device-tree model: $dtrhc_model"
+        test_result_record "PASS" "Runtime device tree exposes model information"
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose an optional model property"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "boot"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Boot handoff"
+    if [ -d "$dtrhc_root/chosen" ]; then
+        dtrhc_stdout_path=$(dt_property_text "$dtrhc_root/chosen" stdout-path 2>/dev/null || true)
+        dtrhc_bootargs=$(dt_property_text "$dtrhc_root/chosen" bootargs 2>/dev/null || true)
+        if [ -n "$dtrhc_stdout_path" ] || [ -n "$dtrhc_bootargs" ]; then
+            log_info "Chosen node: stdout-path=${dtrhc_stdout_path:-unset} bootargs=${dtrhc_bootargs:-unset}"
+            test_result_record "PASS" "Runtime device tree exposes chosen boot handoff data"
+
+            if [ -n "$dtrhc_stdout_path" ]; then
+                dtrhc_stdout_target=${dtrhc_stdout_path%%:*}
+                case "$dtrhc_stdout_target" in
+                    /*)
+                        dtrhc_stdout_target="$dtrhc_root$dtrhc_stdout_target"
+                        ;;
+                    *)
+                        if [ -r "$dtrhc_root/aliases/$dtrhc_stdout_target" ]; then
+                            dtrhc_stdout_target=$(tr -d '\000' <"$dtrhc_root/aliases/$dtrhc_stdout_target" 2>/dev/null)
+                            dtrhc_stdout_target="$dtrhc_root$dtrhc_stdout_target"
+                        else
+                            dtrhc_stdout_target=""
+                        fi
+                        ;;
+                esac
+
+                if [ -n "$dtrhc_stdout_target" ] && [ -d "$dtrhc_stdout_target" ]; then
+                    test_result_record "PASS" "Chosen stdout-path resolves to a runtime DT node"
+                else
+                    test_result_record "FAIL" "Chosen stdout-path does not resolve to a runtime DT node"
+                fi
+            fi
+        else
+            test_result_record "SKIP" "Chosen node has no stdout-path or bootargs property"
+        fi
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose an optional chosen node"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "cpu-memory"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "CPU and memory"
+    dtrhc_dt_cpu_count=$(dt_count_enabled_cpu_nodes "$dtrhc_root" || true)
+    dtrhc_kernel_cpu_count=$(dt_count_kernel_cpu_nodes)
+    if [ "${dtrhc_dt_cpu_count:-0}" -le 0 ] 2>/dev/null; then
+        test_result_record "FAIL" "Runtime device tree exposes no enabled CPU nodes"
+    elif [ "${dtrhc_kernel_cpu_count:-0}" -le 0 ] 2>/dev/null; then
+        test_result_record "FAIL" "Running kernel exposes no CPU directories"
+    else
+        log_info "CPU topology: dt_enabled=$dtrhc_dt_cpu_count kernel_exposed=$dtrhc_kernel_cpu_count"
+        if [ "$dtrhc_dt_cpu_count" -lt "$dtrhc_kernel_cpu_count" ]; then
+            test_result_record "FAIL" "Kernel exposes more CPUs than the runtime device tree describes"
+        else
+            test_result_record "PASS" "Runtime device-tree CPU topology covers all kernel CPUs"
+        fi
+    fi
+
+    : >"$dtrhc_memory_file"
+    if dt_list_enabled_memory_nodes "$dtrhc_root" >"$dtrhc_memory_file"; then
+        while IFS= read -r dtrhc_memory_node; do
+            [ -n "$dtrhc_memory_node" ] || continue
+            if dt_node_has_property "$dtrhc_memory_node" reg; then
+                test_result_record "PASS" "Memory node exposes reg property: ${dtrhc_memory_node##*/}"
+            else
+                test_result_record "FAIL" "Memory node lacks reg property: ${dtrhc_memory_node##*/}"
+            fi
+        done <"$dtrhc_memory_file"
+    else
+        test_result_record "FAIL" "Runtime device tree exposes no enabled memory node"
+    fi
+
+    : >"$dtrhc_reserved_file"
+    if dt_list_enabled_reserved_memory_nodes "$dtrhc_root" >"$dtrhc_reserved_file"; then
+        while IFS= read -r dtrhc_reserved_node; do
+            [ -n "$dtrhc_reserved_node" ] || continue
+            if dt_node_has_property "$dtrhc_reserved_node" reg ||
+               dt_node_has_property "$dtrhc_reserved_node" size; then
+                test_result_record "PASS" "Reserved-memory node has size or reg data: ${dtrhc_reserved_node##*/}"
+            else
+                test_result_record "FAIL" "Reserved-memory node lacks size and reg data: ${dtrhc_reserved_node##*/}"
+            fi
+        done <"$dtrhc_reserved_file"
+    elif [ -d "$dtrhc_root/reserved-memory" ]; then
+        test_result_record "SKIP" "Reserved-memory root has no enabled child nodes"
+    else
+        test_result_record "SKIP" "Runtime device tree does not expose optional reserved-memory nodes"
+    fi
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "interrupts"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Interrupts"
+    dt_validate_property_provider "$dtrhc_root" "NUMA" "numa-node-id" "$dtrhc_result_dir"
+
+    if [ -r /proc/interrupts ]; then
+        test_result_record "PASS" "Kernel interrupt table is readable"
+    else
+        test_result_record "FAIL" "Kernel interrupt table is not readable"
+    fi
+
+    dt_validate_property_provider "$dtrhc_root" "Interrupt controller" "interrupt-controller" "$dtrhc_result_dir"
+    dt_validate_node_inventory "GIC" 'arm,.*gic' "$dtrhc_result_dir"
+    dt_validate_node_inventory "PDC" 'qcom,.*pdc' "$dtrhc_result_dir"
+    dt_validate_platform_capability "GPIO" 'qcom,.*(gpio|tlmm)' "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "fabric"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Core SoC fabric"
+    dt_validate_property_provider "$dtrhc_root" "Clock" "#clock-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Reset" "#reset-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Regulator" "regulator-name" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Power domain" "#power-domain-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Mailbox" "#mbox-cells" "$dtrhc_result_dir"
+    dt_validate_property_provider "$dtrhc_root" "Interconnect" "#interconnect-cells" "$dtrhc_result_dir"
+    dt_validate_node_inventory "RPMh" 'qcom,.*rpmh' "$dtrhc_result_dir"
+    dt_validate_platform_capability "LLCC" 'qcom,.*llcc' "$dtrhc_result_dir"
+    dt_validate_platform_capability "SMMU" 'qcom,.*smmu-500' "$dtrhc_result_dir"
+    dt_capture_power_runtime "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "usb"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "USB"
+    dt_validate_platform_capability "USB" 'qcom,.*(dwc3|usb)' "$dtrhc_result_dir"
+    dt_validate_usb_host_runtime
+    dt_validate_pmic_glink_ucsi "$dtrhc_result_dir"
+    dt_validate_runtime_path "USB gadget controller" '/sys/class/udc/*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "pcie"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "PCIe"
+    dt_validate_platform_capability "PCIe" 'qcom,.*pcie' "$dtrhc_result_dir"
+    dt_validate_runtime_path "PCIe endpoint" '/sys/bus/pci/devices/*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "storage"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Storage"
+    dt_validate_platform_capability "Storage" 'qcom,.*(ufs|sdhci|spi)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "SPI NOR" 'jedec,spi-nor' "$dtrhc_result_dir"
+    dt_validate_runtime_path "NVMe controller" '/sys/class/nvme/nvme*'
+    dt_validate_runtime_path "MTD storage" '/sys/class/mtd/mtd*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "network"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Networking"
+    dt_validate_platform_capability "Ethernet" 'qcom,.*(ethqos|emac)' "$dtrhc_result_dir"
+    dt_validate_network_runtime "Network interface"
+    dt_validate_node_inventory "WiFi" 'qcom,.*(wlan|wifi)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Bluetooth" 'qcom,.*(bluetooth|wcn.*-bt)' "$dtrhc_result_dir"
+    dt_validate_runtime_path "Bluetooth HCI" '/sys/class/bluetooth/hci*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "multimedia"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Display and multimedia"
+    dt_validate_platform_capability "Display" 'qcom,.*(dpu|mdss)' "$dtrhc_result_dir"
+    dt_validate_platform_capability "GPU" 'qcom,.*(adreno|gpu)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Audio" 'qcom,.*(audio|lpass)' "$dtrhc_result_dir"
+    dt_validate_node_inventory "Camera" 'qcom,.*(camss|camera)' "$dtrhc_result_dir"
+    dt_validate_runtime_path "DRM device" '/sys/class/drm/card*'
+    dt_validate_runtime_path "ALSA card" '/sys/class/sound/card*'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "remoteproc"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Remote processors"
+    dt_validate_remoteproc_inventory "$dtrhc_result_dir"
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "security"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Security and virtualization"
+    dt_validate_tee_runtime "$dtrhc_result_dir"
+    dt_validate_node_inventory "SCM" 'qcom,.*scm' "$dtrhc_result_dir"
+    dt_validate_node_inventory "TPM" '.*tpm' "$dtrhc_result_dir"
+    dt_validate_runtime_path "TPM device" '/dev/tpm*'
+    dt_validate_node_inventory "KVM EL2" 'qcom,.*el2' "$dtrhc_result_dir"
+    dt_validate_runtime_path "KVM device" '/dev/kvm'
+        dt_summary_end_area
+    fi
+
+    if dt_hw_capability_area_enabled "health"; then
+        dt_summary_begin_area "$dtrhc_result_dir" "Kernel health"
+    dt_validate_thermal_runtime "$dtrhc_root" "$dtrhc_result_dir"
+    if [ -s "$dtrhc_result_dir/dmesg_errors.log" ]; then
+        test_result_record "FAIL" "Relevant DT or hardware-controller errors were found in the captured kernel log"
+    else
+        test_result_record "PASS" "No relevant DT or hardware-controller errors were found in the captured kernel log"
+    fi
+        dt_summary_end_area
+    fi
+
+    dt_summary_print "$dtrhc_result_dir"
+
+    return 0
+}
+
+###############################################################################
 # list_remoteproc_instances [outfile]
 # Prints or appends '<path>|<name>|<firmware>|<state>' for every runtime
 # remoteproc. Returns 0 if one or more instances exist, otherwise 1.
@@ -3754,15 +6313,29 @@ list_remoteproc_instances() {
 
 ###############################################################################
 # find_image_firmware <firmware-name>
-# Prints the first matching image-provided firmware path under the standard
-# firmware roots, accepting uncompressed, .xz, and .zst files. Returns 0 on a
-# match, 1 when no asset is exposed, and 3 when no name is supplied.
+# Prints the first matching image-provided firmware path under the standard or
+# running-kernel firmware roots, accepting uncompressed, .xz, and .zst files.
+# Returns 0 on a match, 1 when no asset is exposed, and 3 when no name is
+# supplied.
 ###############################################################################
 find_image_firmware() {
     firmware_name="$1"
+    firmware_release=$(uname -r 2>/dev/null || true)
     [ -n "$firmware_name" ] || return 3
 
-    for firmware_root in /lib/firmware /usr/lib/firmware; do
+    for firmware_root in \
+        "/lib/firmware/$firmware_release" \
+        "/usr/lib/firmware/$firmware_release" \
+        /lib/firmware \
+        /usr/lib/firmware; do
+        [ -n "$firmware_release" ] || {
+            case "$firmware_root" in
+                /lib/firmware/|/usr/lib/firmware/)
+                    continue
+                    ;;
+            esac
+        }
+        [ -d "$firmware_root" ] || continue
         for firmware_path in \
             "$firmware_root/$firmware_name" \
             "$firmware_root/$firmware_name.xz" \
@@ -4398,6 +6971,20 @@ systemd_service_exists() {
     systemctl cat "$svc" >/dev/null 2>&1
 }
 
+# Print the first existing systemd service/unit from the supplied candidates.
+systemd_service_first_existing() {
+    for svc in "$@"; do
+        [ -n "$svc" ] || continue
+
+        if systemd_service_exists "$svc"; then
+            printf '%s\n' "$svc"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Check whether a systemd service/unit is currently active.
 systemd_service_is_active() {
     svc="$1"
@@ -4730,14 +7317,16 @@ detect_ufs_partition_block() {
     return 1
 }
 
-###############################################################################
-# scan_dmesg_errors
-#
-# Only scans *new* dmesg lines for true error patterns (since last test run).
-# Keeps a timestamped error log history for each run.
-# Handles dmesg with/without timestamps. Cleans up markers/logs if test dir is gone.
-# Usage: scan_dmesg_errors "$SCRIPT_DIR" [optional_extra_keywords...]
-###############################################################################
+# scan_dmesg_errors OUTPUT_DIR MODULE_REGEX [EXCLUDE_REGEX]
+# Capture the kernel log once and report non-benign errors for selected modules.
+# Inputs: retained output directory, extended module regex, and optional exclusion
+# regex. Set KERNEL_LOG_JOURNAL_FALLBACK=1 to permit journalctl fallback.
+# Outputs: retained snapshot, filtered errors, access diagnostics, timestamped
+# history, and exported DMESG_ACCESS_STATUS, DMESG_ACCESS_RC,
+# DMESG_ACCESS_PROVIDER, and DMESG_ACCESS_LOG values.
+# Returns: 0 when matching errors are found and 1 for a clean or unavailable
+# capture. Callers must inspect DMESG_ACCESS_STATUS to distinguish those cases.
+# Side effects: replaces kernel-log artifacts below OUTPUT_DIR and emits logs.
 scan_dmesg_errors() {
     prefix="$1"
     module_regex="$2"   # e.g. 'qcom_camss|camss|isp'
@@ -4748,14 +7337,117 @@ scan_dmesg_errors() {
 
     DMESG_SNAPSHOT="$prefix/dmesg_snapshot.log"
     DMESG_ERRORS="$prefix/dmesg_errors.log"
+    DMESG_ACCESS_LOG="$prefix/dmesg_access.log"
+    DMESG_JOURNAL_RAW="$prefix/journalctl_kernel.log"
     DATE_STAMP=$(date +%Y%m%d-%H%M%S)
     DMESG_HISTORY="$prefix/dmesg_errors_$DATE_STAMP.log"
 
     # Error patterns (edit as needed for your test coverage)
     err_patterns='Unknown symbol|probe failed|fail(ed)?|error|timed out|not found|invalid|corrupt|abort|panic|oops|unhandled|can.t (start|init|open|allocate|find|register)'
 
-    rm -f "$DMESG_SNAPSHOT" "$DMESG_ERRORS"
-    dmesg > "$DMESG_SNAPSHOT" 2>/dev/null
+    DMESG_ACCESS_STATUS="unknown"
+    DMESG_ACCESS_RC="unknown"
+    DMESG_ACCESS_PROVIDER="none"
+    export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+    export DMESG_ACCESS_LOG
+
+    rm -f \
+        "$DMESG_SNAPSHOT" \
+        "$DMESG_ERRORS" \
+        "$DMESG_ACCESS_LOG" \
+        "$DMESG_JOURNAL_RAW"
+    : >"$DMESG_SNAPSHOT"
+    : >"$DMESG_ERRORS"
+    : >"$DMESG_ACCESS_LOG"
+
+    sde_dmesg_command=$(command -v dmesg 2>/dev/null || true)
+    if [ -n "$sde_dmesg_command" ]; then
+        "$sde_dmesg_command" >"$DMESG_SNAPSHOT" 2>"$DMESG_ACCESS_LOG"
+        DMESG_ACCESS_RC=$?
+        DMESG_ACCESS_PROVIDER="dmesg"
+    else
+        DMESG_ACCESS_RC=127
+        DMESG_ACCESS_PROVIDER="dmesg"
+        printf 'provider=dmesg status=command-not-found rc=127\n' \
+            >>"$DMESG_ACCESS_LOG"
+    fi
+
+    sde_snapshot_bytes=$(wc -c <"$DMESG_SNAPSHOT" 2>/dev/null | tr -d '[:space:]')
+    {
+        printf 'capture=direct rc=%s command=%s snapshot_bytes=%s uid=%s\n' \
+            "$DMESG_ACCESS_RC" \
+            "${sde_dmesg_command:-not-found}" \
+            "${sde_snapshot_bytes:-0}" \
+            "$(id -u 2>/dev/null || printf 'unknown')"
+        if [ -r /proc/sys/kernel/dmesg_restrict ]; then
+            printf 'dmesg_restrict=%s\n' \
+                "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)"
+        fi
+        if [ -r /proc/self/status ]; then
+            grep '^CapEff:' /proc/self/status 2>/dev/null || true
+        fi
+    } >>"$DMESG_ACCESS_LOG"
+
+    # A few target images have returned success with no redirected output even
+    # though an interactive dmesg invocation is readable. Retry through command
+    # substitution so the shell, rather than dmesg, writes the retained file.
+    if [ "$DMESG_ACCESS_RC" -eq 0 ] && [ ! -s "$DMESG_SNAPSHOT" ]; then
+        sde_retry_output=$("$sde_dmesg_command" 2>>"$DMESG_ACCESS_LOG")
+        sde_retry_rc=$?
+        if [ "$sde_retry_rc" -eq 0 ] && [ -n "$sde_retry_output" ]; then
+            printf '%s\n' "$sde_retry_output" >"$DMESG_SNAPSHOT"
+        fi
+        sde_retry_bytes=$(wc -c <"$DMESG_SNAPSHOT" 2>/dev/null | tr -d '[:space:]')
+        printf 'capture=shell-buffer-retry rc=%s snapshot_bytes=%s\n' \
+            "$sde_retry_rc" \
+            "${sde_retry_bytes:-0}" >>"$DMESG_ACCESS_LOG"
+        DMESG_ACCESS_RC=$sde_retry_rc
+    fi
+
+    if [ "$DMESG_ACCESS_RC" -ne 0 ] || [ ! -s "$DMESG_SNAPSHOT" ]; then
+        : >"$DMESG_SNAPSHOT"
+        if [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ] &&
+           command -v journalctl >/dev/null 2>&1; then
+            sde_journal_command=$(command -v journalctl 2>/dev/null || true)
+            journalctl -k -b --no-pager -o cat \
+                >"$DMESG_JOURNAL_RAW" 2>>"$DMESG_ACCESS_LOG"
+            sde_journal_rc=$?
+            sde_journal_bytes=$(wc -c <"$DMESG_JOURNAL_RAW" 2>/dev/null | tr -d '[:space:]')
+            printf 'provider=journalctl rc=%s snapshot_bytes=%s command=%s\n' \
+                "$sde_journal_rc" \
+                "${sde_journal_bytes:-0}" \
+                "${sde_journal_command:-not-found}" >>"$DMESG_ACCESS_LOG"
+            DMESG_ACCESS_RC=$sde_journal_rc
+            DMESG_ACCESS_PROVIDER="journalctl"
+            if [ "$sde_journal_rc" -eq 0 ] && [ -s "$DMESG_JOURNAL_RAW" ]; then
+                sed 's/^/[journal] /' \
+                    "$DMESG_JOURNAL_RAW" >"$DMESG_SNAPSHOT"
+                DMESG_ACCESS_RC=0
+            fi
+        elif [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ]; then
+            DMESG_ACCESS_RC=127
+            DMESG_ACCESS_PROVIDER="journalctl"
+            printf 'provider=journalctl status=command-not-found rc=127\n' \
+                >>"$DMESG_ACCESS_LOG"
+        else
+            printf 'provider=journalctl status=disabled\n' \
+                >>"$DMESG_ACCESS_LOG"
+        fi
+    fi
+
+    if [ ! -s "$DMESG_SNAPSHOT" ]; then
+        DMESG_ACCESS_STATUS="unavailable"
+        export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+        cp "$DMESG_ERRORS" "$DMESG_HISTORY"
+        log_warn "[DMESG-ACCESS] status=$DMESG_ACCESS_STATUS provider=$DMESG_ACCESS_PROVIDER rc=$DMESG_ACCESS_RC snapshot_bytes=0 artifact=$DMESG_ACCESS_LOG"
+        log_file_with_label "DMESG-ACCESS" "$DMESG_ACCESS_LOG" 12
+        return 1
+    fi
+    DMESG_ACCESS_STATUS="available"
+    export DMESG_ACCESS_STATUS DMESG_ACCESS_RC DMESG_ACCESS_PROVIDER
+    if [ "${KERNEL_LOG_JOURNAL_FALLBACK:-0}" = "1" ]; then
+        log_info "[DMESG-ACCESS] status=$DMESG_ACCESS_STATUS provider=$DMESG_ACCESS_PROVIDER snapshot_bytes=$(wc -c <"$DMESG_SNAPSHOT" | tr -d '[:space:]') artifact=$DMESG_ACCESS_LOG"
+    fi
 
     # 1. Match lines with correct module and error pattern
     # 2. Exclude lines with harmless patterns (using dummy regulator etc)
@@ -4765,13 +7457,21 @@ scan_dmesg_errors() {
     cp "$DMESG_ERRORS" "$DMESG_HISTORY"
 
     if [ -s "$DMESG_ERRORS" ]; then
-        log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        if [ "$DMESG_ACCESS_PROVIDER" = "dmesg" ]; then
+            log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        else
+            log_info "Kernel-log scan found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        fi
         while IFS= read -r line; do
             log_info "[dmesg] $line"
         done < "$DMESG_ERRORS"
         return 0
     fi
-    log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
+    if [ "$DMESG_ACCESS_PROVIDER" = "dmesg" ]; then
+        log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
+    else
+        log_info "No relevant, non-benign errors for modules [$module_regex] in the captured kernel log."
+    fi
     return 1
 }
 
@@ -4990,6 +7690,112 @@ minkipc_prepare_test_packages() {
 
     log_pass "MinkIPC package set is ready on os=$mptp_os_id"
     return 0
+}
+
+# qrtr_runtime_present
+# Reports whether the running kernel exposes QRTR transport evidence. Installed
+# tools or modules that are not loaded are not treated as hardware evidence.
+qrtr_runtime_present() {
+    if [ -d /sys/bus/qrtr ] || [ -r /proc/net/qrtr ] || [ -d /sys/module/qrtr ]; then
+        return 0
+    fi
+
+    if is_module_loaded qrtr; then
+        return 0
+    fi
+
+    return 1
+}
+
+# qrtr_capture_topology <output-file> [timeout-seconds]
+# Runs one bounded, read-only QRTR control lookup and validates its tabular
+# header. The image-provided qrtr-lookup is preferred, with the bundled public
+# AF_QIPCRTR client as a fallback. Returns 0 for a valid snapshot, 1 for a
+# broken query, 2 when QRTR or both providers are unavailable, and 3 for
+# invalid arguments.
+qrtr_capture_topology() {
+    qct_output_file="$1"
+    qct_timeout="${2:-${QRTR_LOOKUP_TIMEOUT:-10}}"
+    qct_lookup_bin="${QRTR_LOOKUP_BIN:-qrtr-lookup}"
+    qct_fallback_bin="${QRTR_LOOKUP_FALLBACK_BIN:-$TOOLS/qrtr_lookup.py}"
+    QRTR_LOOKUP_PROVIDER="none"
+    QRTR_LOOKUP_COMMAND=""
+
+    [ -n "$qct_output_file" ] || return 3
+    case "$qct_timeout" in
+        ''|*[!0-9]*|0)
+            return 3
+            ;;
+    esac
+
+    qrtr_runtime_present || return 2
+    if command -v "$qct_lookup_bin" >/dev/null 2>&1; then
+        QRTR_LOOKUP_PROVIDER="native-qrtr-lookup"
+        QRTR_LOOKUP_COMMAND=$(command -v "$qct_lookup_bin")
+    elif command -v python3 >/dev/null 2>&1 && [ -r "$qct_fallback_bin" ]; then
+        QRTR_LOOKUP_PROVIDER="bundled-python-af-qipcrtr"
+        QRTR_LOOKUP_COMMAND="$qct_fallback_bin"
+    else
+        export QRTR_LOOKUP_PROVIDER QRTR_LOOKUP_COMMAND
+        return 2
+    fi
+    export QRTR_LOOKUP_PROVIDER QRTR_LOOKUP_COMMAND
+
+    qct_output_dir=$(dirname "$qct_output_file")
+    mkdir -p "$qct_output_dir" || return 1
+    rm -f "$qct_output_file"
+
+    if [ "$QRTR_LOOKUP_PROVIDER" = "native-qrtr-lookup" ]; then
+        if ! run_with_timeout_log \
+            "$qct_timeout" \
+            "$qct_output_file" \
+            "$QRTR_LOOKUP_COMMAND"; then
+            return 1
+        fi
+    else
+        if ! run_with_timeout_log \
+            "$((qct_timeout + 2))" \
+            "$qct_output_file" \
+            python3 "$QRTR_LOOKUP_COMMAND" --timeout "$qct_timeout"; then
+            return 1
+        fi
+    fi
+
+    if ! awk '
+        NR == 1 && $1 == "Service" && $2 == "Version" &&
+            $3 == "Instance" && $4 == "Node" && $5 == "Port" {
+            valid=1
+        }
+        END { exit !valid }
+    ' "$qct_output_file"; then
+        return 1
+    fi
+
+    return 0
+}
+
+# qrtr_topology_has_service <topology-file> <service> [version] [instance]
+# Matches a qrtr-lookup row. Empty version or instance arguments act as
+# wildcards, allowing each consumer to enforce only its documented contract.
+qrtr_topology_has_service() {
+    qths_file="$1"
+    qths_service="$2"
+    qths_version="${3:-}"
+    qths_instance="${4:-}"
+
+    [ -r "$qths_file" ] && [ -n "$qths_service" ] || return 3
+
+    awk \
+        -v service="$qths_service" \
+        -v version="$qths_version" \
+        -v instance="$qths_instance" '
+        NR > 1 && $1 == service &&
+            (version == "" || $2 == version) &&
+            (instance == "" || $3 == instance) {
+            found=1
+        }
+        END { exit !found }
+    ' "$qths_file"
 }
 
 ###############################################################################
@@ -5880,6 +8686,8 @@ log_soc_info() {
 #   PLATFORM_SOC_MACHINE, PLATFORM_SOC_ID, PLATFORM_SOC_FAMILY
 #   PLATFORM_DT_MODEL, PLATFORM_DT_COMPAT
 #   PLATFORM_OS_LIKE, PLATFORM_OS_NAME
+#   PLATFORM_OS_ID (lowercased /etc/os-release ID, e.g. ubuntu/debian/poky)
+#   PLATFORM_OS_FAMILY (normalized: ubuntu | debian | yocto | unknown)
 #   PLATFORM_TARGET, PLATFORM_MACHINE
 ###############################################################################
 detect_platform() {
@@ -5926,9 +8734,16 @@ detect_platform() {
     fi
  
     # --- OS (parse, do not source /etc/os-release) ---
+    PLATFORM_OS_ID=""
     PLATFORM_OS_LIKE=""
     PLATFORM_OS_NAME=""
+    PLATFORM_OS_FAMILY="unknown"
+    _os_cpe_name=""
     if [ -r /etc/os-release ]; then
+        PLATFORM_OS_ID="$(
+            awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null |
+                tr '[:upper:]' '[:lower:]'
+        )"
         PLATFORM_OS_LIKE="$(
             awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null
         )"
@@ -5940,7 +8755,52 @@ detect_platform() {
         PLATFORM_OS_NAME="$(
             awk -F= '$1=="PRETTY_NAME"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null
         )"
+        _os_cpe_name="$(
+            awk -F= '$1=="CPE_NAME"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null |
+                tr '[:upper:]' '[:lower:]'
+        )"
     fi
+
+    _os_like_lc="$(printf '%s' "$PLATFORM_OS_LIKE" | tr '[:upper:]' '[:lower:]')"
+    case "$PLATFORM_OS_ID" in
+        ubuntu)
+            PLATFORM_OS_FAMILY="ubuntu"
+            ;;
+        debian)
+            PLATFORM_OS_FAMILY="debian"
+            ;;
+        poky)
+            PLATFORM_OS_FAMILY="yocto"
+            ;;
+        *)
+            case "$_os_like_lc" in
+                *ubuntu*)
+                    # Ubuntu derivatives commonly report ID_LIKE="ubuntu debian"
+                    # (both tokens present). Check for the Ubuntu token before
+                    # the Debian fallback below so these are classified as
+                    # ubuntu, not debian, keeping Ubuntu-compatible package
+                    # policy accurate.
+                    PLATFORM_OS_FAMILY="ubuntu"
+                    ;;
+                *debian*)
+                    # Debian derivatives other than Ubuntu (e.g. Raspbian, Devuan).
+                    PLATFORM_OS_FAMILY="debian"
+                    ;;
+                *poky*)
+                    PLATFORM_OS_FAMILY="yocto"
+                    ;;
+                *)
+                    case "$_os_cpe_name" in
+                        *openembedded*)
+                            # Covers qcom-distro and other Yocto/OpenEmbedded
+                            # builds that set neither ID=poky nor ID_LIKE.
+                            PLATFORM_OS_FAMILY="yocto"
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
  
     # --- Target guess (mutually-exclusive; generic names only) ---
     lc_compat="$(printf '%s %s' "$PLATFORM_DT_MODEL" "$PLATFORM_DT_COMPAT" \
@@ -5988,6 +8848,7 @@ detect_platform() {
       PLATFORM_KERNEL PLATFORM_ARCH PLATFORM_UNAME_S PLATFORM_HOSTNAME \
       PLATFORM_SOC_MACHINE PLATFORM_SOC_ID PLATFORM_SOC_FAMILY \
       PLATFORM_DT_MODEL PLATFORM_DT_COMPAT PLATFORM_OS_LIKE PLATFORM_OS_NAME \
+      PLATFORM_OS_ID PLATFORM_OS_FAMILY \
       PLATFORM_TARGET PLATFORM_MACHINE
  
     return 0
@@ -6286,14 +9147,36 @@ net_log_iface_snapshot() {
 # ---- Bring the system online if possible (0 OK, 2 IP/no-internet, 1 no IP) ----
 ensure_network_online() {
     check_network_status_rc; net_rc=$?
-    if [ "$net_rc" -eq 0 ]; then
-        ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-        unset net_rc
-        return 0
-    fi
+    case "$net_rc" in
+        0)
+            ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+            unset net_rc
+            return 0
+            ;;
+        2)
+            log_info "[NET] A valid IP address is already assigned, preserving the existing network configuration"
+            log_info "[NET] The generic reachability probe was inconclusive, endpoint-specific validation will continue"
+            ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+            unset net_rc
+            return 2
+            ;;
+    esac
 
-    if command -v systemctl >/dev/null 2>&1 && command -v check_systemd_services >/dev/null 2>&1; then
-        check_systemd_services NetworkManager systemd-networkd connman || true
+    net_nmcli_available=0
+    if command -v nmcli >/dev/null 2>&1 &&
+       nmcli general status >/dev/null 2>&1; then
+        net_nmcli_available=1
+        log_info "[NET] NetworkManager is available through nmcli"
+    elif command -v systemd_service_is_active >/dev/null 2>&1; then
+        if systemd_service_is_active NetworkManager; then
+            log_info "[NET] NetworkManager service is active"
+        elif systemd_service_is_active systemd-networkd; then
+            log_info "[NET] systemd-networkd service is active"
+        elif systemd_service_is_active connman; then
+            log_info "[NET] ConnMan service is active"
+        elif command -v check_systemd_services >/dev/null 2>&1; then
+            check_systemd_services NetworkManager systemd-networkd connman || true
+        fi
     fi
 
     net_had_any_ip=0
@@ -6309,20 +9192,26 @@ ensure_network_online() {
 
         if command -v is_link_up >/dev/null 2>&1; then
             if ! is_link_up "$net_ifc"; then
-                log_info "[NET] ${net_ifc}: link=down → skipping DHCP"
+                log_info "[NET] ${net_ifc}: link=down, skipping DHCP"
                 continue
             fi
         fi
 
-        log_info "[NET] ${net_ifc}: bringing up and requesting DHCP..."
-        if command -v bringup_interface >/dev/null 2>&1; then
-            bringup_interface "$net_ifc" 2 2 || true
-        fi
+        if [ "$net_nmcli_available" -eq 1 ]; then
+            log_info "[NET] ${net_ifc}: requesting an existing NetworkManager connection"
+            run_with_timeout 15 \
+                nmcli device connect "$net_ifc" >/dev/null 2>&1 || true
+        else
+            log_info "[NET] ${net_ifc}: bringing up and requesting DHCP..."
+            if command -v bringup_interface >/dev/null 2>&1; then
+                bringup_interface "$net_ifc" 2 2 || true
+            fi
 
-        if command -v run_dhcp_client >/dev/null 2>&1; then
-            run_dhcp_client "$net_ifc" 10 >/dev/null 2>&1 || true
-        elif command -v try_dhcp_client_safe >/dev/null 2>&1; then
-            try_dhcp_client_safe "$net_ifc" 8 || true
+            if command -v run_dhcp_client >/dev/null 2>&1; then
+                run_dhcp_client "$net_ifc" 10 >/dev/null 2>&1 || true
+            elif command -v try_dhcp_client_safe >/dev/null 2>&1; then
+                try_dhcp_client_safe "$net_ifc" 8 || true
+            fi
         fi
 
         net_log_iface_snapshot "$net_ifc"
@@ -6332,12 +9221,14 @@ ensure_network_online() {
             0)
                 log_pass "[NET] ${net_ifc}: internet reachable"
                 ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-                unset net_ifaces net_ifc net_rc net_had_any_ip
+                unset net_ifaces net_ifc net_rc net_had_any_ip net_nmcli_available
                 return 0
                 ;;
             2)
                 log_warn "[NET] ${net_ifc}: IP assigned but internet not reachable"
-                net_had_any_ip=1
+                log_warn "[NET] Preserving the existing interface state for endpoint-specific validation"
+                unset net_ifaces net_ifc net_rc net_had_any_ip net_nmcli_available
+                return 2
                 ;;
             1)
                 log_info "[NET] ${net_ifc}: still no IP after DHCP attempt"
@@ -6352,10 +9243,13 @@ ensure_network_online() {
     fi
     if [ -n "$net_wifi" ]; then
         net_log_iface_snapshot "$net_wifi"
-        log_info "[NET] ${net_wifi}: bringing up Wi-Fi..."
-
-        if command -v bringup_interface >/dev/null 2>&1; then
-            bringup_interface "$net_wifi" 2 2 || true
+        if [ "$net_nmcli_available" -eq 1 ]; then
+            log_info "[NET] ${net_wifi}: using the existing NetworkManager configuration"
+        else
+            log_info "[NET] ${net_wifi}: bringing up Wi-Fi..."
+            if command -v bringup_interface >/dev/null 2>&1; then
+                bringup_interface "$net_wifi" 2 2 || true
+            fi
         fi
 
         net_creds=""
@@ -6389,7 +9283,7 @@ ensure_network_online() {
 
                 # If nmcli brought us up, do NOT fall back to wpa_supplicant
                 check_network_status_rc; net_rc=$?
-                if [ "$net_rc" -ne 0 ]; then
+                if [ "$net_rc" -eq 1 ]; then
                     log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
                     if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
                         wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
@@ -6399,9 +9293,15 @@ ensure_network_online() {
                     fi
                 fi
             else
-                log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
-                if command -v run_dhcp_client >/dev/null 2>&1; then
-                    run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+                if [ "$net_nmcli_available" -eq 1 ]; then
+                    log_info "[NET] ${net_wifi}: no credentials provided, requesting a saved NetworkManager connection"
+                    run_with_timeout 15 \
+                        nmcli device connect "$net_wifi" >/dev/null 2>&1 || true
+                else
+                    log_info "[NET] ${net_wifi}: no credentials provided, DHCP only"
+                    if command -v run_dhcp_client >/dev/null 2>&1; then
+                        run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+                    fi
                 fi
             fi
 
@@ -6411,12 +9311,14 @@ ensure_network_online() {
                 0)
                     log_pass "[NET] ${net_wifi}: internet reachable"
                     ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-                    unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass wifi_attempt wifi_max_attempts wifi_retry_delay
+                    unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass wifi_attempt wifi_max_attempts wifi_retry_delay net_nmcli_available
                     return 0
                     ;;
                 2)
                     log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
-                    net_had_any_ip=1
+                    log_warn "[NET] Preserving the existing interface state for endpoint-specific validation"
+                    unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass wifi_attempt wifi_max_attempts wifi_retry_delay net_nmcli_available
+                    return 2
                     ;;
                 1)
                     log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
@@ -6425,14 +9327,18 @@ ensure_network_online() {
 
             # If not last attempt, cooldown + cleanup before retry
             if [ "$wifi_attempt" -lt "$wifi_max_attempts" ]; then
-                if command -v wifi_cleanup >/dev/null 2>&1; then
-                    wifi_cleanup "$net_wifi" || true
-                fi
-                if command -v bringup_interface >/dev/null 2>&1; then
-                    bringup_interface "$net_wifi" 2 2 || true
+                if [ "$net_nmcli_available" -eq 1 ]; then
+                    log_info "[NET] ${net_wifi}: preserving NetworkManager state before retry"
+                else
+                    if command -v wifi_cleanup >/dev/null 2>&1; then
+                        wifi_cleanup "$net_wifi" || true
+                    fi
+                    if command -v bringup_interface >/dev/null 2>&1; then
+                        bringup_interface "$net_wifi" 2 2 || true
+                    fi
                 fi
                 if [ "$wifi_retry_delay" -gt 0 ] 2>/dev/null; then
-                    log_info "[NET] ${net_wifi}: retrying in ${wifi_retry_delay}s…"
+                    log_info "[NET] ${net_wifi}: retrying in ${wifi_retry_delay}s"
                     sleep "$wifi_retry_delay"
                 fi
             fi
@@ -6446,8 +9352,9 @@ ensure_network_online() {
     if command -v ensure_udhcpc_script >/dev/null 2>&1; then
         net_script_path="$(ensure_udhcpc_script 2>/dev/null || echo "")"
     fi
-    if [ -n "$net_script_path" ]; then
-        log_info "[NET] udhcpc default.script present → refreshing leases"
+    if [ -n "$net_script_path" ] &&
+       [ "$net_nmcli_available" -ne 1 ]; then
+        log_info "[NET] udhcpc default.script present, refreshing leases"
         for net_ifc in $net_ifaces $net_wifi; do
             [ -n "$net_ifc" ] || continue
             if command -v run_dhcp_client >/dev/null 2>&1; then
@@ -6459,7 +9366,7 @@ ensure_network_online() {
             0)
                 log_pass "[NET] connectivity restored after udhcpc fixup"
                 ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-                unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+                unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip net_nmcli_available
                 return 0
                 ;;
             2)
@@ -6470,10 +9377,10 @@ ensure_network_online() {
     fi
 
     if [ "$net_had_any_ip" -eq 1 ] 2>/dev/null; then
-        unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+        unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip net_nmcli_available
         return 2
     fi
-    unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+    unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip net_nmcli_available
     return 1
 }
 

@@ -19,14 +19,14 @@ have_cmd() {
 
 # ---------- Backend detection & daemon checks ----------
 detect_audio_backend() {
-  if pgrep -x pipewire >/dev/null 2>&1 && command -v wpctl >/dev/null 2>&1; then
+  if pgrep -x pipewire >/dev/null 2>&1; then
     echo pipewire; return 0
   fi
-  if pgrep -x pulseaudio >/dev/null 2>&1 && command -v pactl >/dev/null 2>&1; then
+  if pgrep -x pulseaudio >/dev/null 2>&1; then
     echo pulseaudio; return 0
   fi
   # Accept pipewire-pulse shim as PulseAudio
-  if pgrep -x pipewire-pulse >/dev/null 2>&1 && command -v pactl >/dev/null 2>&1; then
+  if pgrep -x pipewire-pulse >/dev/null 2>&1; then
     echo pulseaudio; return 0
   fi
   echo ""
@@ -94,17 +94,64 @@ resolve_clip() {
   esac
 }
 
+# audio_ensure_download_client
+# Ensures that curl or wget is available. Takes no arguments and emits no
+# machine-readable stdout. It may install the complete mapped audio-download
+# package set on Ubuntu and writes diagnostics through log_* helpers. Returns 0
+# when a downloader is available and 1 otherwise.
+audio_ensure_download_client() {
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if command -v pkg_ensure_host_distro_package_set_present >/dev/null 2>&1; then
+    log_info "Audio asset download requires curl or wget, attempting mapped package recovery"
+    pkg_ensure_host_distro_package_set_present audio-download
+    audio_download_recovery_rc=$?
+
+    case "$audio_download_recovery_rc" in
+      0)
+        ;;
+      2)
+        log_warn "Audio downloader package recovery is not configured for this operating system"
+        ;;
+      *)
+        log_error "Failed to recover the audio-download package set"
+        ;;
+    esac
+  fi
+
+  if command -v curl >/dev/null 2>&1 ||
+     command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_error "No downloader is available, provision curl and wget in the image or enable Ubuntu package recovery"
+  return 1
+}
+
 # audio_download_with_any <url> <outfile>
+# Downloads the non-empty URL to the output path using an available curl or
+# wget client and writes downloader output to stdout and stderr. Returns the
+# downloader status, or 1 when neither client is available. The caller owns
+# output-file cleanup.
 audio_download_with_any() {
-    url="$1"; out="$2"
-    if command -v wget >/dev/null 2>&1; then
-        wget -O "$out" "$url"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -L --fail -o "$out" "$url"
-    else
-        log_error "No downloader (wget/curl) available to fetch $url"
-        return 1
-    fi
+  url="$1"
+  out="$2"
+
+  if [ -z "$url" ] || [ -z "$out" ]; then
+    log_error "audio_download_with_any requires a URL and output path"
+    return 1
+  fi
+
+  audio_ensure_download_client || return 1
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$out" "$url"
+  else
+    curl -L --fail -o "$out" "$url"
+  fi
 }
 
 audio_has_runnable_discovery_clips() {
@@ -135,7 +182,11 @@ audio_has_runnable_discovery_clips() {
 }
 
 # audio_fetch_assets_from_url <url>
-# Prefer functestlib's extract_tar_from_url; otherwise download + extract.
+# Downloads and extracts the audio archive URL into AUDIO_CLIPS_BASE_DIR. The
+# URL must be non-empty. The function writes diagnostic logs and temporary
+# archive files, may recover the mapped Ubuntu downloader package set, and
+# emits no machine-readable stdout. Returns 0 when runnable clips are ready and
+# 1 when download, extraction, or validation fails.
 audio_fetch_assets_from_url() {
   url="$1"
   clips_dir="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
@@ -169,31 +220,52 @@ audio_fetch_assets_from_url() {
     log_warn "Extraction marker present but runnable clips not found, continuing with download/re-extract path"
   fi
 
+  audio_ensure_download_client || return 1
+
   while [ "$fetch_attempt" -le "$fetch_attempts" ]; do
     rm -f "$archive_path" >/dev/null 2>&1 || true
     rm -f "$fetch_log" >/dev/null 2>&1 || true
 
     download_ok=0
+    fetch_client=""
 
-    if command -v curl >/dev/null 2>&1; then
-      log_info "exec: curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
-      if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$archive_path" "$url" >"$fetch_log" 2>&1; then
+    if command -v curl >/dev/null 2>&1 &&
+       command -v wget >/dev/null 2>&1; then
+      if [ $((fetch_attempt % 2)) -eq 1 ]; then
+        fetch_client="curl"
+      else
+        fetch_client="wget"
+      fi
+    elif command -v curl >/dev/null 2>&1; then
+      fetch_client="curl"
+    elif command -v wget >/dev/null 2>&1; then
+      fetch_client="wget"
+    fi
+
+    if [ "$fetch_client" = "curl" ]; then
+      log_info "exec: curl -fL --connect-timeout 20 --max-time 120 -o \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
+      if audio_exec_with_timeout 125 \
+          curl -fL \
+          --connect-timeout 20 \
+          --max-time 120 \
+          -o "$archive_path" \
+          "$url" >"$fetch_log" 2>&1; then
         download_ok=1
       else
         log_warn "curl download failed on attempt ${fetch_attempt}/${fetch_attempts}, showing last lines from $fetch_log"
         tail -n 20 "$fetch_log" 2>/dev/null || true
       fi
-    fi
-
-    if [ "$download_ok" -ne 1 ]; then
-      if command -v wget >/dev/null 2>&1; then
-        log_info "exec: wget --tries=3 --timeout=20 -O \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
-        if wget --tries=3 --timeout=20 -O "$archive_path" "$url" >"$fetch_log" 2>&1; then
-          download_ok=1
-        else
-          log_warn "wget download failed on attempt ${fetch_attempt}/${fetch_attempts}, showing last lines from $fetch_log"
-          tail -n 20 "$fetch_log" 2>/dev/null || true
-        fi
+    elif [ "$fetch_client" = "wget" ]; then
+      log_info "exec: wget --tries=1 --timeout=20 -O \"$archive_path\" \"$url\" (attempt ${fetch_attempt}/${fetch_attempts})"
+      if audio_exec_with_timeout 125 \
+          wget --tries=1 \
+          --timeout=20 \
+          -O "$archive_path" \
+          "$url" >"$fetch_log" 2>&1; then
+        download_ok=1
+      else
+        log_warn "wget download failed on attempt ${fetch_attempt}/${fetch_attempts}, showing last lines from $fetch_log"
+        tail -n 20 "$fetch_log" 2>/dev/null || true
       fi
     fi
 
@@ -291,9 +363,18 @@ audio_ensure_clip_ready() {
 }
 
 # ---------- dmesg + mixer dumps ----------
+# scan_audio_dmesg <output-directory>
+# Capture an audio-focused kernel snapshot in the supplied evidence directory.
+# Produces no machine-readable stdout and always returns success after the scan.
 scan_audio_dmesg() {
-  outdir="$1"; mods='snd|audio|pipewire|pulseaudio'; excl='dummy regulator|EEXIST|probe deferred'
-  scan_dmesg_errors "$mods" "$outdir" "$excl" || true
+  sad_output_dir="$1"
+  sad_modules='snd|asoc|audio|lpass|q6|codec|xrun|underrun|overrun|pipewire|pulseaudio'
+  sad_exclusions='dummy regulator|EEXIST|probe deferred'
+
+  scan_dmesg_errors \
+    "$sad_output_dir" \
+    "$sad_modules" \
+    "$sad_exclusions" || true
 }
 
 dump_mixers() {
@@ -429,12 +510,12 @@ audio_restart_services_best_effort() {
 
 # Run PipeWire systemctl operations in the correct service scope.
 #
-# Debian:
+# Debian and CentOS:
 #   Root orchestrator:
 #       runuser -u debian -- systemctl --user ...
 #
 #   Temporary migration compatibility:
-#       Existing runners that are still fully re-executed as the Debian Audio
+#       Existing runners that are still fully re-executed as the desktop Audio
 #       user call systemctl --user directly.
 #
 # Yocto/qcom-distro/other:
@@ -478,7 +559,7 @@ audio_pipewire_systemctl() {
   [ -n "$aps_os_id" ] || aps_os_id="unknown"
  
   case "$aps_os_id" in
-    debian)
+    debian|centos)
       ;;
     *)
       # Preserve existing native/Yocto system-service behavior.
@@ -488,7 +569,7 @@ audio_pipewire_systemctl() {
   esac
  
   ###########################################################################
-  # Preferred Debian path: root orchestrator, command-level user execution
+  # Preferred desktop path: root orchestrator, command-level user execution
   ###########################################################################
  
   aps_current_uid="$(id -u 2>/dev/null || echo 1)"
@@ -514,17 +595,22 @@ audio_pipewire_systemctl() {
     1:*|*:1)
       ;;
     *)
-      log_fail "Debian PipeWire systemctl operation was invoked outside the prepared Audio user context"
-      log_fail "Run audio_prepare_debian_audio_environment before invoking PipeWire service operations"
+      log_fail "PipeWire systemctl operation was invoked outside the prepared Audio user context"
+      log_fail "Run audio_prepare_desktop_audio_environment before invoking PipeWire service operations"
       return 1
       ;;
   esac
  
-  aps_expected_user="${AUDIO_TEST_USER:-debian}"
+  aps_expected_user="${AUDIO_TEST_USER:-}"
   aps_current_user="$(id -un 2>/dev/null || echo unknown)"
+
+  if [ -z "$aps_expected_user" ]; then
+    log_fail "The prepared Audio test user is unavailable"
+    return 1
+  fi
  
   if [ "$aps_current_user" != "$aps_expected_user" ]; then
-    log_fail "Unexpected Debian PipeWire service user: current=$aps_current_user expected=$aps_expected_user"
+    log_fail "Unexpected PipeWire service user: current=$aps_current_user expected=$aps_expected_user"
     return 1
   fi
  
@@ -554,7 +640,7 @@ audio_pipewire_systemctl() {
 
 # Prefer the invoking suite directory for test-owned scratch files. PWD covers
 # helpers re-sourced in a child shell where SCRIPT_DIR is not exported, while
-# AUDIO_RECORD_USER_CAPTURE_DIR provides the prepared Debian-user workspace.
+# AUDIO_RECORD_USER_CAPTURE_DIR provides the prepared desktop-user workspace.
 audio_scratch_dir() {
   for asd_candidate in \
     "${SCRIPT_DIR:-}" \
@@ -597,7 +683,7 @@ audio_scratch_dir() {
 audio_restart_pipewire_service() {
   aprs_label="${1:-1/1}"
   aprs_timeout="${PIPEWIRE_SYSTEMCTL_TIMEOUT:-180}"
-  aprs_start_s="$(date +%s 2>/dev/null || echo 0)"
+  aprs_start_s="$(get_monotonic_seconds)"
   aprs_next_log=10
   aprs_scope="system"
   aprs_exec_text="systemctl restart pipewire"
@@ -710,7 +796,7 @@ audio_restart_pipewire_service() {
   rm -f "$aprs_output_file"
  
   while :; do
-    aprs_now_s="$(date +%s 2>/dev/null || echo 0)"
+    aprs_now_s="$(get_monotonic_seconds)"
     aprs_elapsed=$((aprs_now_s - aprs_start_s))
  
     if [ "$aprs_elapsed" -lt 0 ]; then
@@ -897,8 +983,9 @@ pw_sink_is_real_audio() {
   return 0
 }
 
-# Prefer speaker or headphone sinks, then any physical audio sink. Do not use a
-# PipeWire dummy sink as a successful speakers route.
+# Prefer speaker sinks before other physical outputs. Headphones are only a
+# fallback for speakers, so a listed headphone does not override a speaker.
+# Do not use a PipeWire dummy sink as a successful speakers route.
 pw_default_speakers() {
   st="$(pwctl_status_safe 2>/dev/null)" || {
     printf '%s\n' ""
@@ -906,9 +993,19 @@ pw_default_speakers() {
   }
 
   block="$(printf '%s\n' "$st" | sed -n '/Sinks:/,/Sources:/p')"
-  preferred_ids="$(
+  speaker_ids="$(
     printf '%s\n' "$block" |
-      grep -Ei 'speaker|headphone|line[._ -]*out|analog|hdmi' |
+      grep -Ei 'speaker' |
+      sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
+  )"
+  output_ids="$(
+    printf '%s\n' "$block" |
+      grep -Ei 'line[._ -]*out|analog|hdmi' |
+      sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
+  )"
+  headphone_ids="$(
+    printf '%s\n' "$block" |
+      grep -Ei 'headphone' |
       sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p'
   )"
   all_ids="$(
@@ -917,7 +1014,7 @@ pw_default_speakers() {
   )"
   checked_ids=""
 
-  for id in $preferred_ids $all_ids; do
+  for id in $speaker_ids $output_ids $headphone_ids $all_ids; do
     case " $checked_ids " in
       *" $id "*)
         continue
@@ -1084,10 +1181,12 @@ pw_source_label_safe() {
 }
 # ---------- PulseAudio: sinks (playback) ----------
 pa_default_speakers() {
-  def="$(pactl info 2>/dev/null | sed -n 's/^Default Sink:[[:space:]]*//p' | head -n1)"
-  if [ -n "$def" ]; then printf '%s\n' "$def"; return 0; fi
-  name="$(pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -i 'speaker\|head' | head -n1)"
-  [ -n "$name" ] || name="$(pactl list short sinks 2>/dev/null | awk '{print $2}' | head -n1)"
+  sinks="$(pactl list short sinks 2>/dev/null)"
+  name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -i 'speaker' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -Ei 'line[._ -]*out|analog|hdmi' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | grep -i 'headphone' | head -n1)"
+  [ -n "$name" ] || name="$(pactl info 2>/dev/null | sed -n 's/^Default Sink:[[:space:]]*//p' | head -n1)"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sinks" | awk '{print $2}' | head -n1)"
   printf '%s\n' "$name"
 }
 
@@ -1401,7 +1500,30 @@ audio_parse_secs() {
   esac
 }
 
+# Add startup headroom to an AudioRecord capture watchdog.
+# PipeWire and PulseAudio recorders do not take a duration on these paths, so
+# the watchdog starts before the stream is ready. Preserve the requested WAV
+# duration by adding configurable startup grace to the watchdog only.
+audio_record_timeout_with_grace() {
+  artg_requested="$(audio_parse_secs "$1" 2>/dev/null || echo 0)"
+  artg_grace="${AUDIO_RECORD_START_GRACE:-5}"
+
+  if ! is_unsigned_number "$artg_grace"; then
+    artg_grace=5
+  fi
+
+  if [ "${artg_requested:-0}" -gt 0 ] 2>/dev/null &&
+     [ "$artg_grace" -gt 0 ] 2>/dev/null; then
+    printf '%ss\n' "$((artg_requested + artg_grace))"
+    return 0
+  fi
+
+  printf '%s\n' "$1"
+}
+
 # Run a command with a bounded timeout.
+# Timeout accounting uses monotonic uptime so an RTC or NTP correction cannot
+# prematurely terminate the child.
 #
 # Return:
 # child status - command exited before the timeout
@@ -1436,19 +1558,13 @@ audio_exec_with_timeout() {
   "$@" &
   aewt_pid=$!
 
-  aewt_start="$(
-    date +%s 2>/dev/null ||
-      echo 0
-  )"
+  aewt_start="$(get_monotonic_seconds)"
 
   aewt_deadline=$((aewt_start + aewt_dur_norm))
   aewt_timed_out=0
 
   while kill -0 "$aewt_pid" 2>/dev/null; do
-    aewt_now="$(
-      date +%s 2>/dev/null ||
-        echo 0
-    )"
+    aewt_now="$(get_monotonic_seconds)"
 
     if [ "$aewt_now" -ge "$aewt_deadline" ] 2>/dev/null; then
       aewt_timed_out=1
@@ -1489,11 +1605,11 @@ audio_exec_with_timeout() {
 audio_wait_audio_ready() {
   max_s="${1:-${PIPEWIRE_READY_TIMEOUT:-120}}"
   backend_name="${2:-auto}"
-  start_s="$(date +%s 2>/dev/null || echo 0)"
+  start_s="$(get_monotonic_seconds)"
   next_log=10
 
   while :; do
-    now_s="$(date +%s 2>/dev/null || echo 0)"
+    now_s="$(get_monotonic_seconds)"
     elapsed=$((now_s - start_s))
     if [ "$elapsed" -lt 0 ]; then
       elapsed=0
@@ -2968,6 +3084,108 @@ audio_alsa_set_control_if_present() {
     cset "iface=MIXER,name=$aascip_name" "$aascip_value" >/dev/null 2>&1
 }
 
+# audio_write_little_endian <value> <byte-count>
+# Write an unsigned integer as binary little-endian bytes to stdout.
+audio_write_little_endian() {
+  awle_value="$1"
+  awle_count="$2"
+  awle_index=0
+
+  while [ "$awle_index" -lt "$awle_count" ]; do
+    awle_byte=$((awle_value % 256))
+    awle_escape="\\$(printf '%03o' "$awle_byte")"
+    printf '%b' "$awle_escape"
+    awle_value=$((awle_value / 256))
+    awle_index=$((awle_index + 1))
+  done
+}
+
+# audio_generate_u8_stereo_wav <output> <seconds> [rate] [frequency]
+# Generate a deterministic unsigned 8-bit stereo square-wave WAV.
+audio_generate_u8_stereo_wav() {
+  agusw_output="$1"
+  agusw_seconds="$2"
+  agusw_rate="${3:-48000}"
+  agusw_frequency="${4:-1000}"
+
+  if [ -z "$agusw_output" ] ||
+     ! is_unsigned_number "$agusw_seconds" ||
+     ! is_unsigned_number "$agusw_rate" ||
+     ! is_unsigned_number "$agusw_frequency" ||
+     [ "$agusw_seconds" -le 0 ] ||
+     [ "$agusw_rate" -le 0 ] ||
+     [ "$agusw_frequency" -le 0 ]; then
+    printf '%s\n' 'invalid WAV output, duration, rate, or frequency' >&2
+    return 1
+  fi
+
+  agusw_half_period=$((agusw_rate / (agusw_frequency * 2)))
+  if [ "$agusw_half_period" -le 0 ]; then
+    printf '%s\n' \
+      "tone frequency $agusw_frequency is too high for rate $agusw_rate" >&2
+    return 1
+  fi
+
+  agusw_frames=$((agusw_seconds * agusw_rate))
+  agusw_data_bytes=$((agusw_frames * 2))
+  agusw_riff_bytes=$((36 + agusw_data_bytes))
+  agusw_byte_rate=$((agusw_rate * 2))
+
+  rm -f "$agusw_output"
+  if ! {
+    printf 'RIFF'
+    audio_write_little_endian "$agusw_riff_bytes" 4
+    printf 'WAVEfmt '
+    audio_write_little_endian 16 4
+    audio_write_little_endian 1 2
+    audio_write_little_endian 2 2
+    audio_write_little_endian "$agusw_rate" 4
+    audio_write_little_endian "$agusw_byte_rate" 4
+    audio_write_little_endian 2 2
+    audio_write_little_endian 8 2
+    printf 'data'
+    audio_write_little_endian "$agusw_data_bytes" 4
+    audio_exec_with_timeout 15s env LC_ALL=C awk \
+      -v frames="$agusw_frames" \
+      -v half_period="$agusw_half_period" '
+        BEGIN {
+          cycle_frames = half_period * 2
+          cycle = ""
+          for (frame = 0; frame < cycle_frames; frame++) {
+            value = frame < half_period ? 80 : 176
+            cycle = cycle sprintf("%c%c", value, value)
+          }
+
+          cycles = int(frames / cycle_frames)
+          for (cycle_index = 0; cycle_index < cycles; cycle_index++) {
+            printf "%s", cycle
+          }
+
+          remaining = frames - (cycles * cycle_frames)
+          for (frame = 0; frame < remaining; frame++) {
+            value = frame < half_period ? 80 : 176
+            printf "%c%c", value, value
+          }
+        }
+      '
+  } >"$agusw_output"; then
+    rm -f "$agusw_output"
+    printf '%s\n' "could not generate WAV reference: $agusw_output" >&2
+    return 1
+  fi
+
+  agusw_expected_bytes=$((44 + agusw_data_bytes))
+  agusw_actual_bytes="$(file_size_bytes "$agusw_output" 2>/dev/null || echo 0)"
+  if [ "$agusw_actual_bytes" -ne "$agusw_expected_bytes" ] 2>/dev/null; then
+    rm -f "$agusw_output"
+    printf '%s\n' \
+      "WAV reference size mismatch: expected=$agusw_expected_bytes observed=${agusw_actual_bytes:-0}" >&2
+    return 1
+  fi
+
+  return 0
+}
+
 # List unique ALSA card indexes from procfs and the playback/capture inventories.
 audio_alsa_card_indexes() {
   {
@@ -3216,23 +3434,43 @@ audio_playback_pick_alsa_sink() {
 audio_playback_alsa_probe() {
   ap_probe_dev="$(audio_playback_pick_alsa_sink)"
   if [ -z "$ap_probe_dev" ]; then
+    printf '%s\n' \
+      '[ALSA-PROBE] no playback candidate was discovered from aplay inventory' >&2
     return 1
   fi
 
   ap_probe_card="$(audio_alsa_device_card "$ap_probe_dev")"
+  ap_probe_profile="generic"
+  if [ -n "$ap_probe_card" ]; then
+    ap_probe_profile="$(audio_alsa_playback_profile "$ap_probe_card")"
+  fi
+
+  printf '%s\n' \
+    "[ALSA-PROBE] candidate=$ap_probe_dev card=${ap_probe_card:-unknown} profile=$ap_probe_profile" >&2
   audio_playback_alsa_prepare "$ap_probe_card" >/dev/null 2>&1 || true
 
-  if audio_exec_with_timeout 5s aplay -D "$ap_probe_dev" -t raw -f S16_LE -r 48000 -c 2 -d 1 /dev/zero >/dev/null 2>&1; then
+  printf '%s\n' \
+    "[ALSA-PROBE] exec: aplay -D $ap_probe_dev -t raw -f S16_LE -r 48000 -c 2 -d 1 /dev/zero" >&2
+  audio_exec_with_timeout 5s \
+    aplay -D "$ap_probe_dev" -t raw -f S16_LE -r 48000 -c 2 -d 1 \
+    /dev/zero >/dev/null
+  ap_probe_rc=$?
+
+  if [ "$ap_probe_rc" -eq 0 ]; then
+    printf '%s\n' \
+      "[ALSA-PROBE] playback candidate opened successfully: $ap_probe_dev" >&2
     AUDIO_ALSA_PLAYBACK_DEVICE="$ap_probe_dev"
     export AUDIO_ALSA_PLAYBACK_DEVICE
     return 0
   fi
 
+  printf '%s\n' \
+    "[ALSA-PROBE] playback candidate failed: device=$ap_probe_dev exit_status=$ap_probe_rc" >&2
   return 1
 }
 
 # Print the successfully probed ALSA playback device for propagation from a
-# Debian Audio-user subprocess back into the root orchestrator.
+# desktop Audio-user subprocess back into the root orchestrator.
 audio_playback_alsa_probe_device() {
   if ! audio_playback_alsa_probe; then
     return 1
@@ -3261,8 +3499,16 @@ audio_alsa_playback_inventory_available() {
 # Probe direct ALSA playback in the prepared user context. When no playback PCM
 # exists, root may start one fully provisioned offline audio DSP and retry.
 audio_playback_probe_alsa_with_recovery() {
+  appawr_log="${AUDIO_ALSA_PLAYBACK_PROBE_LOG:-/dev/stderr}"
+  if [ "$appawr_log" != "/dev/stderr" ]; then
+    printf '\n%s\n' \
+      "[ALSA-PROBE] attempt started at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      >>"$appawr_log"
+  fi
+
   appawr_output="$(
-    audio_run_helper_as_test_user audio_playback_alsa_probe_device 2>/dev/null
+    audio_run_helper_as_test_user audio_playback_alsa_probe_device \
+      2>>"$appawr_log"
   )"
   appawr_rc=$?
 
@@ -3276,6 +3522,9 @@ audio_playback_probe_alsa_with_recovery() {
     audio_run_helper_as_test_user audio_playback_pick_alsa_sink 2>/dev/null || true
   )"
   if [ -n "$appawr_candidate" ]; then
+    printf '%s\n' \
+      "[ALSA-PROBE] candidate remains present after failed open: $appawr_candidate" \
+      >>"$appawr_log"
     return 1
   fi
 
@@ -3288,8 +3537,15 @@ audio_playback_probe_alsa_with_recovery() {
   export AUDIO_DSP_RECOVERY_ATTEMPTED
 
   if ! audio_recover_offline_dsp; then
+    printf '%s\n' \
+      "[ALSA-PROBE] DSP recovery was not performed: ${AUDIO_DSP_RECOVERY_REASON:-not applicable}" \
+      >>"$appawr_log"
     return 1
   fi
+
+  printf '%s\n' \
+    '[ALSA-PROBE] offline audio DSP was started, retrying playback discovery' \
+    >>"$appawr_log"
 
   appawr_wait=0
   while [ "$appawr_wait" -lt 10 ]; do
@@ -3302,7 +3558,8 @@ audio_playback_probe_alsa_with_recovery() {
   done
 
   appawr_output="$(
-    audio_run_helper_as_test_user audio_playback_alsa_probe_device 2>/dev/null
+    audio_run_helper_as_test_user audio_playback_alsa_probe_device \
+      2>>"$appawr_log"
   )"
   appawr_rc=$?
 
@@ -3458,7 +3715,11 @@ audio_record_alsa_capture_probe() {
   return 1
 }
 
+# audio_probe_alsa_capture_profile [device]
+# Probe a supported capture format on one explicit device or discovered devices.
+# shellcheck disable=SC2120
 audio_probe_alsa_capture_profile() {
+  requested_capture_device="${1:-}"
   # shellcheck disable=SC2034
   AUDIO_ALSA_CAPTURE_DEVICE=""
   # shellcheck disable=SC2034
@@ -3496,38 +3757,42 @@ audio_probe_alsa_capture_profile() {
   }
 
   probe_devices=""
-  cand="$(alsa_pick_capture 2>/dev/null || true)"
-  if [ -n "$cand" ]; then
-    probe_devices="$cand"
-    case "$cand" in
-      hw:*)
-        probe_devices="$probe_devices plughw:${cand#hw:}"
-        ;;
-      plughw:*)
-        probe_devices="$probe_devices hw:${cand#plughw:}"
-        ;;
-    esac
-  fi
+  if [ -n "$requested_capture_device" ]; then
+    probe_devices="$requested_capture_device"
+  else
+    cand="$(alsa_pick_capture 2>/dev/null || true)"
+    if [ -n "$cand" ]; then
+      probe_devices="$cand"
+      case "$cand" in
+        hw:*)
+          probe_devices="$probe_devices plughw:${cand#hw:}"
+          ;;
+        plughw:*)
+          probe_devices="$probe_devices hw:${cand#plughw:}"
+          ;;
+      esac
+    fi
 
-  extra_devices="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null)"
-  if [ -n "$extra_devices" ]; then
-    for dev in $extra_devices; do
-      seen=0
-      for existing in $probe_devices; do
-        if [ "$existing" = "$dev" ]; then
-          seen=1
-          break
+    extra_devices="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null)"
+    if [ -n "$extra_devices" ]; then
+      for dev in $extra_devices; do
+        seen=0
+        for existing in $probe_devices; do
+          if [ "$existing" = "$dev" ]; then
+            seen=1
+            break
+          fi
+        done
+        if [ "$seen" -eq 0 ]; then
+          probe_devices="$probe_devices $dev"
+          case "$dev" in
+            hw:*)
+              probe_devices="$probe_devices plughw:${dev#hw:}"
+              ;;
+          esac
         fi
       done
-      if [ "$seen" -eq 0 ]; then
-        probe_devices="$probe_devices $dev"
-        case "$dev" in
-          hw:*)
-            probe_devices="$probe_devices plughw:${dev#hw:}"
-            ;;
-        esac
-      fi
-    done
+    fi
   fi
 
   if [ -z "$probe_devices" ]; then
@@ -4236,26 +4501,26 @@ audio_validate_dma_heap_access() {
   return 1
 }
 
-# Prepare and validate the Debian AudioReach overlay runtime.
+# Prepare and validate the Debian or CentOS AudioReach overlay runtime.
 #
 # The preferred execution model keeps the test runner as root and executes only
-# user-session or unprivileged device-access commands as the Debian Audio user.
+# user-session or unprivileged device-access commands as the desktop Audio user.
 #
 # Args:
 #   $1 - 0 for base Audio mode
 #        1 when --overlay was explicitly requested
 #
-# Prerequisite for the preferred Debian root path:
-#   audio_prepare_debian_audio_environment 1
+# Prerequisite for the preferred desktop root path:
+#   audio_prepare_desktop_audio_environment 1
 #
 # Platform behavior:
-#   Debian overlay:
-#     - validate dma-heap access as the Debian Audio user
-#     - validate ALSA node access as the Debian Audio user
-#     - validate PipeWire through the Debian user session
+#   Debian and CentOS overlay:
+#     - validate dma-heap access as the desktop Audio user
+#     - validate ALSA node access as the desktop Audio user
+#     - validate PipeWire through the desktop user session
 #     - restart PipeWire only when required
 #
-#   Debian base:
+#   Debian and CentOS base:
 #     - no-op
 #
 #   Yocto/qcom-distro/other:
@@ -4331,7 +4596,7 @@ audio_prepare_overlay_runtime() {
   [ -n "$apor_os_id" ] || apor_os_id="unknown"
 
   case "$apor_os_id" in
-    debian)
+    debian|centos)
       ;;
     *)
       # Preserve native/Yocto behavior.
@@ -4376,12 +4641,12 @@ audio_prepare_overlay_runtime() {
        [ -z "${AUDIO_TEST_UID:-}" ] ||
        [ -z "${AUDIO_TEST_RUNTIME_DIR:-}" ] ||
        [ -z "${AUDIO_TEST_DBUS_ADDRESS:-}" ]; then
-      log_fail "Debian Audio environment has not been prepared"
-      log_fail "Call audio_prepare_debian_audio_environment 1 before overlay runtime preparation"
+      log_fail "Desktop Audio environment has not been prepared"
+      log_fail "Call audio_prepare_desktop_audio_environment 1 before overlay runtime preparation"
       return 1
     fi
 
-    log_info "Preparing Debian AudioReach runtime from root orchestration"
+    log_info "Preparing desktop AudioReach runtime from root orchestration"
   else
     # Temporary compatibility until Playback and Record stop re-executing the
     # complete runner as the Debian user.
@@ -4395,7 +4660,7 @@ audio_prepare_overlay_runtime() {
         ;;
     esac
 
-    log_info "Preparing Debian AudioReach runtime in temporary re-executed-user mode"
+    log_info "Preparing desktop AudioReach runtime in temporary re-executed-user mode"
   fi
 
   ###########################################################################
@@ -4422,7 +4687,7 @@ audio_prepare_overlay_runtime() {
   fi
 
   ###########################################################################
-  # Validate dma-heap access as the Debian Audio user
+  # Validate dma-heap access as the desktop Audio user
   ###########################################################################
 
   if [ "$apor_user_command_mode" = "root-wrapper" ]; then
@@ -4447,14 +4712,14 @@ audio_prepare_overlay_runtime() {
   fi
 
   if [ "$apor_dma_rc" -ne 0 ]; then
-    log_fail "Debian Audio user cannot read and write /dev/dma_heap/system"
+    log_fail "Desktop Audio user cannot read and write /dev/dma_heap/system"
     return 1
   fi
 
-  log_pass "/dev/dma_heap/system is accessible to the Debian Audio user"
+  log_pass "/dev/dma_heap/system is accessible to the desktop Audio user"
 
   ###########################################################################
-  # Validate ALSA nodes as the Debian Audio user
+  # Validate ALSA nodes as the desktop Audio user
   ###########################################################################
 
   if [ ! -d /dev/snd ]; then
@@ -4500,14 +4765,14 @@ audio_prepare_overlay_runtime() {
 
   case "$apor_alsa_rc" in
     0)
-      log_pass "ALSA device nodes are accessible to the Debian Audio user"
+      log_pass "ALSA device nodes are accessible to the desktop Audio user"
       ;;
     2)
       log_fail "No ALSA control or PCM device nodes were found under /dev/snd"
       return 1
       ;;
     *)
-      log_fail "ALSA control and PCM nodes are not accessible to the Debian Audio user"
+      log_fail "ALSA control and PCM nodes are not accessible to the desktop Audio user"
 
       if command -v stat >/dev/null 2>&1; then
         for apor_snd_node in /dev/snd/*; do
@@ -4605,7 +4870,7 @@ audio_prepare_overlay_runtime() {
   fi
 
   if ! audio_restart_pipewire_service "1/1"; then
-    log_fail "Failed to restart the Debian PipeWire user service"
+    log_fail "Failed to restart the desktop PipeWire user service"
     return 1
   fi
 
@@ -4643,7 +4908,7 @@ audio_prepare_overlay_runtime() {
 
     if [ "$apor_pipewire_service_ready" -eq 1 ] &&
        [ "$apor_pipewire_control_ready" -eq 1 ]; then
-      log_pass "Debian AudioReach runtime is ready"
+      log_pass "Desktop AudioReach runtime is ready"
       return 0
     fi
 
@@ -4929,12 +5194,22 @@ audio_prepare_audioreach_udev_rule() {
 #   qcom-distro/Yocto - strict no-op
 #   Debian base       - ensure the mapped audio-base package set
 #   Debian overlay    - ensure audio-base and Debian AudioReach package sets
+#   Ubuntu server     - ensure ALSA utilities
+#   Ubuntu desktop    - ensure ALSA, PipeWire, PipeWire-Pulse, and WirePlumber
+#   Ubuntu overlay    - not enabled, report not applicable without package work
+#   CentOS base       - defer client recovery until backend selection
+#   CentOS overlay    - ensure the documented Qualcomm AudioReach RPM set
 #   other distros     - no-op until their package mappings are verified
+#
+# Environment:
+#   AUDIO_PACKAGE_PROFILE=auto|server|desktop
+#   AUDIO_PACKAGE_UPDATE=1 to upgrade installed mapped Ubuntu packages
 #
 # Return:
 #   0 - ready or not applicable
 #   1 - package preparation failed
 #   2 - AudioReach DKMS package changed; reboot required
+#   3 - requested AudioReach overlay is not enabled on this distribution
 audio_prepare_test_packages() {
   atp_overlay_requested="${1:-0}"
  
@@ -4980,21 +5255,96 @@ audio_prepare_test_packages() {
       log_info "Native image detected, Audio package preparation is not required"
       return 0
       ;;
-    debian)
+    debian|ubuntu|centos)
       ;;
     *)
       log_info "Audio package preparation is not enabled for os=$atp_os_id"
       return 0
       ;;
   esac
- 
-  # Debian package preparation must run before the test is re-executed as the
-  # unprivileged Audio user.
-  if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    log_fail "Debian Audio package preparation must run as root"
-    return 1
+
+  if [ "$atp_os_id" = "ubuntu" ] &&
+     [ "$atp_overlay_requested" -eq 1 ]; then
+    log_info "Ubuntu AudioReach overlay is not enabled"
+    log_info "Run without --overlay to validate the Ubuntu base Audio stack"
+    return 3
   fi
  
+  # Host-distribution package preparation must run from root orchestration.
+  if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+    log_fail "Audio package preparation must run as root, os=$atp_os_id"
+    return 1
+  fi
+
+  if [ "$atp_os_id" = "ubuntu" ]; then
+    atp_ubuntu_profile="${AUDIO_PACKAGE_PROFILE:-auto}"
+
+    case "$atp_ubuntu_profile" in
+      auto|server|desktop)
+        ;;
+      *)
+        log_fail "Invalid AUDIO_PACKAGE_PROFILE: $atp_ubuntu_profile"
+        return 1
+        ;;
+    esac
+
+    if [ "$atp_ubuntu_profile" = "auto" ]; then
+      if command -v systemctl >/dev/null 2>&1 &&
+         systemctl is-active --quiet graphical.target 2>/dev/null; then
+        atp_ubuntu_profile="desktop"
+      else
+        atp_ubuntu_profile="server"
+      fi
+    fi
+
+    if [ "${AUDIO_PACKAGE_UPDATE:-0}" = "1" ]; then
+      PKG_PACKAGE_SET_UPGRADE=1
+      export PKG_PACKAGE_SET_UPGRADE
+      log_info "Ubuntu Audio package update is enabled"
+    fi
+
+    if ! command -v pkg_ensure_required_package_set_present \
+        >/dev/null 2>&1; then
+      log_fail "Required package-set helper is unavailable"
+      return 1
+    fi
+
+    if ! pkg_ensure_required_package_set_present audio-base; then
+      log_fail "Failed to ensure Ubuntu Audio base package set"
+      return 1
+    fi
+
+    if [ "$atp_ubuntu_profile" = "desktop" ] &&
+       ! pkg_ensure_required_package_set_present audio-desktop; then
+      log_fail "Failed to ensure Ubuntu desktop Audio package set"
+      return 1
+    fi
+
+    if command -v modinfo >/dev/null 2>&1 &&
+       modinfo snd-soc-wcd938x >/dev/null 2>&1; then
+      if [ ! -d /sys/module/snd_soc_wcd938x ]; then
+        if command -v modprobe >/dev/null 2>&1; then
+          if modprobe snd-soc-wcd938x; then
+            log_info "Loaded optional Audio codec module: snd-soc-wcd938x"
+          else
+            log_warn "Unable to load optional Audio codec module: snd-soc-wcd938x"
+          fi
+        else
+          log_warn "Optional Audio codec module is available but modprobe is unavailable"
+        fi
+      fi
+    fi
+
+    log_pass "Ubuntu Audio package profile is ready: $atp_ubuntu_profile"
+    return 0
+  fi
+
+  if [ "$atp_os_id" = "centos" ] &&
+     [ "$atp_overlay_requested" -eq 0 ]; then
+    log_info "CentOS base Audio mode defers client package recovery until backend selection"
+    return 0
+  fi
+
   ###########################################################################
   # Debian base mode
   ###########################################################################
@@ -5016,7 +5366,7 @@ audio_prepare_test_packages() {
   fi
  
   ###########################################################################
-  # Debian AudioReach overlay mode
+  # Debian and CentOS AudioReach overlay mode
   ###########################################################################
  
   if ! command -v pkg_ensure_optional_package_set_present \
@@ -5031,24 +5381,39 @@ audio_prepare_test_packages() {
     return 1
   fi
  
+  case "$atp_os_id" in
+    centos)
+      atp_plugin_package="audioreach-pipewire-plugin"
+      atp_dkms_package="audioreach-dkms"
+      atp_support_package="audioreach-pal"
+      atp_overlay_source="auto"
+      ;;
+    *)
+      atp_plugin_package="audioreach-pipewire-plugin"
+      atp_dkms_package="audioreach-dkms"
+      atp_support_package="audioreach-conf"
+      atp_overlay_source="qli-staging"
+      ;;
+  esac
+
   # Capture AudioReach package versions before package preparation. These
   # values let us distinguish an already-ready target from an install or
   # upgrade performed during this invocation.
   atp_before_plugin="$(
     pkg_installed_package_version \
-      audioreach-pipewire-plugin 2>/dev/null ||
+      "$atp_plugin_package" 2>/dev/null ||
       true
   )"
  
   atp_before_dkms="$(
     pkg_installed_package_version \
-      audioreach-kernel-dkms 2>/dev/null ||
+      "$atp_dkms_package" 2>/dev/null ||
       true
   )"
  
-  atp_before_config="$(
+  atp_before_support="$(
     pkg_installed_package_version \
-      audioreach-config 2>/dev/null ||
+      "$atp_support_package" 2>/dev/null ||
       true
   )"
  
@@ -5057,35 +5422,35 @@ audio_prepare_test_packages() {
   # treat the request as base mode.
   if ! pkg_ensure_optional_package_set_present \
       audio \
-      qli-staging \
+      "$atp_overlay_source" \
       auto \
       --overlay \
       "$@"; then
-    log_fail "Failed to ensure Debian AudioReach package set"
+    log_fail "Failed to ensure $atp_os_id AudioReach package set"
     return 1
   fi
  
   atp_after_plugin="$(
     pkg_installed_package_version \
-      audioreach-pipewire-plugin 2>/dev/null ||
+      "$atp_plugin_package" 2>/dev/null ||
       true
   )"
  
   atp_after_dkms="$(
     pkg_installed_package_version \
-      audioreach-kernel-dkms 2>/dev/null ||
+      "$atp_dkms_package" 2>/dev/null ||
       true
   )"
  
-  atp_after_config="$(
+  atp_after_support="$(
     pkg_installed_package_version \
-      audioreach-config 2>/dev/null ||
+      "$atp_support_package" 2>/dev/null ||
       true
   )"
  
   if [ "$atp_before_plugin" != "$atp_after_plugin" ] ||
      [ "$atp_before_dkms" != "$atp_after_dkms" ] ||
-     [ "$atp_before_config" != "$atp_after_config" ]; then
+     [ "$atp_before_support" != "$atp_after_support" ]; then
     AUDIO_OVERLAY_PACKAGES_CHANGED=1
     export AUDIO_OVERLAY_PACKAGES_CHANGED
  
@@ -5095,8 +5460,8 @@ audio_prepare_test_packages() {
       log_info "AudioReach PipeWire plugin version changed: ${atp_before_plugin:-not-installed} -> ${atp_after_plugin:-not-installed}"
     fi
  
-    if [ "$atp_before_config" != "$atp_after_config" ]; then
-      log_info "AudioReach configuration version changed: ${atp_before_config:-not-installed} -> ${atp_after_config:-not-installed}"
+    if [ "$atp_before_support" != "$atp_after_support" ]; then
+      log_info "AudioReach support package changed, package=$atp_support_package version=${atp_before_support:-not-installed}->${atp_after_support:-not-installed}"
     fi
  
     if [ "$atp_before_dkms" != "$atp_after_dkms" ]; then
@@ -5132,11 +5497,218 @@ audio_prepare_test_packages() {
     return 1
   fi
  
-  log_pass "Debian AudioReach package set is ready"
+  log_pass "$atp_os_id AudioReach package set is ready"
   return 0
 }
 
-# Prepare the Debian Audio test user and optional systemd user manager.
+# audio_prepare_backend_client_packages <backend>
+# Ensure the complete playback and recording client set for one selected
+# backend. Debian, Ubuntu, and CentOS use exact package-set mappings. Yocto and
+# other image-managed environments retain their preinstalled userspace.
+# Successful preparation is cached per backend for the current runner process.
+# Produces no machine-readable stdout. Returns 0 when ready and 1 on failure.
+audio_prepare_backend_client_packages() {
+  apbcp_backend="$1"
+
+  case "$apbcp_backend" in
+    pipewire|pulseaudio|alsa)
+      apbcp_package_set="audio-client-$apbcp_backend"
+      ;;
+    *)
+      log_fail "Unsupported Audio backend for package preparation: $apbcp_backend"
+      return 1
+      ;;
+  esac
+
+  case " ${AUDIO_PREPARED_CLIENT_BACKENDS:-} " in
+    *" $apbcp_backend "*)
+      return 0
+      ;;
+  esac
+
+  if command -v pkg_detect_os_id >/dev/null 2>&1; then
+    apbcp_os_id="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
+  else
+    apbcp_os_id="$(
+      sed -n 's/^ID=//p' /etc/os-release 2>/dev/null |
+        sed -n '1p' |
+        sed 's/^"//;s/"$//' |
+        tr '[:upper:]' '[:lower:]'
+    )"
+  fi
+
+  [ -n "$apbcp_os_id" ] || apbcp_os_id="unknown"
+
+  case "$apbcp_os_id" in
+    qcom-distro|poky|openembedded|oe)
+      log_info "Native image uses preinstalled $apbcp_backend Audio clients"
+      AUDIO_PREPARED_CLIENT_BACKENDS="${AUDIO_PREPARED_CLIENT_BACKENDS:+$AUDIO_PREPARED_CLIENT_BACKENDS }$apbcp_backend"
+      return 0
+      ;;
+    debian|ubuntu|centos)
+      ;;
+    *)
+      log_info "Audio backend client package recovery is not enabled, os=$apbcp_os_id backend=$apbcp_backend"
+      AUDIO_PREPARED_CLIENT_BACKENDS="${AUDIO_PREPARED_CLIENT_BACKENDS:+$AUDIO_PREPARED_CLIENT_BACKENDS }$apbcp_backend"
+      return 0
+      ;;
+  esac
+
+  if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+    log_fail "Audio backend client package preparation must run as root, os=$apbcp_os_id backend=$apbcp_backend"
+    return 1
+  fi
+
+  if ! command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+    log_fail "Required package-set helper is unavailable"
+    return 1
+  fi
+
+  log_info "Ensuring complete Audio backend client package set, os=$apbcp_os_id backend=$apbcp_backend set=$apbcp_package_set"
+
+  if ! pkg_ensure_required_package_set_present "$apbcp_package_set"; then
+    log_fail "Failed to ensure Audio backend client package set, os=$apbcp_os_id backend=$apbcp_backend set=$apbcp_package_set"
+    return 1
+  fi
+
+  log_pass "Audio backend client package set is ready, os=$apbcp_os_id backend=$apbcp_backend"
+  AUDIO_PREPARED_CLIENT_BACKENDS="${AUDIO_PREPARED_CLIENT_BACKENDS:+$AUDIO_PREPARED_CLIENT_BACKENDS }$apbcp_backend"
+  return 0
+}
+
+# Return success when a user account is suitable for desktop Audio execution.
+audio_user_is_regular() {
+  auir_user="$1"
+
+  if [ -z "$auir_user" ] || [ "$auir_user" = "root" ]; then
+    return 1
+  fi
+
+  if ! id "$auir_user" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    auir_entry="$(getent passwd "$auir_user" 2>/dev/null | sed -n '1p')"
+  else
+    auir_entry="$(
+      awk -F: -v requested_user="$auir_user" \
+        '$1 == requested_user { print; exit }' \
+        /etc/passwd 2>/dev/null
+    )"
+  fi
+
+  auir_uid="$(printf '%s\n' "$auir_entry" | awk -F: 'NR == 1 { print $3 }')"
+  auir_shell="$(printf '%s\n' "$auir_entry" | awk -F: 'NR == 1 { print $7 }')"
+
+  case "$auir_uid" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+
+  if [ "$auir_uid" -eq 0 ] || [ "$auir_uid" -ge 65534 ]; then
+    return 1
+  fi
+
+  case "$auir_shell" in
+    */false|*/nologin)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+# Print the regular user that owns the active desktop session. If no active
+# session is visible, use the only regular login account on the image.
+# Diagnostics must remain on stderr because callers use command substitution.
+audio_find_regular_session_user() {
+  afrsu_user="${AUDIO_TEST_USER:-}"
+  afrsu_sessions=""
+  afrsu_runtime_dir=""
+  afrsu_uid=""
+  afrsu_candidates=""
+  afrsu_count=0
+
+  if audio_user_is_regular "$afrsu_user"; then
+    printf '%s\n' "$afrsu_user"
+    return 0
+  fi
+
+  if command -v loginctl >/dev/null 2>&1; then
+    afrsu_sessions="$(
+      loginctl list-sessions --no-legend 2>/dev/null |
+        awk '{ print $1 }'
+    )"
+
+    for afrsu_session in $afrsu_sessions; do
+      afrsu_active="$(
+        loginctl show-session "$afrsu_session" -p Active --value 2>/dev/null
+      )"
+      [ "$afrsu_active" = "yes" ] || continue
+
+      afrsu_user="$(
+        loginctl show-session "$afrsu_session" -p Name --value 2>/dev/null
+      )"
+      if audio_user_is_regular "$afrsu_user"; then
+        printf '%s\n' "$afrsu_user"
+        return 0
+      fi
+    done
+  fi
+
+  for afrsu_runtime_dir in /run/user/[0-9]*; do
+    [ -d "$afrsu_runtime_dir" ] || continue
+
+    afrsu_uid="${afrsu_runtime_dir##*/}"
+    case "$afrsu_uid" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+
+    if command -v getent >/dev/null 2>&1; then
+      afrsu_user="$(
+        getent passwd "$afrsu_uid" 2>/dev/null |
+          awk -F: 'NR == 1 { print $1 }'
+      )"
+    else
+      afrsu_user="$(
+        awk -F: -v requested_uid="$afrsu_uid" \
+          '$3 == requested_uid { print $1; exit }' \
+          /etc/passwd 2>/dev/null
+      )"
+    fi
+
+    if audio_user_is_regular "$afrsu_user"; then
+      printf '%s\n' "$afrsu_user"
+      return 0
+    fi
+  done
+
+  if command -v getent >/dev/null 2>&1; then
+    afrsu_candidates="$(
+      getent passwd 2>/dev/null |
+        awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(false|nologin)$/ { print $1 }'
+    )"
+  else
+    afrsu_candidates="$(
+      awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(false|nologin)$/ { print $1 }' \
+        /etc/passwd 2>/dev/null
+    )"
+  fi
+
+  afrsu_count="$(printf '%s\n' "$afrsu_candidates" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  if [ "$afrsu_count" -eq 1 ] 2>/dev/null; then
+    printf '%s\n' "$afrsu_candidates"
+    return 0
+  fi
+
+  return 1
+}
+
+# Prepare a Debian or CentOS Audio test user and optional systemd user manager.
 #
 # Unlike audio_prepare_debian_audio_test_user(), this function does not:
 #   - re-execute the complete runner
@@ -5145,14 +5717,15 @@ audio_prepare_test_packages() {
 #   - invoke runuser
 #
 # The calling test remains the root orchestrator. Individual audio commands
-# will be executed as the Debian Audio user through audio_run_as_test_user().
+# will be executed as the prepared desktop Audio user through
+# audio_run_as_test_user().
 #
 # Args:
 #   $1 - 1 when a PipeWire systemd user manager is required
 #        0 for ALSA-only operations
 #
 # Platform behavior:
-#   Debian:
+#   Debian and CentOS:
 #     - require root orchestration
 #     - ensure AUDIO_TEST_USER belongs to audio
 #     - optionally start or refresh user@UID.service
@@ -5161,7 +5734,7 @@ audio_prepare_test_packages() {
 #   Yocto/qcom-distro/other:
 #     - strict no-op
 #
-# Environment exported on Debian:
+# Environment exported on applicable desktop distributions:
 #   AUDIO_TEST_USER
 #   AUDIO_TEST_UID
 #   AUDIO_TEST_HOME
@@ -5172,7 +5745,7 @@ audio_prepare_test_packages() {
 # Returns:
 #   0 - preparation completed or not applicable
 #   1 - preparation failed
-audio_prepare_debian_audio_environment() {
+audio_prepare_desktop_audio_environment() {
   apdae_need_user_manager="${1:-0}"
 
   case "$apdae_need_user_manager" in
@@ -5205,7 +5778,7 @@ audio_prepare_debian_audio_environment() {
   [ -n "$apdae_os_id" ] || apdae_os_id="unknown"
 
   case "$apdae_os_id" in
-    debian)
+    debian|centos)
       ;;
     qcom-distro|poky|openembedded|oe)
       return 0
@@ -5220,24 +5793,44 @@ audio_prepare_debian_audio_environment() {
   ###########################################################################
 
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    log_fail "Debian Audio environment preparation must run as root"
+    log_fail "Desktop Audio environment preparation must run as root"
     return 1
   fi
 
-  apdae_user="${AUDIO_TEST_USER:-debian}"
+  case "$apdae_os_id" in
+    debian)
+      apdae_default_user="debian"
+      ;;
+    centos)
+      apdae_default_user="$(audio_find_regular_session_user 2>/dev/null || true)"
+      ;;
+  esac
+
+  apdae_user="${AUDIO_TEST_USER:-$apdae_default_user}"
+
+  if [ -z "$apdae_user" ]; then
+    log_fail "No regular desktop Audio user could be discovered on os=$apdae_os_id"
+    log_fail "Start a regular user session before running the Audio test"
+    return 1
+  fi
 
   if ! id "$apdae_user" >/dev/null 2>&1; then
-    log_fail "Debian Audio test user does not exist: $apdae_user"
+    log_fail "Desktop Audio test user does not exist: $apdae_user"
+    return 1
+  fi
+
+  if ! audio_user_is_regular "$apdae_user"; then
+    log_fail "Desktop Audio test user is not a regular login account: $apdae_user"
     return 1
   fi
 
   if command -v getent >/dev/null 2>&1; then
     if ! getent group audio >/dev/null 2>&1; then
-      log_fail "Required Debian group does not exist: audio"
+      log_fail "Required desktop Audio group does not exist: audio"
       return 1
     fi
   elif ! grep -q '^audio:' /etc/group 2>/dev/null; then
-    log_fail "Required Debian group does not exist: audio"
+    log_fail "Required desktop Audio group does not exist: audio"
     return 1
   fi
 
@@ -5257,7 +5850,7 @@ audio_prepare_debian_audio_environment() {
       return 1
     fi
 
-    log_info "Adding Debian Audio test user to audio group: $apdae_user"
+    log_info "Adding desktop Audio test user to audio group: $apdae_user"
 
     if ! usermod -aG audio "$apdae_user"; then
       log_fail "Failed to add $apdae_user to the audio group"
@@ -5329,7 +5922,7 @@ audio_prepare_debian_audio_environment() {
 
     if systemctl is-active --quiet "$apdae_user_unit"; then
       if [ "$apdae_group_changed" -eq 1 ]; then
-        log_info "Restarting Debian user manager after audio-group update: $apdae_user_unit"
+        log_info "Restarting desktop user manager after audio-group update: $apdae_user_unit"
 
         if command -v audio_exec_with_timeout >/dev/null 2>&1; then
           audio_exec_with_timeout \
@@ -5342,14 +5935,14 @@ audio_prepare_debian_audio_environment() {
         fi
 
         if [ "$apdae_systemctl_rc" -ne 0 ]; then
-          log_fail "Failed to restart Debian user manager: $apdae_user_unit"
+          log_fail "Failed to restart desktop user manager: $apdae_user_unit"
           return 1
         fi
       else
-        log_pass "Debian user manager is already active: $apdae_user_unit"
+        log_pass "Desktop user manager is already active: $apdae_user_unit"
       fi
     else
-      log_info "Starting Debian user manager: $apdae_user_unit"
+      log_info "Starting desktop user manager: $apdae_user_unit"
 
       systemctl reset-failed \
         "$apdae_user_unit" \
@@ -5366,7 +5959,7 @@ audio_prepare_debian_audio_environment() {
       fi
 
       if [ "$apdae_systemctl_rc" -ne 0 ]; then
-        log_fail "Failed to start Debian user manager: $apdae_user_unit"
+        log_fail "Failed to start desktop user manager: $apdae_user_unit"
 
         systemctl status \
           "$apdae_user_unit" \
@@ -5390,7 +5983,7 @@ audio_prepare_debian_audio_environment() {
         ;;
     esac
 
-    log_info "Waiting for Debian user runtime and D-Bus, timeout=${apdae_wait_timeout}s"
+    log_info "Waiting for desktop user runtime and D-Bus, timeout=${apdae_wait_timeout}s"
 
     while [ "$apdae_wait" -lt "$apdae_wait_timeout" ]; do
       if [ -d "$apdae_runtime_dir" ] &&
@@ -5403,16 +5996,16 @@ audio_prepare_debian_audio_environment() {
     done
 
     if [ ! -d "$apdae_runtime_dir" ]; then
-      log_fail "Debian user runtime directory is unavailable: $apdae_runtime_dir"
+      log_fail "Desktop user runtime directory is unavailable: $apdae_runtime_dir"
       return 1
     fi
 
     if [ ! -S "$apdae_runtime_dir/bus" ]; then
-      log_fail "Debian user D-Bus is unavailable: $apdae_runtime_dir/bus"
+      log_fail "Desktop user D-Bus is unavailable: $apdae_runtime_dir/bus"
       return 1
     fi
 
-    log_pass "Debian user runtime is ready: $apdae_runtime_dir"
+    log_pass "Desktop user runtime is ready: $apdae_runtime_dir"
   fi
 
   ###########################################################################
@@ -5433,14 +6026,20 @@ audio_prepare_debian_audio_environment() {
   export AUDIO_TEST_DBUS_ADDRESS
   export AUDIO_SYSTEMCTL_USER_SCOPE
 
-  log_pass "Debian Audio environment prepared: user=$apdae_user uid=$apdae_uid"
+  log_pass "Desktop Audio environment prepared: os=$apdae_os_id user=$apdae_user uid=$apdae_uid"
   return 0
 }
 
-# Execute one Audio command as the configured Debian Audio user.
+# Compatibility wrapper for existing callers while suites migrate to the
+# distribution-neutral helper name.
+audio_prepare_debian_audio_environment() {
+  audio_prepare_desktop_audio_environment "$@"
+}
+
+# Execute one Audio command as the configured desktop Audio user.
 #
 # The main test runner remains the root orchestrator. Only the supplied command
-# is executed as the Debian user.
+# is executed as the prepared user.
 #
 # Usage:
 #   audio_run_as_test_user command [args...]
@@ -5456,23 +6055,89 @@ audio_prepare_debian_audio_environment() {
 #
 #       It is not required for direct ALSA commands such as aplay and arecord.
 #
+# Return the regular user that owns an active PipeWire or PulseAudio runtime.
+# Output is machine-readable so callers can use command substitution safely.
+# AUDIO_TEST_USER is preferred when it owns a usable runtime socket.
+audio_find_desktop_audio_user() {
+  adau_preferred_user="${AUDIO_TEST_USER:-}"
+  adau_runtime_dir=""
+  adau_uid=""
+  adau_user=""
+  adau_passwd_entry=""
+  adau_shell=""
+
+  if [ -n "$adau_preferred_user" ] && id "$adau_preferred_user" >/dev/null 2>&1; then
+    adau_uid="$(id -u "$adau_preferred_user" 2>/dev/null || true)"
+    adau_runtime_dir="/run/user/$adau_uid"
+
+    if [ -S "$adau_runtime_dir/pipewire-0" ] ||
+       [ -S "$adau_runtime_dir/pulse/native" ]; then
+      printf '%s\n' "$adau_preferred_user"
+      return 0
+    fi
+  fi
+
+  for adau_runtime_dir in /run/user/[0-9]*; do
+    [ -d "$adau_runtime_dir" ] || continue
+
+    adau_uid="${adau_runtime_dir##*/}"
+    case "$adau_uid" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+
+    if [ ! -S "$adau_runtime_dir/pipewire-0" ] &&
+       [ ! -S "$adau_runtime_dir/pulse/native" ]; then
+      continue
+    fi
+
+    if command -v getent >/dev/null 2>&1; then
+      adau_passwd_entry="$(getent passwd "$adau_uid" 2>/dev/null | sed -n '1p')"
+    else
+      adau_passwd_entry="$(awk -F: -v requested_uid="$adau_uid" '$3 == requested_uid { print; exit }' /etc/passwd 2>/dev/null)"
+    fi
+
+    adau_user="$(printf '%s\n' "$adau_passwd_entry" | awk -F: 'NR == 1 { print $1 }')"
+    adau_shell="$(printf '%s\n' "$adau_passwd_entry" | awk -F: 'NR == 1 { print $7 }')"
+    [ -n "$adau_user" ] || continue
+
+    case "$adau_shell" in
+      */false|*/nologin)
+        continue
+        ;;
+    esac
+
+    printf '%s\n' "$adau_user"
+    return 0
+  done
+
+  return 1
+}
+
 # Platform behavior:
-#   Debian:
+#   Debian and CentOS:
 #     - require the caller to be root
 #     - verify the configured Audio user and audio-group membership
 #     - execute only the supplied command through runuser
 #
+#   Ubuntu root playback runs:
+#     - when AUDIO_USE_DESKTOP_SESSION=1, discover the active regular user
+#       owning PipeWire or PulseAudio and execute through that user session
+#
 #   Yocto/qcom-distro/other:
 #     - execute the command directly as the current user
 #
-# Prerequisite on Debian:
-#   audio_prepare_debian_audio_environment must run before this helper.
+# Prerequisite on Debian and CentOS:
+#   audio_prepare_desktop_audio_environment must run before this helper.
 #
 # Returns:
 #   The exact exit status of the supplied command.
 #   1 when user/session preparation is invalid.
 audio_run_as_test_user() {
   aratu_require_session=0
+  aratu_require_audio_group=0
+  aratu_desktop_session_mode=0
 
   case "${1:-}" in
     --require-session)
@@ -5507,7 +6172,17 @@ audio_run_as_test_user() {
   [ -n "$aratu_os_id" ] || aratu_os_id="unknown"
 
   case "$aratu_os_id" in
-    debian)
+    debian|centos)
+      aratu_require_audio_group=1
+      ;;
+    ubuntu)
+      if [ "${AUDIO_USE_DESKTOP_SESSION:-0}" -ne 1 ] ||
+         [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        "$@"
+        return $?
+      fi
+
+      aratu_desktop_session_mode=1
       ;;
     *)
       # Preserve existing native/Yocto execution behavior.
@@ -5516,32 +6191,51 @@ audio_run_as_test_user() {
       ;;
   esac
 
+  if [ "${AUDIO_TEST_USER_REEXEC:-0}" -eq 1 ] &&
+     [ "$(id -un 2>/dev/null || echo unknown)" = "${AUDIO_TEST_USER:-}" ]; then
+    "$@"
+    return $?
+  fi
+
   ###########################################################################
-  # Debian root orchestration validation
+  # Desktop root orchestration validation
   ###########################################################################
 
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    log_fail "Debian Audio command execution must be initiated by root"
+    log_fail "Audio command execution must be initiated by root"
     return 1
   fi
 
   if ! command -v runuser >/dev/null 2>&1; then
-    log_fail "runuser is unavailable, cannot execute an Audio command as the Debian user"
+    log_fail "runuser is unavailable, cannot execute an Audio command in the user session"
     return 1
   fi
 
-  aratu_user="${AUDIO_TEST_USER:-debian}"
+  if [ "$aratu_desktop_session_mode" -eq 1 ]; then
+    aratu_user="$(audio_find_desktop_audio_user)"
+    if [ -z "$aratu_user" ]; then
+      log_fail "No active regular-user PipeWire or PulseAudio session was found"
+      return 1
+    fi
+  else
+    aratu_user="${AUDIO_TEST_USER:-}"
+    if [ -z "$aratu_user" ]; then
+      log_fail "The prepared Audio test user is unavailable"
+      return 1
+    fi
+  fi
 
   if ! id "$aratu_user" >/dev/null 2>&1; then
-    log_fail "Debian Audio test user does not exist: $aratu_user"
+    log_fail "Audio test user does not exist: $aratu_user"
     return 1
   fi
 
-  if ! id -nG "$aratu_user" 2>/dev/null |
+  if [ "$aratu_require_audio_group" -eq 1 ] &&
+     ! id -nG "$aratu_user" 2>/dev/null |
       tr ' ' '\n' |
       grep -qx audio; then
-    log_fail "Debian Audio test user is not a member of audio: $aratu_user"
-    log_fail "Call audio_prepare_debian_audio_environment before running user commands"
+    log_fail "Desktop Audio test user is not a member of audio: $aratu_user"
+    log_fail "Call audio_prepare_desktop_audio_environment before running user commands"
     return 1
   fi
 
@@ -5552,7 +6246,7 @@ audio_run_as_test_user() {
   aratu_uid="$(id -u "$aratu_user" 2>/dev/null || true)"
 
   if [ -z "$aratu_uid" ]; then
-    log_fail "Unable to resolve uid for Debian Audio test user: $aratu_user"
+    log_fail "Unable to resolve uid for Audio test user: $aratu_user"
     return 1
   fi
 
@@ -5587,15 +6281,20 @@ audio_run_as_test_user() {
   [ -n "$aratu_home" ] || aratu_home="/home/$aratu_user"
   [ -n "$aratu_shell" ] || aratu_shell="/bin/sh"
 
-  aratu_runtime_dir="$(
-    printf '%s\n' \
-      "${AUDIO_TEST_RUNTIME_DIR:-/run/user/$aratu_uid}"
-  )"
+  if [ "$aratu_desktop_session_mode" -eq 1 ]; then
+    aratu_runtime_dir="/run/user/$aratu_uid"
+    aratu_bus_address="unix:path=$aratu_runtime_dir/bus"
+  else
+    aratu_runtime_dir="$(
+      printf '%s\n' \
+        "${AUDIO_TEST_RUNTIME_DIR:-/run/user/$aratu_uid}"
+    )"
 
-  aratu_bus_address="$(
-    printf '%s\n' \
-      "${AUDIO_TEST_DBUS_ADDRESS:-unix:path=$aratu_runtime_dir/bus}"
-  )"
+    aratu_bus_address="$(
+      printf '%s\n' \
+        "${AUDIO_TEST_DBUS_ADDRESS:-unix:path=$aratu_runtime_dir/bus}"
+    )"
+  fi
 
   ###########################################################################
   # Optional user-session validation
@@ -5603,18 +6302,18 @@ audio_run_as_test_user() {
 
   if [ "$aratu_require_session" -eq 1 ]; then
     if [ ! -d "$aratu_runtime_dir" ]; then
-      log_fail "Debian Audio user runtime directory is unavailable: $aratu_runtime_dir"
+      log_fail "Desktop Audio user runtime directory is unavailable: $aratu_runtime_dir"
       return 1
     fi
 
     if [ ! -S "$aratu_runtime_dir/bus" ]; then
-      log_fail "Debian Audio user D-Bus socket is unavailable: $aratu_runtime_dir/bus"
+      log_fail "Desktop Audio user D-Bus socket is unavailable: $aratu_runtime_dir/bus"
       return 1
     fi
   fi
 
   ###########################################################################
-  # Execute only the requested command as the Debian Audio user
+  # Execute only the requested command as the desktop Audio user
   ###########################################################################
 
   case "${VERBOSE:-0}" in
@@ -5645,7 +6344,7 @@ audio_run_as_test_user() {
   return $?
 }
 
-# Execute one existing audio_common.sh helper as the Debian Audio user.
+# Execute one existing audio_common.sh helper as the desktop Audio user.
 #
 # This preserves helper/library reuse while keeping the main test runner as the
 # root orchestrator. On native/Yocto systems, the already-sourced helper is
@@ -5694,7 +6393,14 @@ audio_run_helper_as_test_user() {
   [ -n "$arhatu_os_id" ] || arhatu_os_id="unknown"
 
   case "$arhatu_os_id" in
-    debian)
+    debian|centos)
+      ;;
+    ubuntu)
+      if [ "${AUDIO_USE_DESKTOP_SESSION:-0}" -ne 1 ] ||
+         [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        "$arhatu_helper" "$@"
+        return $?
+      fi
       ;;
     *)
       "$arhatu_helper" "$@"
@@ -5760,7 +6466,7 @@ audio_run_helper_as_test_user() {
   return $?
 }
 
-# Execute one command through audio_exec_with_timeout as the Debian Audio user.
+# Execute one command through audio_exec_with_timeout as the desktop Audio user.
 # Root opens any surrounding redirection before this helper is called, so test
 # logs and result files remain root-owned.
 #
@@ -5807,13 +6513,13 @@ audio_run_with_timeout_as_test_user() {
 # audio_run_with_timeout_as_test_user().
 #
 # These helpers are intentionally shared because they implement backend recovery,
-# Debian-user capture workspace handling, mixer collection, and ALSA profile
+# desktop-user capture workspace handling, mixer collection, and ALSA profile
 # propagation. They do not parse AudioRecord CLI options or emit final results.
 
 audio_record_restart_backend_best_effort() {
   arbbe_backend="$1"
 
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -ne 1 ]; then
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -ne 1 ]; then
     audio_restart_services_best_effort
     return $?
   fi
@@ -5833,10 +6539,10 @@ audio_record_restart_backend_best_effort() {
   esac
 }
 
-# On Debian, manual daemon bootstrap is replaced by one user-service recovery
+# On desktop user-mode systems, manual daemon bootstrap is replaced by one user-service recovery
 # attempt. Native and minimal Yocto images retain their existing bootstrap path.
 audio_record_bootstrap_backend_if_needed() {
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -ne 1 ]; then
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -ne 1 ]; then
     audio_bootstrap_backend_if_needed
     return $?
   fi
@@ -5856,10 +6562,10 @@ audio_record_bootstrap_backend_if_needed() {
   esac
 }
 
-# Record whether a recovered backend is managed by the Debian user manager or
+# Record whether a recovered backend is managed by the desktop user manager or
 # by the native/minimal-image bootstrap path.
 audio_record_set_recovered_backend_management() {
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -eq 1 ]; then
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -eq 1 ]; then
     AUDIO_SYSTEMD_MANAGED=1
   else
     AUDIO_SYSTEMD_MANAGED=0
@@ -5868,13 +6574,13 @@ audio_record_set_recovered_backend_management() {
   export AUDIO_SYSTEMD_MANAGED
 }
 
-# Resolve the root-owned final WAV and the Debian-user scratch WAV for one case.
+# Resolve the root-owned final WAV and the desktop-user scratch WAV for one case.
 audio_record_set_capture_paths() {
   arcsp_case_name="$1"
 
   record_out="$LOGDIR/${arcsp_case_name}.wav"
 
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -eq 1 ]; then
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -eq 1 ]; then
     record_user_out="$AUDIO_RECORD_USER_CAPTURE_DIR/${arcsp_case_name}.wav"
   else
     record_user_out="$record_out"
@@ -5891,7 +6597,7 @@ audio_record_capture_size() {
   file_size_bytes "$record_user_out" 2>/dev/null || echo 0
 }
 
-# Move the Debian-user scratch WAV into the root-owned final results directory.
+# Move the desktop-user scratch WAV into the root-owned final results directory.
 # When no scratch file was produced, create an empty final file so the existing
 # WAV validator can report the backend failure consistently.
 audio_record_promote_capture_output() {
@@ -5930,7 +6636,7 @@ audio_record_promote_capture_output() {
 audio_record_dump_mixers() {
   ardm_out="$1"
 
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -ne 1 ]; then
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -ne 1 ]; then
     dump_mixers "$ardm_out"
     return $?
   fi
@@ -5973,8 +6679,10 @@ audio_record_dump_mixers() {
 # Run one capture probe in the correct user context and copy its profile into
 # the root orchestrator.
 audio_record_probe_alsa_capture_profile_once() {
-  if [ "${AUDIO_RECORD_DEBIAN_ROOT_MODE:-0}" -ne 1 ]; then
-    audio_probe_alsa_capture_profile
+  arpacpo_requested_device="${1:-}"
+
+  if [ "${AUDIO_RECORD_DESKTOP_ROOT_MODE:-0}" -ne 1 ]; then
+    audio_probe_alsa_capture_profile "$arpacpo_requested_device"
     return $?
   fi
 
@@ -5986,7 +6694,7 @@ audio_record_probe_alsa_capture_profile_once() {
         . "$TOOLS/functestlib.sh"
         . "$TOOLS/audio_common.sh"
 
-        audio_probe_alsa_capture_profile >/dev/null 2>&1
+        audio_probe_alsa_capture_profile "$1" >/dev/null 2>&1
         probe_rc=$?
 
         printf "%s\n" \
@@ -5997,7 +6705,9 @@ audio_record_probe_alsa_capture_profile_once() {
           "${AUDIO_ALSA_CAPTURE_REASON:-}"
 
         exit "$probe_rc"
-      '
+      ' \
+      sh \
+      "$arpacpo_requested_device"
   )"
   arpacp_rc=$?
 
@@ -6034,7 +6744,9 @@ audio_record_probe_alsa_capture_profile_once() {
 # Retry capture discovery after a narrowly guarded audio-DSP startup. Recovery
 # is attempted once and only when ALSA exposes no capture PCM at all.
 audio_record_probe_alsa_capture_profile() {
-  if audio_record_probe_alsa_capture_profile_once; then
+  arpacp_requested_device="${1:-}"
+
+  if audio_record_probe_alsa_capture_profile_once "$arpacp_requested_device"; then
     return 0
   fi
 
@@ -6066,7 +6778,7 @@ audio_record_probe_alsa_capture_profile() {
     arpacp_wait=$((arpacp_wait + 1))
   done
 
-  if audio_record_probe_alsa_capture_profile_once; then
+  if audio_record_probe_alsa_capture_profile_once "$arpacp_requested_device"; then
     return 0
   fi
 
@@ -6079,8 +6791,8 @@ audio_record_probe_alsa_capture_profile() {
   return 1
 }
 
-# Prepare the Debian Audio test user and re-execute the current test as that
-# user.
+# Prepare the Debian or CentOS Audio test user and re-execute the current test
+# as that user.
 #
 # Package preparation must complete successfully before calling this function.
 # This helper does not install packages.
@@ -6094,7 +6806,7 @@ audio_record_probe_alsa_capture_profile() {
 # $5... - original run.sh arguments
 #
 # Platform behavior:
-# Debian:
+# Debian and CentOS:
 # - initial process must run as root
 # - ensures AUDIO_TEST_USER belongs to the audio group
 # - prepares test-owned result/output paths
@@ -6106,7 +6818,8 @@ audio_record_probe_alsa_capture_profile() {
 #
 # Environment:
 # AUDIO_TEST_USER
-# Debian test user; default: debian
+# Desktop Audio test user. Debian defaults to `debian`; CentOS discovers the
+# active regular user dynamically.
 #
 # AUDIO_TEST_USER_REEXEC
 # Internal recursion guard.
@@ -6118,13 +6831,13 @@ audio_record_probe_alsa_capture_profile() {
 # Selects systemctl --user for PipeWire service operations.
 #
 # Returns:
-# 0 - not applicable or already executing as the prepared Debian user
+# 0 - not applicable or already executing as the prepared desktop Audio user
 # 1 - user, output-path, or user-manager preparation failed
 #
 # A successful root-to-user transition uses exec and therefore does not return.
-audio_prepare_debian_audio_test_user() {
+audio_prepare_desktop_audio_test_user() {
   if [ "$#" -lt 4 ]; then
-    log_fail "audio_prepare_debian_audio_test_user requires runner, result file, log directory, and user-manager mode"
+    log_fail "audio_prepare_desktop_audio_test_user requires runner, result file, log directory, and user-manager mode"
     return 1
   fi
 
@@ -6156,14 +6869,14 @@ audio_prepare_debian_audio_test_user() {
   [ -n "$apdatu_os_id" ] || apdatu_os_id="unknown"
 
   case "$apdatu_os_id" in
-    debian)
+    debian|centos)
       ;;
     qcom-distro|poky|openembedded|oe)
       # Preserve all native-image execution behavior.
       return 0
       ;;
     *)
-      # User switching is intentionally limited to verified Debian images.
+      # Preserve existing execution on Ubuntu and native/minimal images.
       return 0
       ;;
   esac
@@ -6177,12 +6890,21 @@ audio_prepare_debian_audio_test_user() {
       ;;
   esac
 
-  apdatu_user="${AUDIO_TEST_USER:-debian}"
+  case "$apdatu_os_id" in
+    debian)
+      apdatu_default_user="debian"
+      ;;
+    centos)
+      apdatu_default_user="$(audio_find_regular_session_user 2>/dev/null || true)"
+      ;;
+  esac
+
+  apdatu_user="${AUDIO_TEST_USER:-$apdatu_default_user}"
   apdatu_current_uid="$(id -u 2>/dev/null || echo 1)"
   apdatu_current_user="$(id -un 2>/dev/null || echo unknown)"
 
   ###########################################################################
-  # Re-executed Debian child
+  # Re-executed desktop Audio child
   ###########################################################################
 
   if [ "${AUDIO_TEST_USER_REEXEC:-0}" -eq 1 ]; then
@@ -6194,14 +6916,14 @@ audio_prepare_debian_audio_test_user() {
     if ! id -nG "$apdatu_user" 2>/dev/null |
         tr ' ' '\n' |
         grep -qx audio; then
-      log_fail "Debian Audio test user is not a member of audio: $apdatu_user"
+      log_fail "Desktop Audio test user is not a member of audio: $apdatu_user"
       return 1
     fi
 
     apdatu_uid="$(id -u "$apdatu_user" 2>/dev/null || true)"
 
     if [ -z "$apdatu_uid" ]; then
-      log_fail "Unable to resolve uid for Debian Audio test user: $apdatu_user"
+      log_fail "Unable to resolve uid for desktop Audio test user: $apdatu_user"
       return 1
     fi
 
@@ -6217,26 +6939,26 @@ audio_prepare_debian_audio_test_user() {
 
     if [ "$apdatu_need_user_manager" -eq 1 ]; then
       if [ ! -d "$XDG_RUNTIME_DIR" ]; then
-        log_fail "Debian user runtime directory is missing: $XDG_RUNTIME_DIR"
+        log_fail "Desktop user runtime directory is missing: $XDG_RUNTIME_DIR"
         return 1
       fi
 
       if [ ! -S "$XDG_RUNTIME_DIR/bus" ]; then
-        log_fail "Debian user D-Bus is unavailable: $XDG_RUNTIME_DIR/bus"
+        log_fail "Desktop user D-Bus is unavailable: $XDG_RUNTIME_DIR/bus"
         return 1
       fi
     fi
 
-    log_pass "Audio test is running as Debian user: user=$apdatu_user uid=$apdatu_uid"
+    log_pass "Audio test is running as desktop user: os=$apdatu_os_id user=$apdatu_user uid=$apdatu_uid"
     return 0
   fi
 
   ###########################################################################
-  # Initial Debian process must be root
+  # Initial desktop-distribution process must be root
   ###########################################################################
 
   if [ "$apdatu_current_uid" -ne 0 ]; then
-    log_fail "Debian Audio tests must initially run as root"
+    log_fail "Desktop Audio tests must initially run as root, os=$apdatu_os_id"
     log_fail "Package preparation and Audio user setup require root privileges"
     return 1
   fi
@@ -6252,17 +6974,22 @@ audio_prepare_debian_audio_test_user() {
   fi
 
   if ! id "$apdatu_user" >/dev/null 2>&1; then
-    log_fail "Debian Audio test user does not exist: $apdatu_user"
+    log_fail "Desktop Audio test user does not exist: $apdatu_user"
+    return 1
+  fi
+
+  if ! audio_user_is_regular "$apdatu_user"; then
+    log_fail "Desktop Audio test user is not a regular login account: $apdatu_user"
     return 1
   fi
 
   if command -v getent >/dev/null 2>&1; then
     if ! getent group audio >/dev/null 2>&1; then
-      log_fail "Required Debian group does not exist: audio"
+      log_fail "Required desktop Audio group does not exist: audio"
       return 1
     fi
   elif ! grep -q '^audio:' /etc/group 2>/dev/null; then
-    log_fail "Required Debian group does not exist: audio"
+    log_fail "Required desktop Audio group does not exist: audio"
     return 1
   fi
 
@@ -6282,7 +7009,7 @@ audio_prepare_debian_audio_test_user() {
       return 1
     fi
 
-    log_info "Adding Debian Audio test user to audio group: $apdatu_user"
+    log_info "Adding desktop Audio test user to audio group: $apdatu_user"
 
     if ! usermod -aG audio "$apdatu_user"; then
       log_fail "Failed to add $apdatu_user to the audio group"
@@ -6304,7 +7031,7 @@ audio_prepare_debian_audio_test_user() {
   apdatu_uid="$(id -u "$apdatu_user" 2>/dev/null || true)"
 
   if [ -z "$apdatu_uid" ]; then
-    log_fail "Unable to resolve uid for Debian Audio test user: $apdatu_user"
+    log_fail "Unable to resolve uid for desktop Audio test user: $apdatu_user"
     return 1
   fi
 
@@ -6428,7 +7155,7 @@ audio_prepare_debian_audio_test_user() {
       if [ "$apdatu_group_changed" -eq 1 ]; then
         # The existing user manager was started before the audio-group update.
         # Restart it so PipeWire inherits the new supplementary group.
-        log_info "Restarting Debian user manager after audio-group update: $apdatu_user_unit"
+        log_info "Restarting desktop user manager after audio-group update: $apdatu_user_unit"
 
         if command -v audio_exec_with_timeout >/dev/null 2>&1; then
           audio_exec_with_timeout \
@@ -6441,14 +7168,14 @@ audio_prepare_debian_audio_test_user() {
         fi
 
         if [ "$apdatu_systemctl_rc" -ne 0 ]; then
-          log_fail "Failed to restart Debian user manager: $apdatu_user_unit"
+          log_fail "Failed to restart desktop user manager: $apdatu_user_unit"
           return 1
         fi
       else
-        log_pass "Debian user manager is already active: $apdatu_user_unit"
+        log_pass "Desktop user manager is already active: $apdatu_user_unit"
       fi
     else
-      log_info "Starting Debian user manager: $apdatu_user_unit"
+      log_info "Starting desktop user manager: $apdatu_user_unit"
 
       # Clear a previous failed state before attempting a new start.
       systemctl reset-failed "$apdatu_user_unit" 2>/dev/null || true
@@ -6464,7 +7191,7 @@ audio_prepare_debian_audio_test_user() {
       fi
 
       if [ "$apdatu_systemctl_rc" -ne 0 ]; then
-        log_fail "Failed to start Debian user manager: $apdatu_user_unit"
+        log_fail "Failed to start desktop user manager: $apdatu_user_unit"
 
         systemctl status \
           "$apdatu_user_unit" \
@@ -6490,7 +7217,7 @@ audio_prepare_debian_audio_test_user() {
         ;;
     esac
 
-    log_info "Waiting for Debian user runtime and D-Bus, timeout=${apdatu_wait_timeout}s"
+    log_info "Waiting for desktop user runtime and D-Bus, timeout=${apdatu_wait_timeout}s"
 
     while [ "$apdatu_wait" -lt "$apdatu_wait_timeout" ]; do
       if [ -d "$apdatu_runtime_dir" ] &&
@@ -6503,23 +7230,23 @@ audio_prepare_debian_audio_test_user() {
     done
 
     if [ ! -d "$apdatu_runtime_dir" ]; then
-      log_fail "Debian user runtime directory is unavailable: $apdatu_runtime_dir"
+      log_fail "Desktop user runtime directory is unavailable: $apdatu_runtime_dir"
       return 1
     fi
 
     if [ ! -S "$apdatu_bus_path" ]; then
-      log_fail "Debian user D-Bus is unavailable: $apdatu_bus_path"
+      log_fail "Desktop user D-Bus is unavailable: $apdatu_bus_path"
       return 1
     fi
 
-    log_pass "Debian user runtime is ready: $apdatu_runtime_dir"
+    log_pass "Desktop user runtime is ready: $apdatu_runtime_dir"
   else
     apdatu_runtime_dir="/run/user/$apdatu_uid"
     apdatu_bus_path="$apdatu_runtime_dir/bus"
   fi
 
   ###########################################################################
-  # Re-execute the test as the Debian Audio user
+  # Re-execute the test as the desktop Audio user
   ###########################################################################
 
   if ! command -v runuser >/dev/null 2>&1; then
@@ -6533,6 +7260,16 @@ audio_prepare_debian_audio_test_user() {
   AUDIO_PACKAGE_PREPARED=1
   AUDIO_SYSTEMCTL_USER_SCOPE=1
   AUDIO_TEST_USER_MANAGER_REQUIRED="$apdatu_need_user_manager"
+  TEST_RESULT_FILE_PREPARED=1
+
+  # Keep the stdout/stderr capture opened by the privileged launcher. The
+  # unprivileged child inherits those descriptors and must not create another
+  # suite-directory log. Unlinking the FIFO is safe while both ends remain
+  # open and prevents leaving a stale /tmp entry after exec replaces this shell.
+  apdatu_stdout_active="${__RUN_STDOUT_ACTIVE:-}"
+  if [ -n "$apdatu_stdout_active" ] && [ -n "${PIPE:-}" ]; then
+    rm -f "$PIPE" 2>/dev/null || true
+  fi
 
   export AUDIO_TEST_USER
   export AUDIO_TEST_UID
@@ -6540,6 +7277,7 @@ audio_prepare_debian_audio_test_user() {
   export AUDIO_PACKAGE_PREPARED
   export AUDIO_SYSTEMCTL_USER_SCOPE
   export AUDIO_TEST_USER_MANAGER_REQUIRED
+  export TEST_RESULT_FILE_PREPARED
   
   log_info "Re-executing Audio test as user=$apdatu_user uid=$apdatu_uid"
 
@@ -6566,8 +7304,16 @@ audio_prepare_debian_audio_test_user() {
       AUDIO_TEST_USER_MANAGER_REQUIRED="$apdatu_need_user_manager" \
       AUDIO_OVERLAY_PACKAGES_CHANGED="${AUDIO_OVERLAY_PACKAGES_CHANGED:-0}" \
       AUDIO_OVERLAY_REBOOT_REQUIRED="${AUDIO_OVERLAY_REBOOT_REQUIRED:-0}" \
+      TEST_RESULT_FILE_PREPARED=1 \
+      __RUN_STDOUT_ACTIVE="$apdatu_stdout_active" \
+      LOGDIR="$apdatu_log_dir" \
       "$apdatu_script" \
       "$@"
+}
+
+# Compatibility wrapper for callers using the original Debian-specific name.
+audio_prepare_debian_audio_test_user() {
+  audio_prepare_desktop_audio_test_user "$@"
 }
 
 # Minimal WAV fallback for images without Python. It validates RIFF/WAVE/fmt/data,
@@ -6579,10 +7325,14 @@ audio_validate_recorded_wav_od() {
   avrwo_rate="$3"
   avrwo_channels="$4"
   avrwo_expected_seconds="$5"
+  avrwo_expected_bits="${6:-0}"
+  avrwo_scope="${7:-record}"
   avrwo_analyze_bytes="${AUDIO_RECORD_ANALYZE_BYTES:-4194304}"
   avrwo_min_active="${AUDIO_RECORD_MIN_ACTIVE_SAMPLES:-100}"
   avrwo_min_distinct="${AUDIO_RECORD_MIN_DISTINCT_SAMPLES:-4}"
   avrwo_threshold_lsb="${AUDIO_RECORD_SAMPLE_THRESHOLD_LSB:-${AUDIO_RECORD_SAMPLE_THRESHOLD:-8}}"
+  avrwo_strict_signal="${AUDIO_RECORD_STRICT_SIGNAL:-0}"
+  avrwo_min_rms_dbfs="${AUDIO_RECORD_MIN_RMS_DBFS:--60}"
 
   command -v od >/dev/null 2>&1 || return 1
   command -v dd >/dev/null 2>&1 || return 1
@@ -6677,8 +7427,18 @@ EOF
       ;;
   esac
 
-  [ "$avrwo_actual_rate" = "$avrwo_rate" ] || return 1
-  [ "$avrwo_actual_channels" = "$avrwo_channels" ] || return 1
+  if [ "$avrwo_rate" -gt 0 ] 2>/dev/null &&
+     [ "$avrwo_actual_rate" != "$avrwo_rate" ]; then
+    return 1
+  fi
+  if [ "$avrwo_channels" -gt 0 ] 2>/dev/null &&
+     [ "$avrwo_actual_channels" != "$avrwo_channels" ]; then
+    return 1
+  fi
+  if [ "$avrwo_expected_bits" -gt 0 ] 2>/dev/null &&
+     [ "$avrwo_bits" != "$avrwo_expected_bits" ]; then
+    return 1
+  fi
   [ "$avrwo_byte_rate" -gt 0 ] 2>/dev/null || return 1
   [ "$avrwo_block_align" -gt 0 ] 2>/dev/null || return 1
   [ $((avrwo_block_align % avrwo_actual_channels)) -eq 0 ] 2>/dev/null || return 1
@@ -6713,8 +7473,10 @@ EOF
   fi
 
   if [ "$avrwo_source_kind" = "null" ]; then
-    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=PASS reason=valid-null-source-recording validator=od payload_bytes=$avrwo_usable"
-    export AUDIO_WAV_VALIDATION_SUMMARY
+    avrwo_fields="status=PASS reason=valid-null-source-recording validator=od payload_bytes=$avrwo_usable"
+    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION $avrwo_fields"
+    AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrwo_scope policy=basic-integrity $avrwo_fields"
+    export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
     return 0
   fi
 
@@ -6737,7 +7499,11 @@ EOF
       -v bits="$avrwo_bits" \
       -v min_active="$avrwo_min_active" \
       -v min_distinct="$avrwo_min_distinct" \
-      -v threshold_lsb="$avrwo_threshold_lsb" '
+      -v threshold_lsb="$avrwo_threshold_lsb" \
+      -v strict_signal="$avrwo_strict_signal" \
+      -v min_rms_dbfs="$avrwo_min_rms_dbfs" \
+      -v channels="$avrwo_actual_channels" \
+      -v rate="$avrwo_actual_rate" '
     function abs_value(value) {
       return value < 0 ? -value : value
     }
@@ -6749,14 +7515,37 @@ EOF
     function consume_sample(raw, sign_limit, full_range, threshold, key) {
       sign_limit = power2(bits - 1)
       full_range = power2(bits)
-      if (raw >= sign_limit) raw -= full_range
+      if (bits == 8) {
+        raw -= 128
+      } else if (raw >= sign_limit) {
+        raw -= full_range
+      }
 
       samples++
       if (raw != 0) nonzero_samples++
 
+      normalized = raw / sign_limit
+      sum_values += normalized
+      sum_squares += normalized * normalized
+      if (abs_value(normalized) >= 0.999) clipped_samples++
+
       threshold = (threshold_lsb / 32768.0) * sign_limit
       if (threshold < 0) threshold = 0
-      if (abs_value(raw) > threshold) active_samples++
+      channel = ((samples - 1) % channels) + 1
+      if (abs_value(raw) > threshold) {
+        active_samples++
+        channel_active[channel]++
+        if (silence_samples >= minimum_silence_samples) silence_runs++
+        if (silence_samples > longest_silence_samples) longest_silence_samples = silence_samples
+        silence_samples = 0
+      } else {
+        silence_samples++
+      }
+
+      if (channel in previous && abs_value(normalized - previous[channel]) >= 0.8) {
+        glitch_candidates++
+      }
+      previous[channel] = normalized
 
       if (distinct_samples < 256) {
         key = sprintf("%.0f", raw)
@@ -6768,9 +7557,12 @@ EOF
     }
     BEGIN {
       bytes_per_sample = bits / 8
+      minimum_silence_samples = int(rate * channels * 0.05)
+      if (minimum_silence_samples < 1) minimum_silence_samples = 1
     }
     {
       for (i = 1; i <= NF; i++) {
+        if ($i != 0) payload_nonzero_bytes++
         sample_bytes[++sample_index] = $i
         if (sample_index == bytes_per_sample) {
           raw = 0
@@ -6786,41 +7578,74 @@ EOF
       }
     }
     END {
-      printf "%d|%d|%d|%d\n", samples, nonzero_samples, active_samples, distinct_samples
-      if (samples <= 0 || nonzero_samples <= 0 || active_samples < min_active || distinct_samples < min_distinct) {
+      rms = samples > 0 ? sqrt(sum_squares / samples) : 0
+      rms_dbfs = rms > 0 ? 20 * log(rms) / log(10) : -999
+      dc_offset = samples > 0 ? sum_values / samples : 0
+      if (silence_samples >= minimum_silence_samples) silence_runs++
+      if (silence_samples > longest_silence_samples) longest_silence_samples = silence_samples
+      silent_channels = 0
+      for (channel = 1; channel <= channels; channel++) {
+        if (channel_active[channel] == 0) silent_channels++
+      }
+      longest_silence_ms = rate > 0 && channels > 0 ? (1000 * longest_silence_samples / (rate * channels)) : 0
+      printf "%d|%d|%d|%d|%d|%.2f|%.8f|%d|%d|%.2f|%d|%d\n", samples, payload_nonzero_bytes, nonzero_samples, active_samples, distinct_samples, rms_dbfs, dc_offset, clipped_samples, silence_runs, longest_silence_ms, glitch_candidates, silent_channels
+      if (samples <= 0 || payload_nonzero_bytes <= 0 || nonzero_samples <= 0) {
         exit 1
       }
+      if (strict_signal == 1 && rms_dbfs < min_rms_dbfs) exit 1
     }
-  ')" || return 1
+  ')"
+  avrwo_stats_rc=$?
 
   IFS='|' read -r \
     avrwo_samples \
+    avrwo_nonzero_storage_bytes \
     avrwo_nonzero_samples \
     avrwo_active_samples \
-    avrwo_distinct_samples <<EOF
+    avrwo_distinct_samples \
+    avrwo_rms_dbfs \
+    avrwo_dc_offset \
+    avrwo_clipped_samples \
+    avrwo_silence_runs \
+    avrwo_longest_silence_ms \
+    avrwo_glitch_candidates \
+    avrwo_silent_channels <<EOF
 $avrwo_stats
 EOF
 
-  AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=PASS reason=pcm-signal-activity-present validator=od analyzed_samples=$avrwo_samples nonzero_samples=$avrwo_nonzero_samples active_samples=$avrwo_active_samples distinct_samples=$avrwo_distinct_samples"
-  export AUDIO_WAV_VALIDATION_SUMMARY
+  if [ "$avrwo_stats_rc" -ne 0 ]; then
+    avrwo_fields="status=FAIL reason=pcm-signal-validation-failed validator=od analyzed_samples=${avrwo_samples:-0} nonzero_storage_bytes=${avrwo_nonzero_storage_bytes:-0} nonzero_samples=${avrwo_nonzero_samples:-0} active_samples=${avrwo_active_samples:-0} distinct_samples=${avrwo_distinct_samples:-0} rms_dbfs=${avrwo_rms_dbfs:--999} dc_offset=${avrwo_dc_offset:-0} clipped_samples=${avrwo_clipped_samples:-0} silence_runs=${avrwo_silence_runs:-0} longest_silence_ms=${avrwo_longest_silence_ms:-0} glitch_candidates=${avrwo_glitch_candidates:-0} silent_channels=${avrwo_silent_channels:-0} strict_signal=$avrwo_strict_signal min_rms_dbfs=$avrwo_min_rms_dbfs"
+    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION $avrwo_fields"
+    AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrwo_scope policy=basic-integrity $avrwo_fields"
+    export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
+    return 1
+  fi
+
+  avrwo_fields="status=PASS reason=pcm-signal-activity-present validator=od analyzed_samples=$avrwo_samples nonzero_storage_bytes=$avrwo_nonzero_storage_bytes nonzero_samples=$avrwo_nonzero_samples active_samples=$avrwo_active_samples distinct_samples=$avrwo_distinct_samples rms_dbfs=$avrwo_rms_dbfs dc_offset=$avrwo_dc_offset clipped_samples=$avrwo_clipped_samples silence_runs=$avrwo_silence_runs longest_silence_ms=$avrwo_longest_silence_ms glitch_candidates=$avrwo_glitch_candidates silent_channels=$avrwo_silent_channels strict_signal=$avrwo_strict_signal min_rms_dbfs=$avrwo_min_rms_dbfs"
+  AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION $avrwo_fields"
+  AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrwo_scope policy=basic-integrity $avrwo_fields"
+  export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
   return 0
 }
 
-# Validate one recorded WAV using the repository Python validator when possible,
-# with an od/dd fallback for smaller embedded images.
-# Args: file, source-kind, expected-rate, expected-channels, expected-seconds,
-#       optional log file.
-audio_validate_recorded_wav() {
+# audio_validate_wav_file <file> <source-kind> <rate> <channels> <bits>
+#                         <seconds> <log-file> <scope>
+# Validate WAV structure and basic signal integrity. Advanced signal metrics
+# remain diagnostic unless strict-signal mode is explicitly enabled.
+audio_validate_wav_file() {
   avrw_file="$1"
   avrw_source_kind="${2:-mic}"
   avrw_rate="${3:-0}"
   avrw_channels="${4:-0}"
-  avrw_expected_seconds="${5:-0}"
-  avrw_log="${6:-}"
+  avrw_bits="${5:-0}"
+  avrw_expected_seconds="${6:-0}"
+  avrw_log="${7:-}"
+  avrw_scope="${8:-record}"
   avrw_validator="${AUDIO_WAV_VALIDATOR:-${TOOLS:-}/audio_wav_validate.py}"
 
   AUDIO_WAV_VALIDATION_SUMMARY=""
-  export AUDIO_WAV_VALIDATION_SUMMARY
+  AUDIO_VALIDATION_SUMMARY=""
+  export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
 
   if command -v python3 >/dev/null 2>&1 && [ -r "$avrw_validator" ]; then
     avrw_output="$(python3 "$avrw_validator" \
@@ -6828,6 +7653,7 @@ audio_validate_recorded_wav() {
       --source-kind "$avrw_source_kind" \
       --expect-rate "$avrw_rate" \
       --expect-channels "$avrw_channels" \
+      --expect-bits "$avrw_bits" \
       --expected-seconds "$avrw_expected_seconds" \
       --analyze-bytes "${AUDIO_RECORD_ANALYZE_BYTES:-4194304}" \
       --min-active-samples "${AUDIO_RECORD_MIN_ACTIVE_SAMPLES:-100}" \
@@ -6836,6 +7662,7 @@ audio_validate_recorded_wav() {
       --min-duration-ratio "${AUDIO_RECORD_MIN_DURATION_RATIO:-0.70}" \
       --strict-signal "${AUDIO_RECORD_STRICT_SIGNAL:-0}" \
       --min-rms-dbfs "${AUDIO_RECORD_MIN_RMS_DBFS:--60}" \
+      --validation-scope "$avrw_scope" \
       2>&1)"
     avrw_rc=$?
 
@@ -6845,8 +7672,23 @@ audio_validate_recorded_wav() {
         [ -n "$avrw_line" ] && log_info "$avrw_line"
       done
 
-    AUDIO_WAV_VALIDATION_SUMMARY="$(printf '%s\n' "$avrw_output" | tail -n 1)"
-    export AUDIO_WAV_VALIDATION_SUMMARY
+    AUDIO_WAV_VALIDATION_SUMMARY="$(
+      printf '%s\n' "$avrw_output" |
+        sed -n '/^AUDIO_WAV_VALIDATION /p' |
+        tail -n 1
+    )"
+    AUDIO_VALIDATION_SUMMARY="$(
+      printf '%s\n' "$avrw_output" |
+        sed -n '/^AUDIO_VALIDATION /p' |
+        tail -n 1
+    )"
+    if [ -z "$AUDIO_WAV_VALIDATION_SUMMARY" ]; then
+      AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=ERROR reason=validator-output-missing"
+    fi
+    if [ -z "$AUDIO_VALIDATION_SUMMARY" ]; then
+      AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrw_scope policy=basic-integrity status=FAIL reason=validator-output-missing"
+    fi
+    export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
     [ "$avrw_rc" -eq 0 ]
     return $?
   fi
@@ -6857,17 +7699,119 @@ audio_validate_recorded_wav() {
       "$avrw_source_kind" \
       "$avrw_rate" \
       "$avrw_channels" \
-      "$avrw_expected_seconds"; then
-    [ -n "$avrw_log" ] && printf '%s\n' "$AUDIO_WAV_VALIDATION_SUMMARY" >>"$avrw_log"
+      "$avrw_expected_seconds" \
+      "$avrw_bits" \
+      "$avrw_scope"; then
+    if [ -n "$avrw_log" ]; then
+      printf '%s\n%s\n' \
+        "$AUDIO_WAV_VALIDATION_SUMMARY" \
+        "$AUDIO_VALIDATION_SUMMARY" >>"$avrw_log"
+    fi
     log_info "$AUDIO_WAV_VALIDATION_SUMMARY"
+    log_info "$AUDIO_VALIDATION_SUMMARY"
     return 0
   fi
 
-  AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=od-fallback-validation-failed"
-  export AUDIO_WAV_VALIDATION_SUMMARY
-  [ -n "$avrw_log" ] && printf '%s\n' "$AUDIO_WAV_VALIDATION_SUMMARY" >>"$avrw_log"
+  if [ -z "$AUDIO_WAV_VALIDATION_SUMMARY" ]; then
+    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=od-fallback-validation-failed"
+  fi
+  if [ -z "$AUDIO_VALIDATION_SUMMARY" ]; then
+    AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrw_scope policy=basic-integrity status=FAIL reason=od-fallback-validation-failed"
+  fi
+  export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
+  if [ -n "$avrw_log" ]; then
+    printf '%s\n%s\n' \
+      "$AUDIO_WAV_VALIDATION_SUMMARY" \
+      "$AUDIO_VALIDATION_SUMMARY" >>"$avrw_log"
+  fi
   log_fail "$AUDIO_WAV_VALIDATION_SUMMARY"
+  log_fail "$AUDIO_VALIDATION_SUMMARY"
   return 1
+}
+
+# audio_validate_recorded_wav <file> [source-kind] [rate] [channels]
+#                             [seconds] [log-file] [scope]
+# Validate one recorded WAV using the shared basic-integrity policy. The
+# validation scope defaults to record and is preserved in emitted evidence.
+audio_validate_recorded_wav() {
+  audio_validate_wav_file \
+    "$1" \
+    "${2:-mic}" \
+    "${3:-0}" \
+    "${4:-0}" \
+    0 \
+    "${5:-0}" \
+    "${6:-}" \
+    "${7:-record}"
+}
+
+# audio_validate_playback_wav <file> [log-file]
+# Validate a playback asset and emit AUDIO_VALIDATION scope=playback evidence.
+audio_validate_playback_wav() {
+  avpw_file="$1"
+  avpw_log="${2:-}"
+  avpw_name="$(basename "$avpw_file")"
+  avpw_rate=0
+  avpw_channels=0
+  avpw_bits=0
+  avpw_seconds="$(extract_clip_duration "$avpw_name" 2>/dev/null || echo 0)"
+  avpw_metadata="$(parse_clip_metadata "$avpw_name" 2>/dev/null || true)"
+
+  if [ -n "$avpw_metadata" ]; then
+    # shellcheck disable=SC2086 # Intentional parsing of helper key=value output.
+    set -- $avpw_metadata
+    avpw_rate_label="${1#rate=}"
+    avpw_bits="${2#bits=}"
+    avpw_channels="${3#channels=}"
+    avpw_bits="${avpw_bits%b}"
+    avpw_channels="${avpw_channels%ch}"
+
+    case "$avpw_rate_label" in
+      8KHz) avpw_rate=8000 ;;
+      16KHz) avpw_rate=16000 ;;
+      22.05KHz) avpw_rate=22050 ;;
+      24KHz) avpw_rate=24000 ;;
+      32KHz) avpw_rate=32000 ;;
+      44.1KHz) avpw_rate=44100 ;;
+      48KHz) avpw_rate=48000 ;;
+      88.2KHz) avpw_rate=88200 ;;
+      96KHz) avpw_rate=96000 ;;
+      176.4KHz) avpw_rate=176400 ;;
+      192KHz) avpw_rate=192000 ;;
+      352.8KHz) avpw_rate=352800 ;;
+      384KHz) avpw_rate=384000 ;;
+      *) avpw_rate=0 ;;
+    esac
+  fi
+
+  avpw_had_strict=0
+  avpw_saved_strict=""
+  if [ "${AUDIO_RECORD_STRICT_SIGNAL+x}" = x ]; then
+    avpw_had_strict=1
+    avpw_saved_strict="$AUDIO_RECORD_STRICT_SIGNAL"
+  fi
+  AUDIO_RECORD_STRICT_SIGNAL=0
+  export AUDIO_RECORD_STRICT_SIGNAL
+
+  audio_validate_wav_file \
+    "$avpw_file" \
+    mic \
+    "$avpw_rate" \
+    "$avpw_channels" \
+    "$avpw_bits" \
+    "$avpw_seconds" \
+    "$avpw_log" \
+    playback
+  avpw_rc=$?
+
+  if [ "$avpw_had_strict" -eq 1 ]; then
+    AUDIO_RECORD_STRICT_SIGNAL="$avpw_saved_strict"
+    export AUDIO_RECORD_STRICT_SIGNAL
+  else
+    unset AUDIO_RECORD_STRICT_SIGNAL
+  fi
+
+  return "$avpw_rc"
 }
 
 # Validate one recorder result using the existing timeout and file-size helpers
@@ -6882,6 +7826,7 @@ audio_validate_recorded_wav() {
 #   $6 recorder return code
 #   $7 watchdog timeout passed to audio_exec_with_timeout
 #   $8 optional log file
+#   $9 validation scope, default: record
 #
 # Return:
 #   0 - recorder status is acceptable and WAV validation passed
@@ -6895,12 +7840,19 @@ audio_validate_recording_result() {
   avrr_rc="${6:-1}"
   avrr_timeout="${7:-0}"
   avrr_log="${8:-}"
+  avrr_scope="${9:-record}"
 
   avrr_bytes="$(file_size_bytes "$avrr_file" 2>/dev/null || echo 0)"
   if [ "${avrr_bytes:-0}" -le 44 ] 2>/dev/null; then
-    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=file-empty-or-header-only file_bytes=${avrr_bytes:-0}"
-    export AUDIO_WAV_VALIDATION_SUMMARY
-    [ -n "$avrr_log" ] && printf '%s\n' "$AUDIO_WAV_VALIDATION_SUMMARY" >>"$avrr_log"
+    avrr_fields="status=FAIL reason=file-empty-or-header-only file_bytes=${avrr_bytes:-0}"
+    AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION $avrr_fields"
+    AUDIO_VALIDATION_SUMMARY="AUDIO_VALIDATION scope=$avrr_scope policy=basic-integrity $avrr_fields"
+    export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
+    if [ -n "$avrr_log" ]; then
+      printf '%s\n%s\n' \
+        "$AUDIO_WAV_VALIDATION_SUMMARY" \
+        "$AUDIO_VALIDATION_SUMMARY" >>"$avrr_log"
+    fi
     return 1
   fi
 
@@ -6913,7 +7865,8 @@ audio_validate_recording_result() {
       "$avrr_rate" \
       "$avrr_channels" \
       "$avrr_expected_seconds" \
-      "$avrr_log"; then
+      "$avrr_log" \
+      "$avrr_scope"; then
     return 1
   fi
 
@@ -6924,14 +7877,16 @@ audio_validate_recording_result() {
       avrr_timeout_seconds="$(audio_parse_secs "$avrr_timeout" 2>/dev/null || echo 0)"
       if [ -z "$avrr_timeout_seconds" ] || [ "$avrr_timeout_seconds" -le 0 ] 2>/dev/null; then
         AUDIO_WAV_VALIDATION_SUMMARY="${AUDIO_WAV_VALIDATION_SUMMARY} recorder_rc=$avrr_rc recorder_status=unexpected-timeout"
-        export AUDIO_WAV_VALIDATION_SUMMARY
+        AUDIO_VALIDATION_SUMMARY="${AUDIO_VALIDATION_SUMMARY} recorder_rc=$avrr_rc recorder_status=unexpected-timeout"
+        export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
         return 1
       fi
-      log_warn "Recorder ended through expected watchdog timeout rc=$avrr_rc, validated WAV payload is accepted"
+      log_info "Recorder ended through expected watchdog timeout rc=$avrr_rc, validated WAV payload is accepted"
       ;;
     *)
       AUDIO_WAV_VALIDATION_SUMMARY="${AUDIO_WAV_VALIDATION_SUMMARY} recorder_rc=$avrr_rc recorder_status=failed"
-      export AUDIO_WAV_VALIDATION_SUMMARY
+      AUDIO_VALIDATION_SUMMARY="${AUDIO_VALIDATION_SUMMARY} recorder_rc=$avrr_rc recorder_status=failed"
+      export AUDIO_WAV_VALIDATION_SUMMARY AUDIO_VALIDATION_SUMMARY
       return 1
       ;;
   esac

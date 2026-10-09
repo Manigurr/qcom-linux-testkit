@@ -17,6 +17,92 @@ EGLI_LAST_GL_RENDERER=""
 EGLI_LAST_PIPE_KIND=""
 EGLI_LAST_OUT=""
 
+# display_detect_ubuntu_variant
+# Classify an Ubuntu image as desktop or server from immutable OS metadata,
+# installed desktop meta-packages, and systemd display-target evidence. Output
+# is exactly "desktop" or "server" on stdout. Returns 0.
+display_detect_ubuntu_variant() {
+    display_duv_variant_id="$(
+        sed -n 's/^VARIANT_ID=//p' /etc/os-release 2>/dev/null |
+            sed -n '1p' |
+            sed 's/^"//;s/"$//' |
+            tr '[:upper:]' '[:lower:]'
+    )"
+
+    case "$display_duv_variant_id" in
+        *desktop*)
+            printf '%s\n' "desktop"
+            return 0
+            ;;
+        *server*|minimal|core)
+            printf '%s\n' "server"
+            return 0
+            ;;
+    esac
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        for display_duv_package in \
+            ubuntu-desktop \
+            ubuntu-desktop-minimal \
+            ubuntu-desktop-raspi
+        do
+            if dpkg-query -W -f='${Status}\n' "$display_duv_package" 2>/dev/null |
+                grep -q '^install ok installed$'; then
+                printf '%s\n' "desktop"
+                return 0
+            fi
+        done
+    fi
+
+    if [ -s /etc/X11/default-display-manager ]; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    printf '%s\n' "server"
+    return 0
+}
+
+# display_resolve_graphics_mode <os-id> <requested-mode>
+# Resolve the internal default mode without changing explicit base, overlay, or
+# auto requests. Output is one mode on stdout. Returns 1 for invalid input.
+display_resolve_graphics_mode() {
+    display_rgm_os_id="${1:-unknown}"
+    display_rgm_requested="${2:-default}"
+
+    case "$display_rgm_requested" in
+        base|overlay|auto)
+            printf '%s\n' "$display_rgm_requested"
+            return 0
+            ;;
+        default)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    case "$display_rgm_os_id" in
+        ubuntu)
+            printf '%s\n' "overlay"
+            ;;
+        debian|centos|rhel|fedora)
+            printf '%s\n' "base"
+            ;;
+        *)
+            printf '%s\n' "auto"
+            ;;
+    esac
+
+    return 0
+}
+
 debugfs_is_mounted() {
     awk '$3=="debugfs" && $2=="/sys/kernel/debug" {found=1} END{exit(found?0:1)}' /proc/mounts 2>/dev/null
 }
@@ -654,6 +740,114 @@ discover_wayland_socket_anywhere() {
     done
 
     return 1
+}
+
+# Adopt the live GNOME Wayland session without changing the desktop compositor.
+# The selected socket must be owned by a running gnome-shell user so later
+# clients can be executed with the same uid and runtime directory.
+display_adopt_gnome_wayland_session() {
+    dagws_pid=""
+    dagws_user=""
+    dagws_uid=""
+    dagws_runtime_dir=""
+    dagws_socket=""
+    dagws_socket_uid=""
+    dagws_home=""
+
+    DISPLAY_WAYLAND_SESSION_USER=""
+    DISPLAY_WAYLAND_SESSION_HOME=""
+    DISPLAY_WAYLAND_SESSION_RUNTIME_DIR=""
+    DISPLAY_WAYLAND_SOCKET=""
+    DISPLAY_RUNTIME_MODEL="unknown"
+    export DISPLAY_WAYLAND_SESSION_USER
+    export DISPLAY_WAYLAND_SESSION_HOME
+    export DISPLAY_WAYLAND_SESSION_RUNTIME_DIR
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    command -v pgrep >/dev/null 2>&1 || return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    command -v id >/dev/null 2>&1 || return 1
+
+    for dagws_pid in $(pgrep -x gnome-shell 2>/dev/null); do
+        dagws_user="$(ps -o user= -p "$dagws_pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+        [ -n "$dagws_user" ] || continue
+
+        dagws_uid="$(id -u "$dagws_user" 2>/dev/null || true)"
+        [ -n "$dagws_uid" ] || continue
+
+        dagws_runtime_dir="/run/user/$dagws_uid"
+        [ -d "$dagws_runtime_dir" ] || continue
+
+        for dagws_socket in "$dagws_runtime_dir"/wayland-*; do
+            [ -S "$dagws_socket" ] || continue
+
+            dagws_socket_uid="$(stat -c '%u' "$dagws_socket" 2>/dev/null || true)"
+            [ "$dagws_socket_uid" = "$dagws_uid" ] || continue
+
+            dagws_home="$(getent passwd "$dagws_user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')"
+            [ -n "$dagws_home" ] || dagws_home="/"
+
+            DISPLAY_WAYLAND_SESSION_USER="$dagws_user"
+            DISPLAY_WAYLAND_SESSION_HOME="$dagws_home"
+            DISPLAY_WAYLAND_SESSION_RUNTIME_DIR="$dagws_runtime_dir"
+            DISPLAY_WAYLAND_SOCKET="$dagws_socket"
+            DISPLAY_RUNTIME_MODEL="desktop-gnome-session"
+            export DISPLAY_WAYLAND_SESSION_USER
+            export DISPLAY_WAYLAND_SESSION_HOME
+            export DISPLAY_WAYLAND_SESSION_RUNTIME_DIR
+            export DISPLAY_WAYLAND_SOCKET
+            export DISPLAY_RUNTIME_MODEL
+
+            log_info "Adopted GNOME Wayland session, user=$dagws_user socket=$dagws_socket"
+            return 0
+        done
+    done
+
+    return 1
+}
+
+# Run a command in the user context that owns an adopted GNOME Wayland socket.
+# When no GNOME session was adopted, preserve the caller's existing execution.
+display_run_in_wayland_session() {
+    drws_user="${DISPLAY_WAYLAND_SESSION_USER:-}"
+    drws_home="${DISPLAY_WAYLAND_SESSION_HOME:-/}"
+    drws_runtime_dir="${DISPLAY_WAYLAND_SESSION_RUNTIME_DIR:-}"
+    drws_socket="${DISPLAY_WAYLAND_SOCKET:-}"
+
+    if [ -z "$drws_user" ] ||
+       [ -z "$drws_runtime_dir" ] ||
+       [ -z "$drws_socket" ]; then
+        "$@"
+        return $?
+    fi
+
+    if [ "$(id -un 2>/dev/null || true)" = "$drws_user" ]; then
+        env \
+            HOME="$drws_home" \
+            XDG_RUNTIME_DIR="$drws_runtime_dir" \
+            WAYLAND_DISPLAY="$(basename "$drws_socket")" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$drws_runtime_dir/bus" \
+            "$@"
+        return $?
+    fi
+
+    if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        log_error "Cannot access the adopted GNOME Wayland session as user=$drws_user without root"
+        return 1
+    fi
+
+    if ! command -v runuser >/dev/null 2>&1; then
+        log_error "runuser is unavailable, cannot access the adopted GNOME Wayland session"
+        return 1
+    fi
+
+    runuser -u "$drws_user" -- env \
+        HOME="$drws_home" \
+        XDG_RUNTIME_DIR="$drws_runtime_dir" \
+        WAYLAND_DISPLAY="$(basename "$drws_socket")" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$drws_runtime_dir/bus" \
+        "$@"
 }
 
 adopt_wayland_env_from_socket() {
@@ -2904,11 +3098,30 @@ weston_prepare_runtime() {
     wr_wait_secs="${2:-10}"
     wr_validate_mode="${3:-runtime}"
     wr_allow_relaunch="${4:-0}"
+    wr_os_id="unknown"
+    wr_desktop_os=0
 
     DISPLAY_WAYLAND_SOCKET=""
     DISPLAY_RUNTIME_MODEL="unknown"
     export DISPLAY_WAYLAND_SOCKET
     export DISPLAY_RUNTIME_MODEL
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        wr_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        wr_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    case "$wr_os_id" in
+        debian|ubuntu|centos|rhel|fedora)
+            wr_desktop_os=1
+            ;;
+    esac
 
     if [ -z "${DISPLAY_BUILD_FLAVOUR:-}" ]; then
         display_detect_build_flavour
@@ -3030,11 +3243,32 @@ weston_prepare_runtime() {
         log_warn "Preparing Weston runtime relaunch, cleaning stale systemd state first"
 
         if command -v systemd_service_exists >/dev/null 2>&1 && systemd_service_exists weston.service; then
+            if [ "$wr_os_id" = "centos" ]; then
+                if ! command -v display_prepare_desktop_weston_seat >/dev/null 2>&1 ||
+                   ! display_prepare_desktop_weston_seat; then
+                    log_fail "Weston relaunch attempt failed, desktop seat provider could not be prepared"
+                    return 3
+                fi
+            fi
+
             if ! weston_restart_systemd_runtime "$wr_wait_secs"; then
                 if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
                     weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
                 fi
                 log_fail "Weston relaunch attempt failed, systemd-managed Weston could not be recovered"
+                return 3
+            fi
+        elif [ "$wr_desktop_os" -eq 1 ] &&
+             command -v display_prepare_desktop_weston_runtime >/dev/null 2>&1; then
+            log_info "Relaunch path, starting desktop Weston directly on the selected DRM device"
+
+            if ! display_prepare_desktop_weston_runtime \
+                "$wr_testname" \
+                "$wr_wait_secs"; then
+                if command -v weston_log_runtime_snapshot >/dev/null 2>&1; then
+                    weston_log_runtime_snapshot "${wr_testname}: after-relaunch"
+                fi
+                log_fail "Weston relaunch attempt failed, desktop DRM runtime could not be prepared"
                 return 3
             fi
         elif command -v weston_restore_runtime >/dev/null 2>&1; then
@@ -3223,7 +3457,7 @@ weston_prepare_runtime() {
 #
 # Args:
 #   $1 - package-set name, default: graphics
-#   $2 - Debusine source, default: qli-staging
+#   $2 - Debusine source, default: qli-staging on Debian and none elsewhere
 #   $3 - Debusine suite, default: auto
 #
 # Return:
@@ -3231,8 +3465,9 @@ weston_prepare_runtime() {
 #   1 - package-set recovery failed
 display_ensure_graphics_package_set() {
     graphics_set_name="${1:-graphics}"
-    graphics_source="${2:-qli-staging}"
+    graphics_source="${2:-}"
     graphics_suite="${3:-auto}"
+    graphics_os_id=""
 
     if [ -z "${TOOLS:-}" ] || [ ! -f "$TOOLS/lib_pkg_provider.sh" ]; then
         log_warn "Package provider helper not found; continuing without graphics package recovery"
@@ -3245,6 +3480,23 @@ display_ensure_graphics_package_set() {
     # Load provider config first. Otherwise pkg_provider.conf can overwrite
     # caller-provided/default values such as apt_debusine_source.
     pkg_provider_init || true
+    graphics_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+
+    case "$graphics_os_id" in
+        ubuntu)
+            graphics_source="none"
+            ;;
+        debian)
+            if [ -z "$graphics_source" ]; then
+                graphics_source="qli-staging"
+            fi
+            ;;
+        *)
+            if [ -z "$graphics_source" ]; then
+                graphics_source="none"
+            fi
+            ;;
+    esac
 
     old_graphics_source="${PKG_APT_DEBUSINE_SOURCE:-none}"
     old_graphics_suite="${PKG_APT_DEBUSINE_SUITE:-auto}"
@@ -3271,6 +3523,51 @@ display_ensure_graphics_package_set() {
     pkg_log_info "Graphics package recovery source, source=${PKG_APT_DEBUSINE_SOURCE:-none} suite=${PKG_APT_DEBUSINE_SUITE:-auto} set=${graphics_set_name}"
 
     pkg_ensure_package_set "$graphics_set_name"
+}
+
+# Print the first package in a mapped set that matches an extended regex.
+# Diagnostics are intentionally omitted because callers use command substitution.
+display_package_set_member_matching() {
+    dpsmm_set_name="$1"
+    dpsmm_pattern="$2"
+    dpsmm_packages=""
+
+    if [ -z "$dpsmm_set_name" ] || [ -z "$dpsmm_pattern" ] ||
+       ! command -v pkg_lookup_package_set >/dev/null 2>&1; then
+        return 1
+    fi
+
+    dpsmm_packages="$(pkg_lookup_package_set "$dpsmm_set_name" 2>/dev/null || true)"
+
+    for dpsmm_package in $dpsmm_packages; do
+        if printf '%s\n' "$dpsmm_package" | grep -Eq "$dpsmm_pattern"; then
+            printf '%s\n' "$dpsmm_package"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Print the first installed Qualcomm MSM GBM backend found in standard libdirs.
+# Diagnostics are intentionally omitted because callers use command substitution.
+display_find_msm_gbm_backend() {
+    for dfmgb_dir in \
+        /usr/lib/gbm \
+        /usr/lib64/gbm \
+        /usr/lib/*/gbm \
+        /lib/gbm \
+        /lib64/gbm \
+        /lib/*/gbm; do
+        [ -d "$dfmgb_dir" ] || continue
+
+        if [ -f "$dfmgb_dir/msm_gbm.so" ]; then
+            printf '%s\n' "$dfmgb_dir/msm_gbm.so"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 ###############################################################################
@@ -4691,10 +4988,12 @@ display_get_primary_refresh_hz() {
 # - minimal Weston package/client recovery on apt systems
 # - the already validated base/overlay graphics-stack transitions
 # - the existing image-managed Yocto Weston lifecycle
+# - explicit desktop relaunch through the shared direct DRM helper
 # - testcase FPS policy
 #
 # It does not create users, TTY sessions, PAM configuration, udev rules,
-# systemd units, seatd instances, or standalone Weston processes.
+# persistent systemd units, or standalone seatd instances. On CentOS, it may
+# start the image-provided seatd.service for the direct DRM runtime.
 ###############################################################################
 
 display_ensure_weston_test_dependencies() {
@@ -4737,9 +5036,20 @@ display_ensure_weston_test_dependencies() {
             dewtd_dependencies="$dewtd_client weston"
             ;;
 
-        centos|rhel|fedora)
-            # RPM package names vary by release and repository. Keep this path
-            # check-only until explicit validated mappings are added.
+        centos)
+            if [ "$dewtd_provider" = "rpm" ] &&
+               command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+                if ! pkg_ensure_required_package_set_present weston-runtime; then
+                    log_fail "Failed to ensure the minimal CentOS Weston runtime package set"
+                    return 1
+                fi
+            fi
+
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        rhel|fedora)
+            # RPM package names can differ outside the validated CentOS path.
             dewtd_dependencies="$dewtd_client weston"
             ;;
 
@@ -5120,6 +5430,63 @@ display_start_transient_weston_runtime() {
     return 0
 }
 
+# Ensure the CentOS Weston DRM launcher has a usable seat provider.
+# The Weston RPM uses libseat, while the target-validated CentOS flow requires
+# the packaged seatd service when the invoking shell is not a logind session.
+# Other distributions keep their existing logind or image-managed seat policy.
+display_prepare_desktop_weston_seat() {
+    dpdws_os_id="unknown"
+    dpdws_wait=0
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dpdws_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        dpdws_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    [ "$dpdws_os_id" = "centos" ] || return 0
+
+    if ! command -v systemd_service_exists >/dev/null 2>&1 ||
+       ! command -v systemd_service_is_active >/dev/null 2>&1 ||
+       ! command -v systemd_service_start_safe >/dev/null 2>&1; then
+        log_error "Cannot prepare the CentOS Weston seat, shared systemd service helpers are unavailable"
+        return 1
+    fi
+
+    if ! systemd_service_exists seatd.service; then
+        log_error "Cannot prepare the CentOS Weston seat, seatd.service is unavailable after package recovery"
+        return 1
+    fi
+
+    if ! systemd_service_is_active seatd.service 2>/dev/null; then
+        log_info "Starting seatd.service for the CentOS Weston DRM runtime"
+
+        if ! systemd_service_start_safe seatd.service; then
+            log_error "Failed to start seatd.service for the CentOS Weston DRM runtime"
+            return 1
+        fi
+    fi
+
+    while [ "$dpdws_wait" -lt 5 ]; do
+        if systemd_service_is_active seatd.service 2>/dev/null &&
+           [ -S /run/seatd.sock ]; then
+            log_pass "CentOS Weston seat provider is ready, service=seatd.service socket=/run/seatd.sock"
+            return 0
+        fi
+
+        sleep 1
+        dpdws_wait=$((dpdws_wait + 1))
+    done
+
+    log_error "CentOS Weston seat provider is not ready, expected active seatd.service and /run/seatd.sock"
+    return 1
+}
+
 ###############################################################################
 # Desktop Weston runtime, manual command promoted to shared helper
 #
@@ -5272,6 +5639,10 @@ display_prepare_desktop_weston_runtime() {
 
     if ! command -v weston >/dev/null 2>&1; then
         log_error "Cannot start desktop Weston, weston command is unavailable"
+        return 1
+    fi
+
+    if ! display_prepare_desktop_weston_seat; then
         return 1
     fi
 
@@ -5450,10 +5821,27 @@ display_prepare_desktop_graphics_stack() {
     dpdgs_mode="${2:-auto}"
     dpdgs_gpu_module="${3:-msm_kgsl}"
     dpdgs_gpu_device="${4:-/dev/kgsl-3d0}"
-    dpdgs_gbm_package="${5:-libgbm-msm1}"
+    dpdgs_gbm_package="${5:-}"
     dpdgs_rc=0
     dpdgs_package_changed=0
     dpdgs_boot_changed=0
+    dpdgs_dkms_package="kgsl-dkms"
+    dpdgs_dkms_before=""
+    dpdgs_dkms_after=""
+    dpdgs_os_id=""
+    dpdgs_apt_source="none"
+    dpdgs_gbm_path=""
+    dpdgs_mapped_gbm_package=""
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dpdgs_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    fi
+
+    case "$dpdgs_os_id" in
+        debian)
+            dpdgs_apt_source="qli-staging"
+            ;;
+    esac
 
     case "$dpdgs_mode" in
         auto)
@@ -5463,8 +5851,12 @@ display_prepare_desktop_graphics_stack() {
 
         overlay)
             for dpdgs_helper in \
+                display_detect_build_flavour \
+                display_find_msm_gbm_backend \
+                display_package_set_member_matching \
                 pkg_package_set_contains \
                 pkg_ensure_optional_package_set_present \
+                pkg_installed_package_version \
                 pkg_package_has_file_matching \
                 mrv_qcom_gpu_validate_boot_mode \
                 display_select_egl_vendor; do
@@ -5474,18 +5866,74 @@ display_prepare_desktop_graphics_stack() {
                 fi
             done
 
+            display_detect_build_flavour
+            dpdgs_gbm_path="$(display_find_msm_gbm_backend 2>/dev/null || true)"
+
+            if [ "${DISPLAY_BUILD_FLAVOUR:-base}" = "overlay" ] &&
+               [ -n "$dpdgs_gbm_path" ]; then
+                mrv_qcom_gpu_validate_boot_mode \
+                    kgsl \
+                    "$dpdgs_gpu_module" \
+                    "$dpdgs_gpu_device" \
+                    msm
+                dpdgs_rc=$?
+
+                if [ "$dpdgs_rc" -eq 0 ] &&
+                   display_select_egl_vendor adreno; then
+                    log_pass "Qualcomm overlay runtime is already ready, EGL vendor=${DISPLAY_EGL_VENDOR_JSON:-unknown} GBM backend=$dpdgs_gbm_path"
+                    return 0
+                fi
+            fi
+
+            if [ -z "$dpdgs_gbm_package" ] ||
+               ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
+                dpdgs_mapped_gbm_package="$(
+                    display_package_set_member_matching \
+                        graphics \
+                        '^(libgbm-msm1?|gbm-msm-backend)$' || true
+                )"
+
+                if [ -n "$dpdgs_mapped_gbm_package" ] &&
+                   [ "$dpdgs_mapped_gbm_package" != "$dpdgs_gbm_package" ]; then
+                    log_info "Using mapped Qualcomm GBM package for os=${dpdgs_os_id:-unknown}, package=$dpdgs_mapped_gbm_package"
+                fi
+
+                dpdgs_gbm_package="$dpdgs_mapped_gbm_package"
+            fi
+
+            if [ -z "$dpdgs_gbm_package" ]; then
+                log_fail "$dpdgs_testname FAIL - graphics package set has no supported Qualcomm MSM GBM backend package"
+                return 1
+            fi
+
             if ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
                 log_fail "$dpdgs_testname FAIL - graphics package set is incomplete, missing $dpdgs_gbm_package"
                 return 1
             fi
 
+            dpdgs_dkms_before="$(
+                pkg_installed_package_version \
+                    "$dpdgs_dkms_package" 2>/dev/null || true
+            )"
+
             if ! pkg_ensure_optional_package_set_present \
                 graphics \
-                qli-staging \
+                "$dpdgs_apt_source" \
                 auto \
                 --overlay; then
                 log_fail "$dpdgs_testname FAIL - failed to ensure Qualcomm graphics overlay package set"
                 return 1
+            fi
+
+            dpdgs_dkms_after="$(
+                pkg_installed_package_version \
+                    "$dpdgs_dkms_package" 2>/dev/null || true
+            )"
+
+            if [ "$dpdgs_dkms_before" != "$dpdgs_dkms_after" ]; then
+                log_info "Qualcomm graphics kernel package changed, package=$dpdgs_dkms_package version=${dpdgs_dkms_before:-not-installed}->${dpdgs_dkms_after:-not-installed}"
+                log_skip "$dpdgs_testname SKIP - Qualcomm overlay packages are ready, reboot required to activate KGSL"
+                return 2
             fi
 
             if ! pkg_package_has_file_matching \
@@ -5854,6 +6302,10 @@ display_resolve_test_fps_gate_policy() {
     return 0
 }
 
+# Apply the resolved FPS policy to one test result.
+# Arguments: average FPS, sample count, and 0 or 1 indicating whether FPS is required.
+# Returns: 0 when the selected policy passes or is diagnostic, 1 on a required FPS failure.
+# Side effects: emits the policy decision through the shared logging helpers.
 display_apply_test_fps_gate_policy() {
     datfgp_avg="${1:--}"
     datfgp_count="${2:-0}"
@@ -5864,6 +6316,16 @@ display_apply_test_fps_gate_policy() {
             datfgp_count=0
             ;;
     esac
+
+    if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-session-connectivity" ]; then
+        if [ "$datfgp_count" -eq 0 ]; then
+            log_warn "No FPS samples were produced by the desktop session, compositor connectivity was validated"
+        else
+            log_info "Recording desktop-session FPS samples without performance gating, samples=$datfgp_count avg=$datfgp_avg"
+        fi
+
+        return 0
+    fi
 
     if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" != "desktop-functional-cap" ]; then
         if command -v display_fps_gate_avg >/dev/null 2>&1; then
@@ -5880,14 +6342,19 @@ display_apply_test_fps_gate_policy() {
         return 0
     fi
 
-    if [ "$datfgp_count" -eq 0 ]; then
-        if [ "$datfgp_require" -ne 0 ]; then
-            log_fail "Desktop functional FPS gate enabled but no FPS samples were found"
-            return 1
+    if [ "$datfgp_require" -eq 0 ]; then
+        if [ "$datfgp_count" -eq 0 ]; then
+            log_warn "No FPS samples were produced by the desktop client, compositor connectivity and EGL execution were validated"
+        else
+            log_info "Recording desktop FPS samples without performance gating, samples=$datfgp_count avg=$datfgp_avg"
         fi
 
-        log_warn "No FPS samples were found, FPS gating was not requested"
         return 0
+    fi
+
+    if [ "$datfgp_count" -eq 0 ]; then
+        log_fail "Desktop functional FPS gate enabled but no FPS samples were found"
+        return 1
     fi
 
     if ! printf '%s\n' "$datfgp_avg" |
@@ -5901,7 +6368,7 @@ display_apply_test_fps_gate_policy() {
             awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
         )"
 
-        log_fail "Average FPS below desktop functional threshold, avg=$datfgp_avg (~$datfgp_rounded) < ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
+        log_fail "Average FPS below desktop functional threshold, avg=$datfgp_avg (~$datfgp_rounded) < ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown})"
         return 1
     fi
 
@@ -5909,7 +6376,6 @@ display_apply_test_fps_gate_policy() {
         awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
     )"
 
-    log_info "Desktop functional FPS gate passed, avg=$datfgp_avg (~$datfgp_rounded) >= ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
+    log_info "Desktop functional FPS gate passed, avg=$datfgp_avg (~$datfgp_rounded) >= ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown})"
     return 0
 }
-

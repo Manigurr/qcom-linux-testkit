@@ -1,8 +1,8 @@
 # Camera_NHX
 
-Camera NHX validation test for the Qualcomm CAMX proprietary camera stack. This test runs `nhx.sh`, collects generated image dumps, validates dumps (existence + non-zero size), and produces a PASS/FAIL `.res` file suitable for LAVA gating.
+Camera NHX validation test for the Qualcomm CAMX proprietary camera stack. This test runs the available NHX launcher (`nhx.sh` or `camera-nhx`), collects generated image dumps, validates dumps (existence + non-zero size), and produces a PASS/FAIL `.res` file suitable for LAVA gating.
 
-The test supports the legacy/default NHX flow and optional target-specific JSON selection for preview, video, preview+video, and snapshot validation.
+The test supports the legacy/default NHX flow, optional target-specific JSON selection for preview, video, preview+video, and snapshot validation, and an opt-in desktop CAMX package and FIT-DTB selection flow.
 
 ---
 
@@ -12,6 +12,8 @@ The test supports the legacy/default NHX flow and optional target-specific JSON 
 - Utilities:
   - `Runner/utils/functestlib.sh`
   - `Runner/utils/camera/lib_camera.sh`
+  - `Runner/utils/lib_pkg_provider.sh` for optional desktop package recovery
+  - `Runner/utils/lib_system.sh` for EFI variable discovery and update
 - Target-specific NHX JSON configs:
   - `Runner/suites/Multimedia/Camera/Camera_NHX/Kodiak/*.json`
   - `Runner/suites/Multimedia/Camera/Camera_NHX/Lemans/*.json`
@@ -73,16 +75,18 @@ Snapshot JSON files are currently expected only for targets where the files are 
      - `qcom,cam-tpg1031`
      - `qcom,camera`
    - `fdtdump` scan for camera-related nodes through `lib_camera.sh`
-   - Camera kernel module detection and loaded-state validation
+   - Camera kernel module detection and loaded-state validation, including `camera_x1e80100` on Glymur
    - ICP firmware presence check (`CAMERA_ICP`)
    - `dmesg` scan for camera warnings/errors
-   - CAMX package presence check
+   - CAMX package presence check through the available `opkg`, Debian, or RPM package database
+   - With `--overlay`, an unavailable package inventory is warn-only after the package set was verified successfully
    - Sensor presence check is warn-only because NHX may still work depending on target/test config
 
 4. **Runs NHX**
-   - Default mode runs `nhx.sh` with no argument, preserving the existing SoC-specific default behavior.
+   - Resolves legacy `nhx.sh` from `PATH` first, then `camera-nhx` from `PATH`, and finally the packaged CAMX location `/usr/libexec/camx/nhx.sh`.
+   - Default mode runs the selected NHX launcher with no argument, preserving the existing SoC-specific default behavior.
    - Optional mode accepts one selected JSON via `--json` and optionally `--target`.
-   - The selected JSON is staged to the location expected by `/usr/bin/nhx.sh`.
+   - The selected JSON is staged to the location expected by the selected NHX launcher.
 
 5. **Dump validation**
    - Collects dump file list from NHX output and/or dump directory based on a marker timestamp.
@@ -104,6 +108,58 @@ Snapshot JSON files are currently expected only for targets where the files are 
 
 ---
 
+## Desktop CAMX overlay flow
+
+Yocto and meta-qcom LAVA images keep their image-provided camera stack and do
+not use this flow. On Debian and Ubuntu, an explicit overlay request installs
+the `camera-nhx` package set:
+
+```text
+camx-dkms camx-glymur libcamx-glymur1 camx-firmware-glymur camx-nhx
+```
+
+On CentOS Stream 10, the runner follows the Qualcomm overlay installation
+guide and installs the Kodiak package set:
+
+```text
+camx-dkms camx-firmware-kodiak camx-kodiak libcamx-kodiak1
+```
+
+Before a missing CentOS package is installed, the shared package provider
+ensures EPEL and both `qualcomm-linux-aarch64` and
+`qualcomm-linux-noarch` repositories are enabled, then refreshes DNF metadata.
+
+`--overlay` requires the CAMX FIT DTB and uses the compatibility name `camx`.
+The same requirement can be stated explicitly with `--fit-dtb camx`:
+
+```sh
+./run.sh --overlay --fit-dtb camx
+```
+
+The test discovers the platform's `VendorDtbOverlays` EFI variable with
+`efivar -l`. The EFI variable GUID is never supplied by the user or hardcoded
+in the test. It verifies that the payload is `camx` through `efivar -p`. If it
+is not selected, the test writes `camx` without a trailing newline, reads the
+variable back, and synchronizes storage.
+
+When a new DTB selection is written, the test records `Camera_NHX SKIP` with a
+reboot-required message instead of rebooting within the LAVA test shell. Reboot
+the target, then rerun the same command to perform NHX validation with the new
+device tree:
+
+```sh
+reboot
+./run.sh --overlay --fit-dtb camx
+```
+
+If the CAMX FIT DTB is already selected, the test continues with runtime DT and
+camera-module checks. A loaded board-specific camera module is used as runtime
+evidence that the current boot has activated the CAMX camera stack. If EFI is
+set to `camx` but the module is not loaded, the test records SKIP and asks the
+operator to reboot manually. The test never issues a reboot itself.
+
+---
+
 ## NHX JSON selection
 
 ### Default behavior
@@ -112,13 +168,15 @@ Snapshot JSON files are currently expected only for targets where the files are 
 ./run.sh
 ```
 
-This preserves the existing behavior and runs:
+This preserves the existing behavior and runs the first available launcher in this order:
 
-```sh
-nhx.sh
+```text
+nhx.sh from PATH
+camera-nhx from PATH
+/usr/libexec/camx/nhx.sh
 ```
 
-`nhx.sh` then selects the default JSON based on SoC ID:
+The selected launcher then selects the default JSON based on SoC ID:
 
 - Kodiak (`497`, `498`, `575`) -> `NHX.YUV_NV12_Prev_MaxRes`
 - Lemans/Monaco (`534`, `606`, `667`, `674`, `675`, `676`) -> `NHX.YUV_NV12_Prev_MaxRes`
@@ -193,7 +251,7 @@ In that case, pass `--target`:
 
 ## How JSON staging works
 
-`/usr/bin/nhx.sh` does not accept an arbitrary absolute JSON path. It expects a JSON name and internally checks:
+The NHX launcher does not accept an arbitrary absolute JSON path. It expects a JSON name and internally checks:
 
 ```sh
 /etc/camera/test/NHX/${JSON_FILE}.json
@@ -205,13 +263,13 @@ For this reason, when `--json` is used, `run.sh` resolves the source file from t
 /etc/camera/test/NHX/<target>/<json-file>.json
 ```
 
-Then it calls `nhx.sh` with the launcher argument without `.json`, for example:
+Then it calls the selected launcher with the launcher argument without `.json`, for example:
 
 ```sh
-nhx.sh Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX
+camera-nhx Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX
 ```
 
-This causes `nhx.sh` to load:
+The same argument is used when legacy `nhx.sh` is selected. This causes the launcher to load:
 
 ```text
 /etc/camera/test/NHX/Lemans/Prev_plus_Video_YUVNV12_MaxResolution_NHX.json
@@ -231,13 +289,20 @@ NHX JSON argument
 ## Command usage
 
 ```sh
-./run.sh [--json JSON_FILE] [--target TARGET] [--help]
+./run.sh [--overlay] [--fit-dtb NAME] [--json JSON_FILE] [--target TARGET] [--help]
 ```
 
 Options:
 
 ```text
---json JSON_FILE   NHX JSON file to pass to nhx.sh.
+--overlay          Install the optional Camera NHX CAMX package set on Debian,
+                   Ubuntu, or CentOS and ensure the CAMX FIT DTB is selected.
+
+--fit-dtb NAME     Select NAME as the FIT DTB compatibility name for the next
+                   boot. Requires --overlay on a supported desktop distro.
+                   Camera_NHX accepts camx, which is the --overlay default.
+
+--json JSON_FILE   NHX JSON file to pass to the selected NHX launcher.
                    Can be absolute, relative to Camera_NHX/, or relative
                    to the target folder when --target is provided.
 
@@ -251,6 +316,10 @@ Examples:
 
 ```sh
 ./run.sh
+```
+
+```sh
+./run.sh --overlay
 ```
 
 ```sh
@@ -402,7 +471,10 @@ run:
 
 ### SKIP
 
-- Missing CAMX prerequisites, such as DT patterns, camera module artifact/loaded state, ICP firmware, CAMX packages, or `nhx.sh`
+- Missing CAMX prerequisites, such as DT patterns, camera module artifact/loaded state, ICP firmware, CAMX packages, or an executable NHX launcher (`nhx.sh` or `camera-nhx` in `PATH`, or `/usr/libexec/camx/nhx.sh`)
+- The CAMX FIT DTB selection was written and a manual reboot is required before validation
+- EFI selects `camx`, but the board-specific camera module is not loaded, so a manual reboot is required
+- `VendorDtbOverlays` is unavailable when `--overlay` was requested
 - `fdtdump` is not available or camera node evidence is inconclusive
 - Requested `--json` file is not found
 - Requested JSON filename is ambiguous and `--target` was not supplied
@@ -416,7 +488,7 @@ run:
 
 If logs show `1970-01-01`, the device clock is not set. This is common on early boot images or minimal init environments. It does not affect functional correctness, but it can make log browsing confusing.
 
-### `nhx.sh` reports JSON file not found
+### The NHX launcher reports JSON file not found
 
 If you see a message similar to:
 
@@ -429,8 +501,8 @@ check that:
 - `run.sh` logged a valid `NHX JSON resolved`
 - `run.sh` logged a valid `NHX JSON argument`
 - the selected JSON was staged under `/etc/camera/test/NHX`
-- the argument passed to `nhx.sh` does not include an absolute `/tmp/...` path
-- the argument passed to `nhx.sh` does not include the `.json` suffix
+- the argument passed to the selected NHX launcher does not include an absolute `/tmp/...` path
+- the argument passed to the selected NHX launcher does not include the `.json` suffix
 
 Correct expected example:
 

@@ -1,9 +1,12 @@
 Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 
-SPDX-License-Identifier: BSD-3-Clause# weston-simple-egl GraphicsTest Scripts for Qualcomm Linux based platform (Yocto)
+SPDX-License-Identifier: BSD-3-Clause
+
+# weston-simple-egl Graphics Test
+
 # Overview
 
-Graphics scripts automates the validation of Graphics OpenGL ES 2.0 capabilities on the Qualcomm RB3 Gen2 platform running a Yocto-based Linux system. It utilizes Weston-Simple-EGL test app which is publicly available at https://github.com/krh/weston
+This suite validates OpenGL ES 2.0 through the `weston-simple-egl` Wayland client on Qualcomm Linux platforms. It supports image-provided Weston on Yocto and active desktop Wayland sessions on Debian-family distributions.
 
 ## Features
 
@@ -13,10 +16,39 @@ Graphics scripts automates the validation of Graphics OpenGL ES 2.0 capabilities
 
 ## Prerequisites
 
-Ensure the following components are present in the target Yocto build:
+Yocto images must provide the required client and Weston runtime. Debian and Ubuntu recover Weston from `weston`. CentOS recovers the compositor from `weston`, the example clients from `weston-demo`, the DRM seat provider from `seatd`, and `/usr/bin/eglinfo` from `egl-utils`. Overlay mode first accepts a complete image-provided Qualcomm EGL, GBM, and KGSL runtime. When graphics recovery is needed, it uses the distro-specific package family and repository policy.
 
 - `weston-simple-egl` (Binary Available in /usr/bin) be default
 - Write access to root filesystem (for environment setup)
+
+## Desktop distribution modes
+
+- Ubuntu Desktop defaults to `--overlay`, so a plain `./run.sh` validates the
+  Qualcomm KGSL/Adreno stack without requiring an explicit mode argument.
+- Ubuntu Server is treated as headless and reports SKIP before graphics package
+  or display-runtime preparation. Run the suite on Ubuntu Desktop to validate
+  graphics.
+- An explicit `--base` request on Ubuntu Desktop reports SKIP because the
+  supported Ubuntu graphics configuration is the Qualcomm overlay.
+- Debian, CentOS, RHEL, and Fedora default to `--base` for compatibility with
+  their selectable base and overlay package flows.
+- `./run.sh --base` selects the upstream MSM/freedreno stack and ensures the OS-specific Mesa package set.
+- `./run.sh --overlay` selects the Qualcomm KGSL/Adreno stack. A ready runtime is reused without package changes. Otherwise, the focused EGL/GLES package set is recovered and DKMS changes can require a reboot before validation continues.
+- Debian uses the `adreno-*` packages from `qli-staging`. Ubuntu uses the `qcom-adreno-*` packages and existing image APT sources, never Debian `qli` or `qli-staging`. CentOS uses the `adreno-*` RPMs from the configured Qualcomm RPM repositories.
+- The MSM GBM package is resolved from the distro package map: `libgbm-msm1` on Debian, `libgbm-msm` on Ubuntu, and `gbm-msm-backend` on CentOS. Set `GPU_OVERLAY_GBM_PACKAGE` only when an explicit override is required.
+- Desktop automatic mode runs `weston-simple-egl -b` when the client advertises that option. This is an unsynchronized EGL throughput benchmark with a minimum functional FPS gate, not a display-refresh measurement.
+- Yocto, other image-based runs, and `--strict-refresh-fps` keep the compositor-synchronized client mode. FPS evidence remains required by default. Use `--no-require-fps` only when connectivity and EGL execution are the intended coverage.
+- On Ubuntu, the test reuses an active GNOME Wayland session when Weston is not running. A root-launched test executes the client as the Wayland socket owner without stopping or restarting GDM.
+- On desktop distributions without a packaged `weston.service`, `--allow-relaunch` starts Weston directly on the dynamically selected DRM device and validates the resulting Wayland socket before launching the client. On CentOS, the shared runtime preparation starts the packaged `seatd.service` when needed. It does not enable the service persistently.
+- GDM can throttle an unfocused greeter client. That path validates compositor connectivity and EGL startup while recording, but not performance-gating, any FPS samples.
+
+Examples:
+
+```sh
+./run.sh --base
+./run.sh --overlay
+./run.sh --auto
+```
 
 ## Directory Structure
 

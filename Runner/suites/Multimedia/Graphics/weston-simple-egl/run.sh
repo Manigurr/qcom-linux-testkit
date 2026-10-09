@@ -5,16 +5,19 @@
 # Validate weston-simple-egl through a usable Weston compositor.
 #
 # Desktop distributions:
-# - default to the upstream MSM/freedreno base stack
+# - Ubuntu Desktop defaults to the Qualcomm KGSL/Adreno stack
+# - Ubuntu Server is headless and skips as not applicable
+# - Debian, CentOS, RHEL, and Fedora default to upstream MSM/freedreno
 # - --overlay selects the Qualcomm KGSL/Adreno package and boot stack
 # - --auto validates the currently selected stack without changing it
-# - use a 60 FPS functional cap in automatic FPS mode
-# - keep the normal compositor-synchronized client path
+# - use the unsynchronized client benchmark with a 60 FPS functional target in
+#   automatic FPS mode because packaged clients may not report synchronized
+#   redraws
 #
 # Yocto and other image-based distributions:
 # - preserve the existing image-selected graphics and Weston flow
 # - do not install/remove graphics packages or alter boot artifacts
-# - preserve the existing detected-refresh FPS policy and client arguments
+# - preserve the existing detected-refresh FPS policy and synchronized client
 #
 # PASS/FAIL/SKIP is written to the result file. After testcase execution, the
 # runner exits 0 for compatibility with the existing LAVA flow.
@@ -46,7 +49,9 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1090
+. "$INIT_ENV"
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/lib_display.sh"
@@ -62,6 +67,7 @@ if [ -r "$TOOLS/lib_module_reload.sh" ]; then
 fi
 
 TESTNAME="weston-simple-egl"
+RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
 
 DURATION="${DURATION:-30s}"
 STOP_GRACE="${STOP_GRACE:-3s}"
@@ -81,10 +87,11 @@ ALLOW_RELAUNCH="${ALLOW_RELAUNCH:-0}"
 
 GPU_MODULE="${GPU_MODULE:-msm_kgsl}"
 GPU_OVERLAY_DEVICE="${GPU_OVERLAY_DEVICE:-/dev/kgsl-3d0}"
-GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-libgbm-msm1}"
+GPU_OVERLAY_GBM_PACKAGE="${GPU_OVERLAY_GBM_PACKAGE:-}"
 
 OS_ID="unknown"
 DISTRO_GPU_HANDLING_SUPPORTED=0
+UBUNTU_GRAPHICS_VARIANT=""
 APP_PID=""
 
 while [ "$#" -gt 0 ]; do
@@ -126,6 +133,7 @@ while [ "$#" -gt 0 ]; do
 
         --strict-refresh-fps)
             FPS_EXPECT_MODE="detected"
+            REQUIRE_FPS=1
             ;;
 
         --require-fps)
@@ -155,6 +163,11 @@ FPS options:
   --require-fps         Require FPS evidence, default
   --no-require-fps      Record FPS when available but do not gate on it
 
+Defaults:
+  Desktop automatic mode uses the unsynchronized client benchmark and a
+  minimum-throughput gate. Image-based and strict-refresh runs remain
+  compositor-synchronized.
+
 Other options:
   -h, --help            Show this help
 
@@ -166,6 +179,7 @@ Environment:
   EXPECT_FPS_DEFAULT          Fallback expected FPS, default: 60
   FPS_TOL_PCT                 Fixed-mode tolerance, default: 10
   MIN_FPS_PCT                 Minimum percentage, default: 85
+  REQUIRE_FPS                 0 or 1, default: 1
   DESKTOP_FUNCTIONAL_FPS_CAP  Desktop auto-mode FPS cap, default: 60
   TIME_SYNC_WAIT              Clock sync wait bound in seconds, 0 disables, default: 20
   CLOCK_STEP_TOLERANCE        Wall-clock step tolerance in seconds, default: 2
@@ -238,13 +252,12 @@ test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || true)"
 
 if [ -z "$test_path" ] || [ ! -d "$test_path" ]; then
     log_fail "$TESTNAME FAIL - test directory not found"
-    echo "$TESTNAME FAIL" >"./${TESTNAME}.res"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 1
 fi
 
 cd "$test_path" || exit 1
 
-RES_FILE="./${TESTNAME}.res"
 RUN_LOG="./${TESTNAME}_run.log"
 
 : >"$RES_FILE"
@@ -287,22 +300,65 @@ fi
 
 [ -n "$OS_ID" ] || OS_ID="unknown"
 
+if [ -z "$GPU_OVERLAY_GBM_PACKAGE" ]; then
+    case "$OS_ID" in
+        ubuntu)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm"
+            ;;
+        *)
+            GPU_OVERLAY_GBM_PACKAGE="libgbm-msm1"
+            ;;
+    esac
+fi
+
 case "$OS_ID" in
-    debian|ubuntu|centos|rhel|fedora)
+    ubuntu)
         DISTRO_GPU_HANDLING_SUPPORTED=1
-
-        if [ "$REQUESTED_GRAPHICS_MODE" = "default" ]; then
-            REQUESTED_GRAPHICS_MODE="base"
-        fi
-
         ;;
 
-    *)
-        if [ "$REQUESTED_GRAPHICS_MODE" = "default" ]; then
-            REQUESTED_GRAPHICS_MODE="auto"
-        fi
+    debian|centos|rhel|fedora)
+        DISTRO_GPU_HANDLING_SUPPORTED=1
         ;;
 esac
+
+if ! command -v display_resolve_graphics_mode >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL - required graphics policy helper is unavailable: display_resolve_graphics_mode"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+fi
+
+REQUESTED_GRAPHICS_MODE="$(
+    display_resolve_graphics_mode \
+        "$OS_ID" \
+        "$REQUESTED_GRAPHICS_MODE"
+)" || {
+    log_fail "$TESTNAME FAIL - unable to resolve graphics mode for os=$OS_ID"
+    echo "$TESTNAME FAIL" >"$RES_FILE"
+    exit 0
+}
+
+if [ "$OS_ID" = "ubuntu" ]; then
+    if ! command -v display_detect_ubuntu_variant >/dev/null 2>&1; then
+        log_fail "$TESTNAME FAIL - required Ubuntu profile helper is unavailable: display_detect_ubuntu_variant"
+        echo "$TESTNAME FAIL" >"$RES_FILE"
+        exit 0
+    fi
+
+    UBUNTU_GRAPHICS_VARIANT="$(display_detect_ubuntu_variant)"
+    log_info "Ubuntu graphics profile, $UBUNTU_GRAPHICS_VARIANT"
+
+    if [ "$UBUNTU_GRAPHICS_VARIANT" = "server" ]; then
+        log_skip "$TESTNAME SKIP - Ubuntu Server is headless, run this graphics test on Ubuntu Desktop with a graphical target and display manager"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+    fi
+
+    if [ "$REQUESTED_GRAPHICS_MODE" = "base" ]; then
+        log_skip "$TESTNAME SKIP - Ubuntu Desktop supports the Qualcomm overlay graphics configuration, use the default mode or --overlay"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+    fi
+fi
 
 log_info "Weston log directory, $SCRIPT_DIR"
 log_info "--------------------------------------------------------------------------"
@@ -442,17 +498,19 @@ fi
 
 case "$OS_ID" in
     debian|ubuntu|centos|rhel|fedora)
-        if ! command -v weston_prepare_runtime >/dev/null 2>&1; then
+        if [ "$OS_ID" = "ubuntu" ] &&
+           command -v display_adopt_gnome_wayland_session >/dev/null 2>&1 &&
+           display_adopt_gnome_wayland_session; then
+            log_info "Using the active GNOME Wayland session for onscreen EGL validation"
+        elif ! command -v weston_prepare_runtime >/dev/null 2>&1; then
             log_fail "$TESTNAME FAIL - weston_prepare_runtime helper is unavailable"
             echo "$TESTNAME FAIL" >"$RES_FILE"
             exit 0
-        fi
-
-        if ! weston_prepare_runtime \
-            "$TESTNAME" \
-            "$WAIT_SECS" \
-            client \
-            "$ALLOW_RELAUNCH"; then
+        elif ! weston_prepare_runtime \
+                "$TESTNAME" \
+                "$WAIT_SECS" \
+                client \
+                "$ALLOW_RELAUNCH"; then
             log_fail "$TESTNAME FAIL - no usable managed Weston runtime is available for onscreen EGL clients"
             echo "$TESTNAME FAIL" >"$RES_FILE"
             exit 0
@@ -499,6 +557,15 @@ if ! display_resolve_test_fps_gate_policy \
     log_fail "$TESTNAME FAIL - failed to resolve testcase FPS gate policy"
     echo "$TESTNAME FAIL" >"$RES_FILE"
     exit 0
+fi
+
+if [ "${DISPLAY_RUNTIME_MODEL:-}" = "desktop-gnome-session" ]; then
+    # GDM intentionally throttles non-interactive greeter clients, so their
+    # compositor frame cadence is not a display-refresh or GPU-performance
+    # measurement. The client connection and EGL startup remain validated.
+    DISPLAY_TEST_FPS_POLICY="desktop-session-connectivity"
+    export DISPLAY_TEST_FPS_POLICY
+    log_info "FPS policy, desktop-session-connectivity, GNOME greeter throttling is not performance evidence"
 fi
 
 if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-functional-cap" ]; then
@@ -567,10 +634,36 @@ fi
 
 log_info "Using client binary, $BIN"
 log_info "Wayland socket, ${DISPLAY_WAYLAND_SOCKET:-<unknown>}"
-log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
-log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+log_info "Wayland session user, ${DISPLAY_WAYLAND_SESSION_USER:-current-user}"
+log_info "XDG_RUNTIME_DIR, ${DISPLAY_WAYLAND_SESSION_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-<unset>}}"
+log_info "WAYLAND_DISPLAY, $(basename "${DISPLAY_WAYLAND_SOCKET:-${WAYLAND_DISPLAY:-<unset>}}")"
 
-log_info "Client mode, compositor-synchronized weston-simple-egl"
+SIMPLE_EGL_CLIENT_ARG=""
+SIMPLE_EGL_LAUNCH_MODE="compositor-synchronized"
+SIMPLE_EGL_FPS_SOURCE="client-synchronized"
+
+if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-functional-cap" ]; then
+    simple_egl_help="$("$BIN" -h 2>&1)"
+
+    if printf '%s\n' "$simple_egl_help" |
+        grep -Eq '(^|[[:space:]])-b([[:space:]]|$)'; then
+        SIMPLE_EGL_CLIENT_ARG="-b"
+        SIMPLE_EGL_LAUNCH_MODE="desktop-unsynchronized-benchmark"
+        SIMPLE_EGL_FPS_SOURCE="client-unsynchronized-benchmark"
+        log_info "Benchmark FPS is unsynchronized EGL throughput, not display refresh"
+    else
+        log_warn "weston-simple-egl does not advertise -b, keeping compositor-synchronized mode"
+    fi
+fi
+
+log_info "Client mode, $SIMPLE_EGL_LAUNCH_MODE"
+
+set -- "$BIN"
+
+if [ -n "$SIMPLE_EGL_CLIENT_ARG" ]; then
+    set -- "$@" "$SIMPLE_EGL_CLIENT_ARG"
+fi
+
 # Retain the existing environment on Yocto. Upstream weston-simple-egl prints
 # FPS unconditionally, while vendor builds may also honor these variables.
 SIMPLE_EGL_FPS=1
@@ -592,20 +685,44 @@ rc=0
 if command -v run_with_timeout >/dev/null 2>&1; then
     log_info "Using run_with_timeout"
 
-    if command -v stdbuf >/dev/null 2>&1; then
+    if [ -n "${DISPLAY_WAYLAND_SESSION_USER:-}" ] &&
+       command -v timeout >/dev/null 2>&1; then
+        log_info "Using session-local timeout to reap the desktop Wayland client"
+
+        if command -v stdbuf >/dev/null 2>&1; then
+            display_run_in_wayland_session \
+                timeout \
+                "$DURATION" \
+                stdbuf \
+                -oL \
+                -eL \
+                "$@" >>"$RUN_LOG" 2>&1
+            rc=$?
+        else
+            log_warn "stdbuf is unavailable, running the client without line buffering"
+
+            display_run_in_wayland_session \
+                timeout \
+                "$DURATION" \
+                "$@" >>"$RUN_LOG" 2>&1
+            rc=$?
+        fi
+    elif command -v stdbuf >/dev/null 2>&1; then
         run_with_timeout \
             "$DURATION" \
+            display_run_in_wayland_session \
             stdbuf \
             -oL \
             -eL \
-            "$BIN" >>"$RUN_LOG" 2>&1
+            "$@" >>"$RUN_LOG" 2>&1
         rc=$?
     else
         log_warn "stdbuf is unavailable, running the client without line buffering"
 
         run_with_timeout \
             "$DURATION" \
-            "$BIN" >>"$RUN_LOG" 2>&1
+            display_run_in_wayland_session \
+            "$@" >>"$RUN_LOG" 2>&1
         rc=$?
     fi
 else
@@ -624,7 +741,7 @@ else
     [ -n "$duration_secs" ] || duration_secs=30
     [ -n "$stop_grace_secs" ] || stop_grace_secs=3
 
-    "$BIN" >>"$RUN_LOG" 2>&1 &
+    display_run_in_wayland_session "$@" >>"$RUN_LOG" 2>&1 &
     APP_PID=$!
     run_elapsed=0
 
@@ -685,7 +802,7 @@ fi
 log_info "Client finished, rc=${rc} elapsed=${elapsed}s"
 
 if [ "$clock_stepped" -eq 1 ]; then
-    log_warn "System clock stepped by ${clock_step}s during the run; FPS samples from the client are not trustworthy"
+    log_warn "System clock stepped by ${clock_step}s during the run, FPS samples from the client are not trustworthy"
 fi
 
 fps_count=0
@@ -712,17 +829,25 @@ if [ "$fps_count" -eq 0 ]; then
 fi
 
 if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-functional-cap" ]; then
-    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=desktop-functional refresh=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz target=${DISPLAY_TEST_FPS_EXPECTED:-unknown} min_ok=${DISPLAY_TEST_FPS_MIN_OK:-unknown} graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
+    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=desktop-functional target=${DISPLAY_TEST_FPS_EXPECTED:-unknown} min_ok=${DISPLAY_TEST_FPS_MIN_OK:-unknown} graphics=${DISPLAY_BUILD_FLAVOUR} source=${SIMPLE_EGL_FPS_SOURCE}"
+elif [ "${DISPLAY_TEST_FPS_POLICY:-shared}" = "desktop-session-connectivity" ]; then
+    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=desktop-session-connectivity graphics=${DISPLAY_BUILD_FLAVOUR} source=${SIMPLE_EGL_FPS_SOURCE}"
 elif [ "${DISPLAY_FPS_MODE:-}" = "detected" ]; then
-    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=${DISPLAY_FPS_MODE} refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK} graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
+    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=${DISPLAY_FPS_MODE} refresh=${DISPLAY_FPS_DETECTED_HZ}Hz expected=${DISPLAY_FPS_EXPECTED} min_ok=${DISPLAY_FPS_MIN_OK} graphics=${DISPLAY_BUILD_FLAVOUR} source=${SIMPLE_EGL_FPS_SOURCE}"
 else
-    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=${DISPLAY_FPS_MODE} expected=${DISPLAY_FPS_EXPECTED} range=[${DISPLAY_FPS_MIN_OK},${DISPLAY_FPS_MAX_OK}] graphics=${DISPLAY_BUILD_FLAVOUR} source=client-synchronized"
+    log_info "Result summary, rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} mode=${DISPLAY_FPS_MODE} expected=${DISPLAY_FPS_EXPECTED} range=[${DISPLAY_FPS_MIN_OK},${DISPLAY_FPS_MAX_OK}] graphics=${DISPLAY_BUILD_FLAVOUR} source=${SIMPLE_EGL_FPS_SOURCE}"
 fi
 
 final="PASS"
 
 case "$rc" in
     0|143)
+        ;;
+    124)
+        if [ "${DISPLAY_RUNTIME_MODEL:-}" != "desktop-gnome-session" ]; then
+            log_fail "$TESTNAME execution timed out unexpectedly, rc=$rc runtime=${DISPLAY_RUNTIME_MODEL:-unknown}"
+            final="FAIL"
+        fi
         ;;
     *)
         log_fail "$TESTNAME execution failed, rc=$rc"
@@ -767,10 +892,11 @@ fi
     printf '%s\n' "os_id=$OS_ID"
     printf '%s\n' "runtime_model=${DISPLAY_RUNTIME_MODEL:-unknown}"
     printf '%s\n' "wayland_socket=${DISPLAY_WAYLAND_SOCKET:-unknown}"
-    printf '%s\n' "simple_egl_launch_mode=compositor-synchronized"
-    printf '%s\n' "simple_egl_client_arg=none"
-    printf '%s\n' "fps_sample_source=client-synchronized"
+    printf '%s\n' "simple_egl_launch_mode=$SIMPLE_EGL_LAUNCH_MODE"
+    printf '%s\n' "simple_egl_client_arg=${SIMPLE_EGL_CLIENT_ARG:-none}"
+    printf '%s\n' "fps_sample_source=$SIMPLE_EGL_FPS_SOURCE"
     printf '%s\n' "fps_gate_policy=${DISPLAY_TEST_FPS_POLICY:-shared}"
+    printf '%s\n' "fps_required=$REQUIRE_FPS"
     printf '%s\n' "fps_gate_refresh=${DISPLAY_TEST_FPS_REFRESH:-unknown}"
     printf '%s\n' "fps_gate_expected=${DISPLAY_TEST_FPS_EXPECTED:-unknown}"
     printf '%s\n' "fps_gate_minimum=${DISPLAY_TEST_FPS_MIN_OK:-unknown}"

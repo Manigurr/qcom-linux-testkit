@@ -6,7 +6,7 @@
 # - validates ALSA sound card registration
 # - validates /dev/snd/controlC<N> nodes
 # - optionally validates PCM/playback/capture entries
-# - optionally prepares Debian AudioReach packages with --overlay
+# - optionally prepares Debian or CentOS AudioReach packages with --overlay
 # - does not start/restart PipeWire, PulseAudio, ADSP, or remoteproc
 # - does not play or record audio
 
@@ -49,7 +49,7 @@ fi
 
 TESTNAME="Audio_Card_Registration"
 
-# Only the explicit --overlay option enables Debian AudioReach preparation.
+# Only the explicit --overlay option enables AudioReach package preparation.
 # Ignore inherited values so native/base mode remains the default.
 AUDIO_OVERLAY_REQUESTED=0
 AUDIO_EARLY_HELP_REQUESTED=0
@@ -70,9 +70,10 @@ Usage: $0 [options]
 
 Options:
   --overlay
-      On Debian, ensure the Qualcomm AudioReach package set before validating
-      ALSA card registration. Without this flag, use the native/base audio
-      stack. This test never starts or restarts PipeWire.
+      On Debian or CentOS, ensure the Qualcomm AudioReach package set before
+      validating ALSA card registration. Without this flag, use the
+      native/base audio stack. This test never starts or restarts PipeWire.
+      Ubuntu reports SKIP because AudioReach is not enabled there.
 
   --wait-secs N
       Wait time for ALSA sound card registration.
@@ -150,8 +151,8 @@ if [ "$AUDIO_EARLY_HELP_REQUESTED" -eq 1 ]; then
 fi
 
 # Resolve absolute output paths. The complete runner remains the root
-# orchestrator on Debian, so logs, results, inventory, and dmesg evidence stay
-# root-owned.
+# orchestrator on Debian and CentOS, so logs, results, inventory, and dmesg
+# evidence stay root-owned.
 RES_FILE="$SCRIPT_DIR/$TESTNAME.res"
 LOGDIR="$SCRIPT_DIR/results/$TESTNAME"
 
@@ -173,6 +174,11 @@ case "$audio_prepare_rc" in
         echo "$TESTNAME SKIP" > "$RES_FILE"
         exit 0
         ;;
+    3)
+        log_skip "$TESTNAME SKIP: AudioReach is not enabled for Ubuntu, rerun without --overlay to validate the base Audio stack"
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+        exit 0
+        ;;
     *)
         log_fail "$TESTNAME FAIL: audio package preparation failed"
         echo "$TESTNAME FAIL" > "$RES_FILE"
@@ -180,17 +186,29 @@ case "$audio_prepare_rc" in
         ;;
 esac
 
-# Prepare only the Debian Audio account and group membership. This ALSA-only
-# testcase does not require a systemd user manager and does not re-execute the
-# complete runner as debian.
-if ! command -v audio_prepare_debian_audio_environment >/dev/null 2>&1; then
-    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_debian_audio_environment"
+if ! command -v audio_prepare_backend_client_packages >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_backend_client_packages"
     echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 fi
 
-if ! audio_prepare_debian_audio_environment 0; then
-    log_fail "$TESTNAME FAIL: Debian Audio environment preparation failed"
+if ! audio_prepare_backend_client_packages alsa; then
+    log_fail "$TESTNAME FAIL: failed to prepare ALSA playback and recording clients"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+# Prepare only the desktop Audio account and group membership. This ALSA-only
+# testcase does not require a systemd user manager and does not re-execute the
+# complete runner as the regular user.
+if ! command -v audio_prepare_desktop_audio_environment >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_desktop_audio_environment"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! audio_prepare_desktop_audio_environment 0; then
+    log_fail "$TESTNAME FAIL: desktop Audio environment preparation failed"
     echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 fi
@@ -386,7 +404,7 @@ fi
 # This testcase intentionally performs no PipeWire/PulseAudio runtime setup.
 # Do not call audio_prepare_overlay_runtime(), audio_restart_pipewire_service(),
 # or audio_restart_services_best_effort() here. Only the ALSA node validation
-# helpers below are executed as the Debian Audio user.
+# helpers below are executed as the prepared desktop Audio user.
 
 log_info "--------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase --------------------------"
@@ -547,4 +565,3 @@ fi
 
 log_info "------------------- Completed $TESTNAME Testcase --------------------------"
 exit 0
-

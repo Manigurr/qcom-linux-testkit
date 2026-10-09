@@ -19,8 +19,17 @@ This suite automates the validation of audio playback capabilities on Qualcomm L
   - Unique testcase IDs prevent LAVA testcase ID collisions
   - Enables running multiple AudioPlayback configurations simultaneously in CI
 - Plays audio clips with configurable format, duration, and loop count
+- Validates every WAV before playback and emits machine-readable
+  `AUDIO_VALIDATION` records for both clip integrity and playback execution
 - **Network operations are optional**: By default, no network connection is attempted. Use `--enable-network-download` to enable downloading missing audio files
 - Automatically downloads and extracts audio assets if missing
+
+Playback clip validation blocks only on basic integrity failures: corrupt or
+empty WAV files, header-only payloads, all-zero audio, materially short clips,
+or filename metadata that disagrees with the WAV header. RMS, peak, clipping,
+digital-silence runs, DC offset, large sample transitions, and silent-channel
+counts are reported as diagnostic `AUDIO_VALIDATION` metrics and do not fail the
+default policy.
 - Validates playback using multiple evidence sources:
   - PipeWire/PulseAudio streaming state
   - ALSA and ASoC runtime status
@@ -57,24 +66,100 @@ The test suite includes 10 diverse audio clip configurations covering various sa
 
 ## Prerequisites
 
-Ensure the following components are present in the target Yocto build:
+Yocto images must provide the following components. The suite does not change
+the Yocto package flow.
 
-- PipeWire: `pw-play`, `wpctl`
+- PipeWire: `pw-play` or `pw-cat --playback`, plus `wpctl`. CentOS provides
+  these playback clients in the `pipewire-utils` image package.
 - PulseAudio: `paplay`, `pactl`
 - ALSA: `aplay`, `amixer`, `alsaucm` when UCM is available
-- Common tools: `pgrep`, `timeout`, `grep`, `wget`, `tar`
+- Common tools: `pgrep`, `timeout`, `grep`, `tar`, and either `curl` or `wget`
 - Daemon: `pipewire` or `pulseaudio` must be running
+
+On Debian, Ubuntu, and CentOS, the selected backend controls client package
+recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
+`aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
+Yocto continues to use image-provided clients.
+
+### Ubuntu package preparation
+
+When run as root, the suite uses the shared package provider to install missing
+Ubuntu audio packages. It does not run a blanket distribution upgrade.
+When network download is requested and neither downloader is present, Ubuntu
+uses the shared package provider to install the complete `audio-download` set,
+`curl wget`, from the image's configured APT sources. Other distributions keep
+their image-provided downloader policy. Each displayed download attempt has a
+finite deadline. If recovery is unavailable or fails, the suite skips and
+reports the missing prerequisite.
+
+If the target already has a valid global IPv4 address but the generic ICMP
+probe is blocked, the suite preserves the active interface and lets the bounded
+HTTPS download validate endpoint reachability. It does not cycle Wi-Fi, renew
+DHCP, or probe unrelated network services in that state. CentOS targets using
+the systemd-managed `NetworkManager.service` are recognized through `nmcli`
+when network activation is actually required. The absence of
+`systemd-networkd` or ConnMan is not reported when NetworkManager is active.
+
+- `auto` is the default profile. It selects `desktop` when `graphical.target`
+  is active and otherwise selects `server`.
+- `server` ensures `alsa-utils` for ALSA playback.
+- `desktop` ensures `alsa-utils`, `pipewire`, `pipewire-pulse`, `wireplumber`,
+  `pipewire-bin`, and `pulseaudio-utils`.
+- AudioReach is not enabled for Ubuntu. An explicit `--overlay` request reports
+  SKIP before any AudioReach source refresh or package operation. Rerun without
+  `--overlay` to validate the Ubuntu base Audio stack.
+- Set `AUDIO_PACKAGE_UPDATE=1` only when installed packages should be upgraded
+  as part of the test preparation.
+
+The optional `snd-soc-wcd938x` codec module is loaded only when the running
+kernel provides it. Targets without that module are unchanged.
+
+### CentOS Stream 10 overlay preparation
+
+An explicit `./run.sh --overlay` request ensures EPEL and the Qualcomm CentOS
+10 aarch64 and noarch repositories, refreshes DNF metadata, and installs:
+
+```text
+audioreach-dkms audioreach-pal audioreach-pipewire-plugin
+```
+
+If the DKMS package changes, the suite requests a reboot before validation.
+In base mode, CentOS recovers only the complete client set for the selected
+backend from the configured distribution repositories.
+
+Backend client checks run after package recovery. PipeWire uses `pw-play` when
+available and falls back to `pw-cat --playback`. Automatic backend selection
+falls back to an available ALSA path. Package-recovery failure is reported as
+FAIL before any audio-clip download begins.
+
+When launched by root on Debian or CentOS, the suite discovers and prepares the
+regular desktop audio user, then runs PipeWire, PulseAudio, UCM, mixer, and PCM
+operations in that user's context. Yocto retains its native execution model,
+and Ubuntu continues to use its dynamically discovered desktop session.
+
+```sh
+# Let the suite detect a server or desktop Ubuntu image
+./run.sh --clip-name "playback_config1 playback_config7"
+
+# Force desktop package preparation
+AUDIO_PACKAGE_PROFILE=desktop \
+  ./run.sh --clip-name "playback_config1 playback_config7"
+
+# Upgrade the selected profile's installed packages
+AUDIO_PACKAGE_PROFILE=desktop AUDIO_PACKAGE_UPDATE=1 \
+  ./run.sh --clip-name "playback_config1 playback_config7"
+```
 
 ## Backend and Route Selection
 
-When no backend is requested, the suite uses automatic selection. A physical PipeWire audio sink uses `pw-play`, and a physical PulseAudio sink uses `paplay`. Dummy, null, monitor, and loopback PipeWire sinks are not accepted as speaker routes.
+When no backend is requested, the suite uses automatic selection. A physical PipeWire audio sink uses `pw-play` or `pw-cat --playback`, and a physical PulseAudio sink uses `paplay`. For the `speakers` route, a speaker endpoint takes precedence over headphones, then other physical outputs. Dummy, null, monitor, and loopback PipeWire sinks are not accepted as speaker routes.
 
-If automatic selection finds no physical managed speaker sink, the suite probes direct ALSA playback. It selects an ALSA card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `aplay -D <device>`. This supports the Shikra primary-MI2S, secondary-TDM, and codec-direct route capabilities without selecting a form factor or assuming card `0`.
+If automatic selection finds no physical managed speaker sink, the suite probes direct ALSA playback. It selects an ALSA card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `aplay -D <device>`. This supports the Shikra primary-MI2S, secondary-TDM, and codec-direct route capabilities without selecting a form factor or assuming card `0`. When the audio remoteproc preflight proves that audio is applicable, failure of both managed-sink discovery and direct ALSA probing is reported as FAIL so the image or runtime regression remains tracked. The same absence remains SKIP only when runtime preflight found no applicable audio subsystem.
 
 An explicit backend request is never replaced:
 
-- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-play` only and skips if PipeWire has no physical speaker sink.
-- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `paplay` only and skips if no matching sink is available.
+- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-play` or `pw-cat --playback`. A missing optional client can skip, but a ready backend with no requested physical sink fails.
+- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `paplay` only. A ready backend with no requested sink fails.
 - `--backend alsa` or `AUDIO_BACKEND=alsa` runs `aplay` with the discovered ALSA route.
 
 ## Audio Remoteproc Preflight
@@ -236,13 +321,15 @@ CLIP_FILTER              Filter clips by pattern (e.g., "48KHz" or "16b" or "2ch
 FORMATS	                 Audio formats: e.g. wav	                       wav
 DURATIONS	             Playback durations: short, medium, long (legacy mode only)    ""
 LOOPS	                 Number of playback loops	                       1
-TIMEOUT	                 Playback timeout per loop (e.g., 15s, 0=none)     "10s"
+TIMEOUT	                 Playback timeout per loop (0=automatic for discovered clips) "10s"
 STRICT	                 Enable strict mode (fail on any error)            0
 DMESG_SCAN	             Scan dmesg for errors after playback	           1
 VERBOSE	                 Enable verbose logging                            0
 EXTRACT_AUDIO_ASSETS     Download/extract audio assets if missing	       true
 ENABLE_NETWORK_DOWNLOAD  Enable network download of missing audio files    false
 AUDIO_CLIPS_BASE_DIR     Custom path to pre-staged audio clips (CI use)    unset
+AUDIO_PACKAGE_PROFILE    Ubuntu package profile: auto, server, or desktop  auto
+AUDIO_PACKAGE_UPDATE     Upgrade selected Ubuntu audio packages             0
 JUNIT_OUT                Path to write JUnit XML output                    unset
 SSID                     Wi-Fi SSID for network connection                 unset
 PASSWORD                 Wi-Fi password for network connection             unset
@@ -261,7 +348,7 @@ Option	                    Description
 --formats	                Audio formats (space/comma separated): e.g. wav 
 --durations	                Playback durations: short, medium, long (legacy mode only)
 --loops	                    Number of playback loops
---timeout	                Playback timeout per loop (e.g., 15s)
+--timeout <duration>      Playback timeout per loop; 0 uses clip duration plus five seconds in discovery mode
 --strict	                Enable strict mode
 --no-dmesg	                Disable dmesg scan
 --no-extract-assets         Disable asset extraction entirely (skips all asset operations)
@@ -366,7 +453,7 @@ sh-5.3# ./run.sh --clip-name "playback_config1" --res-suffix "Config01" --audio-
 [INFO] 2026-01-22 17:46:33 - ---------------- Starting AudioPlayback ----------------
 [INFO] 2026-01-22 17:46:33 - Using clip discovery mode
 [INFO] 2026-01-22 17:46:33 - Discovered 1 clips to test
-[INFO] 2026-01-22 17:46:33 - [play_16KHz_16b_2ch] Clip duration: 30s (timeout threshold: 29s)
+[INFO] 2026-01-22 17:46:33 - [play_16KHz_16b_2ch] Clip duration: 30s (minimum successful runtime: 29s)
 [PASS] 2026-01-22 17:47:04 - [play_16KHz_16b_2ch] loop 1 OK (rc=0, 30s)
 [PASS] 2026-01-22 17:47:04 - AudioPlayback PASS
 
@@ -415,7 +502,7 @@ Results:
 - Results are stored in: results/AudioPlayback/ (or results/AudioPlayback_<suffix>/ when using --res-suffix)
 - Summary result file: AudioPlayback.res (or AudioPlayback_<suffix>.res when using --res-suffix)
 - JUnit XML (if enabled): <your-path>.xml
-- Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case
+- Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case, and `alsa_playback_probe.log` containing the selected direct-ALSA candidate, probe command, exit status, and `aplay` error output
 - **Note**: When using --res-suffix, both result files AND log directories are unique per invocation, preventing log collisions in CI/LAVA workflows
 
 

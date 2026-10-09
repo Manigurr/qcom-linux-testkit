@@ -4,6 +4,13 @@
 
 This suite automates the validation of audio recording capabilities on Qualcomm Linux-based platforms. It supports PipeWire, PulseAudio, and direct ALSA backends with robust evidence-based PASS/FAIL logic, asset management, and diagnostic logging.
 
+The default CI policy blocks corrupt or empty WAV files, header-only payloads,
+all-zero audio, materially short captures, and explicitly requested format
+mismatches. RMS, peak, clipping, digital-silence runs, DC offset, large sample
+transitions, and silent-channel counts are emitted as diagnostic
+`AUDIO_VALIDATION` metrics. These metrics do not fail the default policy unless
+strict signal validation is explicitly enabled.
+
 ## Features
 
 - Supports **PipeWire**, **PulseAudio**, and direct **ALSA** backends
@@ -61,16 +68,25 @@ Ensure the following components are present in the target Yocto build:
 - Common tools: `pgrep`, `timeout`, `grep`, `sed`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+On Debian, Ubuntu, and CentOS, the selected backend controls client package
+recovery. PipeWire ensures `pw-play`, `pw-record`, and `wpctl`; ALSA ensures
+`aplay` and `arecord`; PulseAudio ensures `paplay`, `parecord`, and `pactl`.
+Yocto continues to use image-provided clients.
+
+When launched by root on Debian or CentOS, the suite discovers and prepares the
+regular desktop audio user, then runs PipeWire, PulseAudio, UCM, mixer, and PCM
+operations in that user's context. Yocto retains its native execution model.
+
 ## Backend and Route Selection
 
 When no backend is requested, the suite uses automatic selection. A real PipeWire audio source uses `pw-record`, and a real PulseAudio source uses `parecord`. Camera, dummy, null, monitor, and loopback PipeWire nodes are not accepted as microphone sources.
 
-If automatic selection finds no physical managed microphone source, the suite probes direct ALSA capture. It selects a card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `arecord -D <device>`. This discovers the VA-DMIC capture route from its controls without selecting a form factor or assuming card `0`.
+If automatic selection finds no physical managed microphone source, the suite probes direct ALSA capture. It selects a card and PCM from the available device inventory, applies only mixer controls exposed by that card, and runs `arecord -D <device>`. This discovers the VA-DMIC capture route from its controls without selecting a form factor or assuming card `0`. When audio remoteproc preflight proves that audio is applicable, failure of both managed-source discovery and direct ALSA probing is reported as FAIL so the image or runtime regression remains tracked. The same absence remains SKIP only when runtime preflight found no applicable audio subsystem.
 
 An explicit backend request is never replaced:
 
-- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-record` only and skips if PipeWire has no physical microphone source.
-- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `parecord` only and skips if no matching source is available.
+- `--backend pipewire` or `AUDIO_BACKEND=pipewire` runs `pw-record` only and fails if the requested physical microphone source is unavailable.
+- `--backend pulseaudio` or `AUDIO_BACKEND=pulseaudio` runs `parecord` only and fails if the requested source is unavailable.
 - `--backend alsa` or `AUDIO_BACKEND=alsa` runs `arecord` with the discovered ALSA route.
 
 ## Audio Remoteproc Preflight
@@ -80,6 +96,21 @@ Before backend discovery, the suite enumerates runtime remoteprocs and checks th
 If the matching remoteproc is `running`, the suite records its name and firmware evidence. If it is `offline`, the suite starts it only after confirming the corresponding firmware is provisioned. Generic audio DSP paths also require adjacent topology evidence. Shikra's modem-hosted path does not require an adjacent topology file because its public image packages `qdsp6sw` modem firmware and `lpaicp` audio firmware separately. The suite never stops a remoteproc. Platforms with no applicable audio remoteproc continue normally. Provisioning or start issues produce a clean skip with the reason.
 
 ## Overlay Build Support
+
+AudioReach is not enabled for Ubuntu. An explicit `./run.sh --overlay` request
+reports SKIP before any AudioReach source refresh or package operation. Rerun
+without `--overlay` to validate the Ubuntu base Audio stack.
+
+On CentOS Stream 10, an explicit `./run.sh --overlay` request ensures EPEL and
+the Qualcomm aarch64 and noarch RPM repositories, refreshes DNF metadata, and
+installs `audioreach-dkms`, `audioreach-pal`, and
+`audioreach-pipewire-plugin`. If the DKMS package changes, reboot before
+rerunning validation. Yocto remains image-provided and non-installing.
+
+Backend client checks run after recovery of the selected backend's complete
+playback and recording client package set. Package recovery failure is reported
+as FAIL. A client that remains unavailable after successful recovery produces
+a clean SKIP for the unavailable recording path.
 
 For overlay builds using audioreach kernel modules, the test automatically:
 - Detects the overlay build configuration
@@ -201,7 +232,8 @@ CONFIG_FILTER     Filter configs by pattern (e.g., "48KHz" or "2ch")            
 DURATIONS	      Recording durations: short, medium, long (legacy mode only)     ""
 RECORD_SECONDS	  Number of seconds to record (e.g., 5s, 10s)                     30s
 LOOPS	          Number of recording loops	                                      1
-TIMEOUT	          Recording timeout per loop (e.g., 15s, 0=none)                  0
+TIMEOUT	          Explicit timeout override (e.g., 15s, 0=automatic)              0
+AUDIO_RECORD_START_GRACE Startup headroom added to the automatic watchdog       5
 STRICT	          Strict mode (0=disabled, 1=enabled, fail on any error)	      0
 DMESG_SCAN	      Scan dmesg for errors after recording	                          1
 VERBOSE	          Enable verbose logging	                                      0
@@ -219,7 +251,8 @@ Option	                      Description
 --record-seconds <duration>   Number of seconds to record (e.g., 5s, 10s)
 --durations	                  Recording durations: short, medium, long (legacy mode only)
 --loops	                      Number of recording loops
---timeout	                  Recording timeout per loop (e.g., 15s)
+--timeout <duration>          Override the automatic duration-based watchdog
+--start-grace <seconds>      Recorder startup headroom, default: 5
 --strict [0|1]                Enable strict mode (0=disabled, 1=enabled)
 --no-dmesg	                  Disable dmesg scan
 --res-suffix <suffix>         Suffix for unique result file and log directory (e.g., "Config01" generates AudioRecord_Config01.res and results/AudioRecord_Config01/)
@@ -229,6 +262,28 @@ Option	                      Description
 --help	                      Show usage instructions
 ```
 
+### Recording watchdog and clock handling
+
+When `TIMEOUT=0`, AudioRecord uses an automatic watchdog for recorder commands.
+The watchdog duration is the requested recording duration plus
+`AUDIO_RECORD_START_GRACE`, which defaults to five seconds. The additional time
+allows PipeWire or PulseAudio to establish the stream without reducing the WAV
+duration being validated. An explicit `--timeout` value overrides the automatic
+watchdog and does not receive startup grace.
+
+Watchdog deadlines and elapsed-time reporting use monotonic uptime rather than
+the system wall clock. RTC or NTP corrections during recording therefore do not
+terminate the recorder early or produce an invalid elapsed time. When the wall
+clock changes materially during a case, stdout includes a diagnostic such as:
+
+```text
+[WARN] ... [record_8KHz_1ch] [AUDIO-CLOCK] wall-clock correction detected step=4581451s, watchdog and elapsed accounting used monotonic time
+```
+
+The requested recording duration remains the WAV validation target. Startup
+grace affects only when the recorder is stopped, so a valid recording may be
+longer than the requested minimum.
+
 Sample Output:
 
 **Example 1: Testing specific config using config naming**
@@ -237,20 +292,20 @@ sh-5.3# ./run.sh --config-name "record_config1"
 [INFO] 2026-01-02 12:00:46 - Base build detected (no audioreach modules), skipping overlay setup
 [INFO] 2026-01-02 12:00:46 - ---------------- Starting AudioRecord ----------------
 [INFO] 2026-01-02 12:00:46 - Platform Details: machine='Qualcomm Technologies, Inc. Robotics RB3gen2' target='Kodiak' kernel='6.18.0-00393-g27507852413b' arch='aarch64'
-[INFO] 2026-01-02 12:00:46 - Args: backend=auto source=mic loops=1 durations='short' record_seconds=30s timeout=0 strict=0 dmesg=1
+[INFO] 2026-01-02 12:00:46 - Args: backend=auto source=mic overlay=0 loops=1 durations='' record_seconds=30s timeout=0 start_grace=5 strict=0 signal_strict=0 dmesg=1 bootstrap=auto runtime_dir=auto
 [INFO] 2026-01-02 12:00:46 - Backend fallback chain: pipewire pulseaudio alsa
 [INFO] 2026-01-02 12:00:46 - Using backend: pipewire
 [INFO] 2026-01-02 12:00:46 - Routing to source: id/name=45 label='Built-in Audio internal Mic' choice=mic
-[INFO] 2026-01-02 12:00:46 - Watchdog/timeout: disabled (no timeout)
+[INFO] 2026-01-02 12:00:46 - Watchdog/timeout: automatic per case, requested duration plus start_grace=5s
 [INFO] 2026-01-02 12:00:46 - Using config discovery mode
 [INFO] 2026-01-02 12:00:46 - Discovered 1 configs to test
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] Using config: record_config1 (rate=8000Hz channels=1)
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] loop 1/1 start=2026-01-02T12:00:46Z rate=8000Hz channels=1 backend=pipewire source=mic(45)
 [INFO] 2026-01-02 12:00:46 - [record_8KHz_1ch] exec: pw-record -v --rate=8000 --channels=1 "results/AudioRecord/record_8KHz_1ch.wav"
-[WARN] 2026-01-02 12:01:16 - [record_8KHz_1ch] nonzero rc=124 but recording looks valid (bytes=482634) - PASS
+[INFO] 2026-01-02 12:01:16 - Recorder ended through expected watchdog timeout rc=124, validated WAV payload is accepted
 [INFO] 2026-01-02 12:01:16 - [record_8KHz_1ch] evidence: pw_streaming=1 pa_streaming=0 alsa_running=1 asoc_path_on=1 bytes=482634 pw_log=1
 [PASS] 2026-01-02 12:01:16 - [record_8KHz_1ch] loop 1 OK (rc=0, 30s, bytes=482634)
-[INFO] 2026-01-02 12:01:16 - No relevant, non-benign errors for modules [results/AudioRecord] in recent dmesg.
+[INFO] 2026-01-02 12:01:16 - No relevant, non-benign errors for modules [snd|asoc|audio|lpass|q6|codec|xrun|underrun|overrun|pipewire|pulseaudio] in recent dmesg.
 [INFO] 2026-01-02 12:01:16 - Summary: total=1 pass=1 fail=0 skip=0
 [PASS] 2026-01-02 12:01:16 - AudioRecord PASS
 ```
