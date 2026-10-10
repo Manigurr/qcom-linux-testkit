@@ -768,7 +768,7 @@ video_validate_upstream_loaded() {
     fi
  
     case "$plat" in
-        lemans|monaco|pakala|shikra|glymur|talos)
+        lemans|monaco|pakala|shikra|glymur|talos|hamoa|purwa)
             # Any upstream build has qcom_iris present
             if video_has_module_loaded qcom_iris; then
                 return 0
@@ -786,6 +786,19 @@ video_validate_upstream_loaded() {
                 return 0
             fi
  
+            return 1
+            ;;
+
+        *)
+            # Fallback for unknown/unrecognized platforms: detect by loaded modules
+            # If qcom_iris is loaded (iris-based upstream), treat as upstream
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
+                return 0
+            fi
+            # If Venus trio is loaded (Venus-based upstream), treat as upstream
+            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc; then
+                return 0
+            fi
             return 1
             ;;
     esac
