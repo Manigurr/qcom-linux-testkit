@@ -52,7 +52,7 @@ run:
       fi
 
       case "$TL" in
-        kodiak|lemans|monaco|pakala|shikra|tolos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
+        kodiak|lemans|monaco|pakala|shikra|talos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
         *) PLAT="" ;; # autodetect
       esac
 
