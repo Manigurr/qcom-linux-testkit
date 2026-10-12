@@ -666,24 +666,29 @@ video_normalize_stack() {
 }
 
 # -----------------------------------------------------------------------------
-# Platform detect → lemans|monaco|kodiak|unknown
+# Platform detect → supported platform name|unknown
 # -----------------------------------------------------------------------------
 video_detect_platform() {
     model=""
     compat=""
- 
-    if [ -r /proc/device-tree/model ]; then
-        model=$(tr -d '\000' </proc/device-tree/model 2>/dev/null)
-    fi
- 
-    if [ -r /proc/device-tree/compatible ]; then
-        compat=$(tr -d '\000' </proc/device-tree/compatible 2>/dev/null)
-    fi
- 
-    s=$(printf '%s\n%s\n' "$model" "$compat" | tr '[:upper:]' '[:lower:]')
+
+    for dtbase in /proc/device-tree /sys/firmware/devicetree/base; do
+        if [ -z "$model" ] && [ -r "$dtbase/model" ]; then
+            model="$(tr -d '\000' <"$dtbase/model" 2>/dev/null)"
+        fi
+        if [ -z "$compat" ] && [ -r "$dtbase/compatible" ]; then
+            compat="$(tr -d '\000' <"$dtbase/compatible" 2>/dev/null)"
+        fi
+    done
+
+    fallback=""
+    [ -r /proc/cmdline ] && fallback="$(cat /proc/cmdline 2>/dev/null)"
+    [ -r /etc/hostname ] && fallback="$fallback $(cat /etc/hostname 2>/dev/null)"
+    fallback="$fallback $(uname -n 2>/dev/null)"
+    s="$(printf '%s\n%s\n%s\n' "$model" "$compat" "$fallback" | tr '[:upper:]' '[:lower:]')"
  
     # Pakala: sm8750, pakala
-    pakala_pat='sm8750|pakala'
+    pakala_pat='sm8750|sm8750-mtp|pakala'
  
     # Shikra: shikra, cq2390, cq2390m, iq2390, iq2390s
     shikra_pat='shikra|cq2390|cq2390m|iq2390|iq2390s'
@@ -763,9 +768,9 @@ video_detect_platform() {
 video_validate_upstream_loaded() {
     plat="$1"
  
-    if [ -z "$plat" ]; then
-        plat="$(video_detect_platform)"
-    fi
+    case "$plat" in
+        ""|auto|unknown) plat="$(video_detect_platform)" ;;
+    esac
  
     case "$plat" in
         lemans|monaco|pakala|shikra|glymur|talos|hamoa|purwa)
@@ -880,9 +885,9 @@ video_assert_stack() {
 video_stack_status() {
     plat="$1"
  
-    if [ -z "$plat" ]; then
-        plat="$(video_detect_platform)"
-    fi
+    case "$plat" in
+        ""|auto|unknown) plat="$(video_detect_platform)" ;;
+    esac
  
     case "$plat" in
         lemans|monaco|glymur)
@@ -1109,9 +1114,9 @@ video_ensure_stack() {
     want_raw="$1" # upstream|downstream|auto|base|overlay|up|down
     plat="$2"
  
-    if [ -z "$plat" ]; then
-        plat="$(video_detect_platform)"
-    fi
+    case "$plat" in
+        ""|auto|unknown) plat="$(video_detect_platform)" ;;
+    esac
  
     want="$(video_normalize_stack "$want_raw")"
  
