@@ -85,6 +85,9 @@ if [ -z "${VIDEO_FW_BACKUP_DIR:-}" ]; then VIDEO_FW_BACKUP_DIR=""; fi
 if [ -z "${VIDEO_NO_REBOOT:-}" ]; then VIDEO_NO_REBOOT="0"; fi
 if [ -z "${VIDEO_FORCE:-}" ]; then VIDEO_FORCE="0"; fi
 if [ -z "${VIDEO_APP:-}" ]; then VIDEO_APP="/usr/bin/iris_v4l2_test"; fi
+# Kodiak firmware is loaded automatically by the kernel/driver.
+# This option only enables validation of firmware-load errors.
+if [ -z "${KODIAK_FW_CHECK:-}" ]; then KODIAK_FW_CHECK="1"; fi
 
 
 # --- Net/DL tunables (no-op if helpers ignore them) ---
@@ -109,6 +112,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--stack auto|upstream|downstream|base|overlay|up|down|both]
           [--platform pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa]
           [--force]
+          [--kodiak-fw-check true|false] # validate Kodiak firmware-load errors
           [--app /path/to/iris_v4l2_test]
           [--ssid SSID] [--password PASS]
           [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
@@ -201,6 +205,10 @@ while [ $# -gt 0 ]; do
         --force)
             VIDEO_FORCE=1
             ;;
+        --kodiak-fw-check)
+            shift
+            KODIAK_FW_CHECK="$1"
+            ;;
         --app)
             shift
             VIDEO_APP="$1"
@@ -272,6 +280,7 @@ done
 
 # Export envs used by lib
 export VIDEO_APP
+export KODIAK_FW_CHECK
 export VIDEO_FW_BACKUP_DIR
 export VIDEO_NO_REBOOT
 export VIDEO_FORCE
@@ -295,6 +304,71 @@ video_resolve_platform() {
         pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa) printf '%s\n' "$normalized" ;;
         *) log_warn "Ignoring unsupported VIDEO_PLATFORM='$candidate'; detecting from device tree."; video_detect_platform ;;
     esac
+}
+
+# --- Kodiak downstream stack validation ---
+# Kodiak downstream must use iris_vpu. Upstream Kodiak modules must not be
+# loaded at the same time. Firmware is not manually loaded by this script.
+video_kodiak_validate_downstream_stack() {
+    if [ "$plat" != "kodiak" ]; then return 0; fi
+    case "$(video_normalize_stack "$VIDEO_STACK")" in
+        downstream|overlay|down) ;;
+        *) return 0 ;;
+    esac
+    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_fail "$TESTNAME FAIL - Kodiak downstream requires iris_vpu to be loaded"
+        return 1
+    fi
+    for upstream_module in qcom_iris venus_core venus_dec venus_enc; do
+        if video_has_module_loaded "$upstream_module" 2>/dev/null; then
+            log_fail "$TESTNAME FAIL - Kodiak downstream rejected: upstream module $upstream_module is loaded"
+            return 1
+        fi
+    done
+    log_pass "Kodiak downstream stack validated: iris_vpu loaded and upstream modules absent"
+    return 0
+}
+
+# --- Kodiak downstream firmware validation ---
+# No manual firmware loading is performed. The kernel/driver requests the
+# firmware through the normal Linux firmware mechanism. This check rejects
+# only clear video firmware-load failures reported by dmesg.
+video_kodiak_validate_downstream_firmware() {
+    if [ "$plat" != "kodiak" ]; then
+        return 0
+    fi
+
+    case "$(video_normalize_stack "$VIDEO_STACK")" in
+        downstream|overlay|down) ;;
+        *) return 0 ;;
+    esac
+
+    if [ "${KODIAK_FW_CHECK:-1}" != "1" ]; then
+        log_info "Kodiak downstream firmware error check disabled"
+        return 0
+    fi
+
+    if ! command -v dmesg >/dev/null 2>&1; then
+        log_warn "dmesg is unavailable; cannot validate Kodiak firmware messages"
+        return 0
+    fi
+
+    firmware_errors="$(
+        dmesg 2>/dev/null |
+            grep -Ei \
+                'firmware: failed to load|firmware.*not found|failed to load.*(iris|venus|video)|'\
+'(iris|venus|video).*firmware.*(failed|error|not found)' |
+            tail -n 10
+    )"
+
+    if [ -n "$firmware_errors" ]; then
+        log_fail "$TESTNAME FAIL - Kodiak downstream firmware error detected"
+        printf '%s\n' "$firmware_errors"
+        return 1
+    fi
+
+    log_pass "Kodiak downstream firmware check passed (no firmware-load errors)"
+    return 0
 }
 
 # --- EARLY dependency check (bail out fast) ---
@@ -599,6 +673,9 @@ if [ "${VIDEO_STACK}" = "both" ]; then
 
         if [ "${VIDEO_FORCE:-0}" -eq 1 ]; then
             args="$args --force"
+        fi
+        if [ -n "${KODIAK_FW_CHECK:-}" ]; then
+            args="$args --kodiak-fw-check $(printf %s "$KODIAK_FW_CHECK")"
         fi
 
         if [ -n "${VIDEO_APP:-}" ]; then
@@ -917,13 +994,24 @@ case "$VIDEO_STACK" in
                 msg="iris_vpu missing or qcom_iris still loaded"
                 ;;
             kodiak)
-                msg="iris_vpu missing or one or more Venus modules are still loaded"
+                msg="iris_vpu missing or one or more upstream modules are still loaded"
                 ;;
             *)
                 msg="required downstream modules not present for platform $plat"
                 ;;
         esac
         log_fail "[STACK] Downstream requested but $msg; aborting."
+        printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+    fi
+
+    if ! video_kodiak_validate_downstream_stack; then
+        log_fail "[STACK] Kodiak downstream module validation failed; aborting."
+        printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+    fi
+    if ! video_kodiak_validate_downstream_firmware; then
+        log_fail "[STACK] Kodiak downstream firmware validation failed; aborting."
         printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
         exit 1
     fi
