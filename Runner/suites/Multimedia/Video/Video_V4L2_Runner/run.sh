@@ -371,6 +371,25 @@ video_kodiak_validate_downstream_firmware() {
     return 0
 }
 
+# Kodiak downstream module loading: load iris_vpu only; firmware is loaded by the kernel/driver.
+video_kodiak_load_downstream_module() {
+    [ "${plat:-}" = "kodiak" ] || return 0
+    case "$(video_normalize_stack "$VIDEO_STACK")" in downstream|overlay|down) ;; *) return 0 ;; esac
+    if video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_info "Kodiak downstream: iris_vpu is already loaded"
+        return 0
+    fi
+    if command -v modprobe >/dev/null 2>&1; then
+        log_info "Kodiak downstream: loading iris_vpu with modprobe"
+        modprobe iris_vpu >/dev/null 2>&1 || true
+    fi
+    if video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_pass "Kodiak downstream: iris_vpu loaded; firmware handled by kernel/driver"
+        return 0
+    fi
+    log_fail "$TESTNAME FAIL - Kodiak downstream requires iris_vpu to be loaded"
+    return 1
+}
 # --- EARLY dependency check (bail out fast) ---
 
 # Ensure the app is executable if a path was provided but lacks +x
@@ -940,6 +959,11 @@ fi
 log_info "Video stack (post): $post_stack"
 
 video_dump_stack_state "post" "$video_stack_probe_mode"
+# Ensure Kodiak downstream has iris_vpu loaded; firmware is not pushed here.
+if ! video_kodiak_load_downstream_module; then
+    printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+fi
 
 # --- Custom .ko load assist (only if user provided --ko-dir) ---
 if [ -n "${KO_DIRS:-}" ]; then
