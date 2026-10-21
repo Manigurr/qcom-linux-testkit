@@ -1,0 +1,39 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name" : "Encoder Testcase - hierb",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1920_1080.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1920,
+                "Height": 1080,
+                "Outputpath": "output_folder/avc_encoder_hierb_output_1920_1080.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile", "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level", "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC", "Vtype": "Int", "Value": 1},
+                    {"Id": "BitRate", "Vtype": "Int", "Value": 40000000},
+                    {"Id": "BitRateMode", "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"},
+                    {"Id": "HierarchicalCoding", "Vtype": "Int", "Value": 1},
+                    {"Id": "HierarchicalCodingType", "Vtype": "String", "Value": "HierB"},
+                    {"Id": "HierarchicalLayerCount", "Vtype": "Int", "Value": 3},
+                    {"Id": "HierCodingL0BR", "Vtype": "Int", "Value": 20000000},
+                    {"Id": "HierCodingL1BR", "Vtype": "Int", "Value": 12000000},
+                    {"Id": "HierCodingL2BR", "Vtype": "Int", "Value": 8000000}
+                ],
+                "DynamicControls": [
+
+                ]
+            }
+        }
+    ]
+}

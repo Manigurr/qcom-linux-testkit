@@ -1,0 +1,141 @@
+{
+    "ExecutionMode": "Concurrent",
+    "TestCases": [
+        {
+            "Name": "Decoder Testcase 1",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output1_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 2",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output2_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 3",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output3_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 4",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output4_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 5",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output5_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 6",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output6_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 7",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output7_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 8",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1280_720.h265",
+              "NumFrames": 100,
+              "Width": 1280,
+              "Height": 720,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output8_1280_720.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+    ]
+}

@@ -1,0 +1,9 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: vpx
+Description: WebM Project VPx codec implementation
+Version: 1.15.2
+Libs: -L${libdir} -lvpx -pthread -lm
+Cflags: -I${includedir} -pthread

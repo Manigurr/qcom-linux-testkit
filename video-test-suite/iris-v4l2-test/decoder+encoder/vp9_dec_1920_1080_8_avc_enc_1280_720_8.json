@@ -1,0 +1,341 @@
+{
+    "ExecutionMode": "Concurrent",
+    "TestCases": [
+        {
+            "Name": "Decoder Testcase 1",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output1_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 2",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output2_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 3",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output3_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 4",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output4_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 5",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output5_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 6",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output6_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 7",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output7_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name": "Decoder Testcase 8",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/vp9_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "VP9",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/vp9_decoder_output8_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        },
+        {
+            "Name" : "Encoder Testcase 1",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output1_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 2",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output2_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 3",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output3_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 4",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output4_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 5",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output5_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 6",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output6_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 7",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output7_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 8",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/avc_encoder_output8_1280_720.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+    ]
+}

@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: avformat
+Description: Multimedia formats
+Version: 61.7.100
+Requires: libavcodec, libavutil, libswresample, zlib
+Libs: -L${libdir} -lavformat -pthread -lm -latomic -lbz2
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

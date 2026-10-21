@@ -1,0 +1,35 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name" : "Encoder Testcase - multislice_maxbytes",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1920_1080.yuv",
+                "NumFrames": 100,
+                "CodecName": "AVC",
+                "PixelFormat": "NV12",
+                "Width": 1920,
+                "Height": 1080,
+                "Outputpath": "output_folder/avc_encoder_multislice_maxbytes_output_1920_1080.h264",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile", "Vtype": "String", "Value": "BASELINE"},
+                    {"Id": "Level", "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC", "Vtype": "Int", "Value": 1},
+                    {"Id": "BitRate", "Vtype": "Int", "Value": 40000000},
+                    {"Id": "BitRateMode", "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"},
+                    {"Id": "MultiSliceMode", "Vtype": "String", "Value": "MAX_BYTES"},
+                    {"Id": "MaxBytesPerSlice", "Vtype": "Int", "Value": 8192}
+                ],
+                "DynamicControls": [
+
+                ]
+            }
+        }
+    ]
+}

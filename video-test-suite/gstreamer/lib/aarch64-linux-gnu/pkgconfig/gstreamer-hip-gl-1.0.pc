@@ -1,0 +1,19 @@
+prefix=/usr
+datadir=${prefix}/share
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+exec_prefix=${prefix}
+toolsdir=${exec_prefix}/bin
+pluginsdir=${libdir}/gstreamer-1.0
+datarootdir=${prefix}/share
+girdir=${datadir}/gir-1.0
+typelibdir=${libdir}/girepository-1.0
+
+Name: gstreamer-hip-gl-1.0
+Description: GStreamer HIP library (OpenGL specifics)
+Version: 1.29.2.1
+Requires: gstreamer-1.0, gstreamer-base-1.0, gstreamer-video-1.0, gstreamer-gl-1.0, gstreamer-hip-1.0
+Requires.private: glib-2.0 >=  2.64.0, gobject-2.0, gmodule-no-export-2.0, gstreamer-allocators-1.0, orc-0.4
+Libs.private: -lm -latomic -pthread
+Cflags: -I${includedir}/gstreamer-1.0

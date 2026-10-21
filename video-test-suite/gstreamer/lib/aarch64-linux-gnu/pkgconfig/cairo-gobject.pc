@@ -1,0 +1,12 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: cairo-gobject
+Description: cairo-gobject for cairo graphics library
+Version: 1.18.4
+Requires: cairo, glib-2.0 >=  2.64.0, gobject-2.0
+Requires.private: pixman-1, zlib, libpng >= 1.0, fontconfig >=  2.13.0, freetype2 >=  23.0.17, x11, xext
+Libs: -L${libdir} -lcairo-gobject
+Libs.private: -lm -ldl
+Cflags: -I${includedir}/cairo

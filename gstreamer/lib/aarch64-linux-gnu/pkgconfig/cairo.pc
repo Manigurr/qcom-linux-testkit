@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: cairo
+Description: Multi-platform 2D graphics library
+Version: 1.18.4
+Requires.private: pixman-1, zlib, libpng >= 1.0, fontconfig >=  2.13.0, freetype2 >=  23.0.17, x11, xext
+Libs: -L${libdir} -lcairo
+Libs.private: -lm -ldl
+Cflags: -I${includedir}/cairo

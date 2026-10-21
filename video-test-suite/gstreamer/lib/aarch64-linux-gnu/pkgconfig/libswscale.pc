@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: swscale
+Description: FFmpeg image rescaling library
+Version: 8.3.100
+Requires: libavutil
+Libs: -L${libdir} -lswscale -pthread -lm -latomic
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

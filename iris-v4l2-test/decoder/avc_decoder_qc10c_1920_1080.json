@@ -1,0 +1,22 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name": "Decoder Testcase",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/avc_10bit_decoder_input_1920_1080.h264",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "AVC",
+              "PixelFormat": "QC10C",
+              "Outputpath": "output_folder/avc_qc10c_decoder_output_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        }
+    ]
+}

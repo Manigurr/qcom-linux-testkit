@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: swresample
+Description: FFmpeg audio resampling library
+Version: 5.3.100
+Requires: libavutil
+Libs: -L${libdir} -lswresample -pthread -lm -latomic
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

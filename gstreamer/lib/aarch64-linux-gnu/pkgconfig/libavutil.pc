@@ -1,0 +1,10 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: avutil
+Description: Multimedia utilities
+Version: 59.39.100
+Libs: -L${libdir} -lavutil -pthread -lm -latomic
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

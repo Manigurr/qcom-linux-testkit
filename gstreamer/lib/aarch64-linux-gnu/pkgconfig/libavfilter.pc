@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: avfilter
+Description: Audio/video filtering library
+Version: 10.4.100
+Requires: libavutil, libavformat, libavcodec, libswresample, libswscale, zlib
+Libs: -L${libdir} -lavfilter -pthread -lm -latomic -lbz2
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

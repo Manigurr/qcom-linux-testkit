@@ -1,0 +1,34 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name" : "Encoder Testcase - rotate270",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1920_1080.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1920,
+                "Height": 1080,
+                "Outputpath": "output_folder/hevc_encoder_rotate270_output_1920_1080.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile", "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level", "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC", "Vtype": "Int", "Value": 1},
+                    {"Id": "BitRate", "Vtype": "Int", "Value": 40000000},
+                    {"Id": "BitRateMode", "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"},
+                    {"Id": "Rotate", "Vtype": "Int", "Value": 270}
+                ],
+                "DynamicControls": [
+
+                ]
+            }
+        }
+    ]
+}

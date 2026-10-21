@@ -1,0 +1,605 @@
+{
+    "ExecutionMode": "Concurrent",
+    "TestCases": [
+        {
+            "Name" : "Encoder Testcase 1",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output1_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 2",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output2_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 3",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output3_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 4",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output4_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 5",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output5_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 6",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output6_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 7",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output7_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 8",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output8_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 9",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output9_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 10",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output10_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 11",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output11_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 12",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output12_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 13",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output13_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 14",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output14_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 15",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output15_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 16",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output16_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 17",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output17_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 18",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output18_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 19",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output19_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 20",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output20_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 21",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output21_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 22",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output22_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 23",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output23_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+        {
+            "Name" : "Encoder Testcase 24",
+            "TestConfigs" : {
+                "Domain": "Encoder",
+                "InputPath": "input_folder/encoder_input_1280_720.yuv",
+                "NumFrames": 100,
+                "CodecName": "HEVC",
+                "PixelFormat": "NV12",
+                "Width": 1280,
+                "Height": 720,
+                "Outputpath": "output_folder/hevc_encoder_output24_1280_720.h265",
+                "InputBufferCount": 4,
+                "OutputBufferCount": 4,
+                "OperatingRate": 30,
+                "FrameRate": 30,
+                "StaticControls": [
+                    {"Id": "Profile",          "Vtype": "String", "Value": "MAIN"},
+                    {"Id": "Level",            "Vtype": "String", "Value": "5.0"},
+                    {"Id": "FrameRC",          "Vtype": "Int",    "Value": 1},
+                    {"Id": "BitRate",          "Vtype": "Int",    "Value": 40000000},
+                    {"Id": "BitRateMode",      "Vtype": "String", "Value": "CBR"},
+                    {"Id": "PrefixHeaderMode", "Vtype": "String", "Value": "JOINED"}
+                ]
+            }
+        },
+    ]
+}

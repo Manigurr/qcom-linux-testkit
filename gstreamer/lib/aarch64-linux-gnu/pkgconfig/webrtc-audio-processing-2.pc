@@ -1,0 +1,10 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: webrtc-audio-processing-2
+Description: WebRTC Audio Processing library
+Version: 2.1
+Libs: -L${libdir} -lwebrtc-audio-processing-2
+Libs.private: -lrt -pthread
+Cflags: -I${includedir}/webrtc-audio-processing-2 -DWEBRTC_LIBRARY_IMPL -DWEBRTC_POSIX

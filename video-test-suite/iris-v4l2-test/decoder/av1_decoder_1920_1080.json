@@ -1,0 +1,22 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name": "Decoder Testcase",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/av1_decoder_input_1920_1080.ivf",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "AV1",
+              "PixelFormat": "NV12",
+              "Outputpath": "output_folder/av1_decoder_output_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        }
+    ]
+}

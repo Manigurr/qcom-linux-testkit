@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: avdevice
+Description: Media device handling
+Version: 61.3.100
+Requires: libavformat, libavcodec, libavutil, libswresample, libswscale, zlib, alsa, xcb >=  1.4
+Libs: -L${libdir} -lavdevice -pthread -lm -latomic -lbz2 -lavfilter
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

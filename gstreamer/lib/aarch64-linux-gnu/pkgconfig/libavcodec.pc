@@ -1,0 +1,11 @@
+prefix=/usr
+includedir=${prefix}/include
+libdir=${prefix}/lib/aarch64-linux-gnu
+
+Name: avcodec
+Description: Multimedia codecs
+Version: 61.19.101
+Requires: libavutil, libswresample, zlib
+Libs: -L${libdir} -lavcodec -pthread -lm -latomic
+Libs.private: -Wl,-Bsymbolic
+Cflags: -I${includedir} -pthread

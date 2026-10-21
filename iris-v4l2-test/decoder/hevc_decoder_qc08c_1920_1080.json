@@ -1,0 +1,22 @@
+{
+    "ExecutionMode": "Sequential",
+    "TestCases": [
+        {
+            "Name": "Decoder Testcase",
+            "TestConfigs": {
+              "Domain": "Decoder",
+              "InputPath": "input_folder/hevc_decoder_input_1920_1080.h265",
+              "NumFrames": 100,
+              "Width": 1920,
+              "Height": 1080,
+              "CodecName": "HEVC",
+              "PixelFormat": "QC08C",
+              "Outputpath": "output_folder/hevc_qc08c_decoder_output_1920_1080.yuv",
+              "InputBufferCount": 4,
+              "OutputBufferCount": 4,
+              "StaticControls": [],
+              "DynamicControls": [],
+          }
+        }
+    ]
+}
