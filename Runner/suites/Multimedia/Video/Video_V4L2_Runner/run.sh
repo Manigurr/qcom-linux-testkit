@@ -1,6 +1,7 @@
 #!/bin/sh
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause# IRIS Video V4L2 runner with stack selection via utils/lib_video.sh
+# SPDX-License-Identifier: BSD-3-Clause
+# IRIS Video V4L2 runner with stack selection via utils/lib_video.sh
 
 # ---------- Repo env + helpers ----------
 SCRIPT_DIR="$(
@@ -372,23 +373,75 @@ video_kodiak_validate_downstream_firmware() {
 }
 
 # Kodiak downstream module loading: load iris_vpu only; firmware is loaded by the kernel/driver.
+video_kodiak_unload_module() {
+    module="$1"
+    if ! video_has_module_loaded "$module" 2>/dev/null; then return 0; fi
+    log_info "Kodiak: unloading $module"
+    if ! modprobe -r "$module"; then
+        log_fail "$TESTNAME FAIL - could not unload $module"
+        return 1
+    fi
+    return 0
+}
+
+video_kodiak_load_upstream_modules() {
+    [ "${plat:-}" = "kodiak" ] || return 0
+    case "$(video_normalize_stack "$VIDEO_STACK")" in upstream|up|base) ;; *) return 0 ;; esac
+    if ! command -v modprobe >/dev/null 2>&1; then
+        log_fail "$TESTNAME FAIL - modprobe is unavailable"
+        return 1
+    fi
+    log_info "Kodiak: switching to upstream Venus stack"
+    if ! video_kodiak_unload_module iris_vpu; then return 1; fi
+    for module in venus_core venus_dec venus_enc; do
+        if ! video_has_module_loaded "$module" 2>/dev/null; then
+            log_info "Kodiak: loading $module"
+            if ! modprobe "$module"; then
+                log_fail "$TESTNAME FAIL - could not load $module"
+                return 1
+            fi
+        fi
+    done
+    if ! video_has_module_loaded venus_core 2>/dev/null ||
+       ! video_has_module_loaded venus_dec 2>/dev/null ||
+       ! video_has_module_loaded venus_enc 2>/dev/null; then
+        log_fail "$TESTNAME FAIL - Kodiak upstream Venus stack is incomplete"
+        return 1
+    fi
+    log_pass "Kodiak upstream stack ready: venus_core/venus_dec/venus_enc"
+    return 0
+}
+
 video_kodiak_load_downstream_module() {
     [ "${plat:-}" = "kodiak" ] || return 0
     case "$(video_normalize_stack "$VIDEO_STACK")" in downstream|overlay|down) ;; *) return 0 ;; esac
-    if video_has_module_loaded iris_vpu 2>/dev/null; then
-        log_info "Kodiak downstream: iris_vpu is already loaded"
-        return 0
+    if ! command -v modprobe >/dev/null 2>&1; then
+        log_fail "$TESTNAME FAIL - modprobe is unavailable"
+        return 1
     fi
-    if command -v modprobe >/dev/null 2>&1; then
-        log_info "Kodiak downstream: loading iris_vpu with modprobe"
-        modprobe iris_vpu >/dev/null 2>&1 || true
+    log_info "Kodiak: switching to downstream iris_vpu stack"
+    for module in venus_enc venus_dec venus_core; do
+        if ! video_kodiak_unload_module "$module"; then return 1; fi
+    done
+    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_info "Kodiak: loading iris_vpu"
+        if ! modprobe iris_vpu; then
+            log_fail "$TESTNAME FAIL - could not load iris_vpu"
+            return 1
+        fi
     fi
-    if video_has_module_loaded iris_vpu 2>/dev/null; then
-        log_pass "Kodiak downstream: iris_vpu loaded; firmware handled by kernel/driver"
-        return 0
+    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_fail "$TESTNAME FAIL - Kodiak downstream requires iris_vpu to be loaded"
+        return 1
     fi
-    log_fail "$TESTNAME FAIL - Kodiak downstream requires iris_vpu to be loaded"
-    return 1
+    for module in venus_core venus_dec venus_enc; do
+        if video_has_module_loaded "$module" 2>/dev/null; then
+            log_fail "$TESTNAME FAIL - $module remains loaded with downstream stack"
+            return 1
+        fi
+    done
+    log_pass "Kodiak downstream stack ready: iris_vpu; Venus modules absent"
+    return 0
 }
 # --- EARLY dependency check (bail out fast) ---
 
@@ -611,7 +664,8 @@ else
 fi
 
 # --- If user asked for both stacks, re-invoke ourselves for base and overlay ---
-if [ "${VIDEO_STACK}" = "both" ]; then
+VIDEO_STACK="$(video_normalize_stack "$VIDEO_STACK")"
+if [ "$VIDEO_STACK" = "both" ]; then
     build_reexec_args() {
         args=""
 
@@ -884,8 +938,7 @@ fi
 if [ "$plat" = "kodiak" ]; then
     case "$VIDEO_STACK" in
         upstream|up|base)
-            video_step "" "Kodiak upstream firmware install"
-            video_kodiak_install_firmware || true
+            log_info "Kodiak upstream selected: no firmware operation; META firmware remains untouched"
             ;;
         downstream|overlay|down)
             log_info "Kodiak downstream stack selected: iris_vpu; Venus modules must be absent"
@@ -959,11 +1012,22 @@ fi
 log_info "Video stack (post): $post_stack"
 
 video_dump_stack_state "post" "$video_stack_probe_mode"
-# Ensure Kodiak downstream has iris_vpu loaded; firmware is not pushed here.
-if ! video_kodiak_load_downstream_module; then
-    printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
-    exit 1
-fi
+# Switch only the requested Kodiak module stack. Firmware is already in META
+# and is handled by the kernel/driver; this runner never pushes firmware.
+case "$VIDEO_STACK" in
+    upstream|up|base)
+        if ! video_kodiak_load_upstream_modules; then
+            printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+            exit 1
+        fi
+        ;;
+    downstream|overlay|down)
+        if ! video_kodiak_load_downstream_module; then
+            printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+            exit 1
+        fi
+        ;;
+esac
 
 # --- Custom .ko load assist (only if user provided --ko-dir) ---
 if [ -n "${KO_DIRS:-}" ]; then
