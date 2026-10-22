@@ -1,0 +1,101 @@
+metadata:
+  format: Lava-Test Test Definition 1.0
+  name: Video_Test_Suite_Import
+  description: "Clone video-test-suite-import branch from qcom-linux-testkit and run test suite with ./run.sh"
+  maintainer:
+    - manigurr@qti.qualcomm.com
+  os:
+    - openembedded
+  scope:
+    - functional
+
+run:
+  steps:
+    - cd /tmp
+    - |
+      # Clone the qcom-linux-testkit repository with video-test-suite-import branch
+      echo "=== Starting Repository Clone ==="
+      REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
+      BRANCH="video-test-suite-import"
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      
+      # Remove existing directory if present
+      if [ -d "$CLONE_DIR" ]; then
+        echo "Removing existing clone directory: $CLONE_DIR"
+        rm -rf "$CLONE_DIR"
+      fi
+      
+      # Clone the repository
+      echo "Cloning repository from: $REPO_URL (branch: $BRANCH)"
+      git clone -b "$BRANCH" "$REPO_URL" "$CLONE_DIR" || {
+        echo "ERROR: Failed to clone repository"
+        exit 1
+      }
+      
+      echo "=== Repository Clone Completed Successfully ==="
+      
+    - |
+      # Navigate to the cloned repository
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      cd "$CLONE_DIR" || {
+        echo "ERROR: Failed to navigate to clone directory"
+        exit 1
+      }
+      
+      echo "=== Current Directory: $(pwd) ==="
+      echo "=== Repository Contents ==="
+      ls -la
+      
+    - |
+      # Run the test suite
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      cd "$CLONE_DIR" || exit 1
+      
+      echo "=== Starting Test Suite Execution ==="
+      echo "Timestamp: $(date)"
+      
+      # Check if run.sh exists
+      if [ ! -f "./run.sh" ]; then
+        echo "ERROR: run.sh not found in repository root"
+        ls -la
+        exit 1
+      fi
+      
+      # Make run.sh executable
+      chmod +x ./run.sh
+      
+      # Run the test suite and capture output
+      echo "=== Executing ./run.sh ==="
+      ./run.sh 2>&1 | tee /tmp/video-test-suite-results.log || {
+        echo "WARNING: run.sh exited with non-zero status"
+      }
+      
+      echo "=== Test Suite Execution Completed ==="
+      echo "Timestamp: $(date)"
+      
+    - |
+      # Print and archive the results
+      echo "=== Test Results Summary ==="
+      if [ -f "/tmp/video-test-suite-results.log" ]; then
+        echo "=== Full Test Output ==="
+        cat /tmp/video-test-suite-results.log
+        
+        # Copy results to a persistent location
+        RESULTS_DIR="/data/test-results"
+        mkdir -p "$RESULTS_DIR" 2>/dev/null || RESULTS_DIR="/tmp/test-results"
+        mkdir -p "$RESULTS_DIR"
+        
+        cp /tmp/video-test-suite-results.log "$RESULTS_DIR/video-test-suite-results-$(date +%s).log"
+        echo "Results saved to: $RESULTS_DIR"
+      else
+        echo "WARNING: No results log file found"
+      fi
+      
+    - |
+      # Generate final status report
+      echo "=== Final Status Report ==="
+      echo "Repository: https://github.com/Manigurr/qcom-linux-testkit.git"
+      echo "Branch: video-test-suite-import"
+      echo "Clone Directory: /tmp/qcom-linux-testkit-video-test"
+      echo "Test Execution Time: $(date)"
+      echo "=== Test Execution Complete ==="
