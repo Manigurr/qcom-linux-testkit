@@ -745,6 +745,48 @@ video_ensure_downstream_iris_vpu() {
     return 1
 }
 
+# --- Upstream policy --------------------------------------------------------
+# Upstream uses qcom_iris only. Do not call the generic video_ensure_stack()
+# for upstream because it may load the legacy Venus modules.
+video_ensure_upstream_qcom_iris() {
+    log_info "Upstream: switching to qcom_iris only"
+    for module in iris_vpu venus_enc venus_dec venus_core; do
+        if video_has_module_loaded "$module" 2>/dev/null; then
+            log_info "Upstream: removing conflicting module $module"
+            modprobe -r "$module" || {
+                log_warn "Upstream: unable to remove $module (module may be busy)"
+                return 1
+            }
+        fi
+    done
+    if ! video_has_module_loaded qcom_iris 2>/dev/null; then
+        log_info "Upstream: loading qcom_iris"
+        modprobe qcom_iris || {
+            log_warn "Upstream: modprobe qcom_iris failed"
+            return 1
+        }
+    fi
+    if video_has_module_loaded qcom_iris &&
+       ! video_has_module_loaded iris_vpu &&
+       ! video_has_module_loaded venus_core &&
+       ! video_has_module_loaded venus_dec &&
+       ! video_has_module_loaded venus_enc; then
+        log_pass "Upstream ready: qcom_iris only"
+        return 0
+    fi
+    log_warn "Upstream is not clean: qcom_iris must be the only video driver"
+    return 1
+}
+
+video_validate_qcom_iris_upstream() {
+    video_has_module_loaded qcom_iris || return 1
+    video_has_module_loaded iris_vpu && return 1
+    video_has_module_loaded venus_core && return 1
+    video_has_module_loaded venus_dec && return 1
+    video_has_module_loaded venus_enc && return 1
+    return 0
+}
+
 # --- Ensure desired video stack (hot switch best-effort) ---
 plat="$(video_resolve_platform "$VIDEO_PLATFORM")"
 [ -n "$plat" ] || plat="unknown"
@@ -856,9 +898,12 @@ stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
 : > "$stack_tmp"
 
 if [ "$VIDEO_STACK" = "downstream" ]; then
-    # Downstream is intentionally limited to loading iris_vpu. No firmware
-    # operation is performed by this runner.
+    # Downstream loads only iris_vpu; firmware is handled by the driver.
     video_ensure_downstream_iris_vpu >"$stack_tmp" 2>&1 || true
+    printf '%s\n' "$(video_stack_status "$plat")" >>"$stack_tmp"
+elif [ "$VIDEO_STACK" = "upstream" ]; then
+    # Upstream loads only qcom_iris; never call the generic helper.
+    video_ensure_upstream_qcom_iris >"$stack_tmp" 2>&1 || true
     printf '%s\n' "$(video_stack_status "$plat")" >>"$stack_tmp"
 elif [ "$VIDEO_PACKAGE_MANAGED_STACK" -eq 1 ]; then
     log_info "Package-managed video stack; validating module state"
@@ -917,7 +962,7 @@ video_clean_and_refresh_v4l || true
 # --- Hard gate: if requested stack not in effect, abort immediately (platform-aware)
 case "$VIDEO_STACK" in
   upstream|up|base)
-    if ! video_validate_upstream_loaded "$plat"; then
+    if ! video_validate_qcom_iris_upstream; then
         case "$plat" in
             lemans|monaco)
                 msg="qcom_iris not both present"
