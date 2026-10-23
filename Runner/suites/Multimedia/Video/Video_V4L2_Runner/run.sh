@@ -81,8 +81,6 @@ CLIPS_DEST="" # optional extraction destination; defaults to cfg/dir root or tes
 
 if [ -z "${VIDEO_STACK:-}" ]; then VIDEO_STACK="auto"; fi
 if [ -z "${VIDEO_PLATFORM:-}" ]; then VIDEO_PLATFORM=""; fi
-if [ -z "${VIDEO_FW_DS:-}" ]; then VIDEO_FW_DS=""; fi
-if [ -z "${VIDEO_FW_BACKUP_DIR:-}" ]; then VIDEO_FW_BACKUP_DIR=""; fi
 if [ -z "${VIDEO_NO_REBOOT:-}" ]; then VIDEO_NO_REBOOT="0"; fi
 if [ -z "${VIDEO_FORCE:-}" ]; then VIDEO_FORCE="0"; fi
 if [ -z "${VIDEO_APP:-}" ]; then VIDEO_APP="/usr/bin/iris_v4l2_test"; fi
@@ -108,7 +106,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--junit FILE] [--dry-run] [--verbose]
           [--stack auto|upstream|downstream|base|overlay|up|down|both]
           [--platform pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa]
-          [--downstream-fw PATH] [--force] # optional Kodiak firmware override
+          [--force]
           [--app /path/to/iris_v4l2_test]
           [--ssid SSID] [--password PASS]
           [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
@@ -198,10 +196,6 @@ while [ $# -gt 0 ]; do
             shift
             VIDEO_PLATFORM="$1"
             ;;
-        --downstream-fw)
-            shift
-            VIDEO_FW_DS="$1"
-            ;;
         --force)
             VIDEO_FORCE=1
             ;;
@@ -276,8 +270,6 @@ done
 
 # Export envs used by lib
 export VIDEO_APP
-export VIDEO_FW_DS
-export VIDEO_FW_BACKUP_DIR
 export VIDEO_NO_REBOOT
 export VIDEO_FORCE
 export LOG_DIR
@@ -481,25 +473,6 @@ else
     log_info "Sub-run: skipping initial network bring-up."
 fi
 
-# Validate an explicitly requested downstream firmware override before downloads.
-# All platforms, including Kodiak, use the same downstream firmware flow.
-early_plat="$(video_resolve_platform "$VIDEO_PLATFORM")"
-early_stack="$(video_normalize_stack "$VIDEO_STACK")"
-case "$early_stack" in
-    downstream|both)
-        if [ -n "${VIDEO_FW_DS:-}" ] && [ ! -f "$VIDEO_FW_DS" ]; then
-            log_fail "$TESTNAME FAIL - requested downstream firmware override does not exist: $VIDEO_FW_DS"
-            printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
-            exit 1
-        fi
-        if [ -n "${VIDEO_FW_DS:-}" ]; then
-            log_info "$early_plat downstream will use the explicit firmware override: $VIDEO_FW_DS"
-        else
-            log_info "$early_plat downstream will use the image-provided downstream firmware"
-        fi
-        ;;
-esac
-
 # --- Optional early fetch of bundle (best-effort, ALWAYS in LOG_ROOT) — only once
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
     if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
@@ -620,10 +593,6 @@ if [ "${VIDEO_STACK}" = "both" ]; then
             args="$args --platform '$esc_plat'"
         fi
 
-        if [ -n "${VIDEO_FW_DS:-}" ]; then
-            esc_fw="$(printf %s "$VIDEO_FW_DS" | sed "s/'/'\\\\''/g")"
-            args="$args --downstream-fw '$esc_fw'"
-        fi
 
         if [ "${VIDEO_FORCE:-0}" -eq 1 ]; then
             args="$args --force"
@@ -721,9 +690,6 @@ log_info "---------------------- Starting $TESTNAME (modular) ------------------
 log_info "STACK=$VIDEO_STACK PLATFORM=${VIDEO_PLATFORM:-auto} STRICT=$STRICT DMESG_SCAN=$DMESG_SCAN"
 log_info "TIMEOUT=${TIMEOUT}s LOGLEVEL=$LOGLEVEL REPEAT=$REPEAT REPEAT_POLICY=$REPEAT_POLICY"
 log_info "APP=$VIDEO_APP"
-if [ -n "$VIDEO_FW_DS" ]; then
-    log_info "Downstream FW override: $VIDEO_FW_DS"
-fi
 if [ -n "$KO_TREE$KO_DIRS$KO_TARBALL" ]; then
     if [ -n "$KO_TREE" ]; then
         log_info "Custom module tree (modprobe -d): $KO_TREE"
@@ -731,9 +697,6 @@ if [ -n "$KO_TREE$KO_DIRS$KO_TARBALL" ]; then
     if [ -n "$KO_DIRS" ]; then
         log_info "Custom ko dir(s): $KO_DIRS (prefer_custom=$KO_PREFER_CUSTOM)"
     fi
-fi
-if [ -n "$VIDEO_FW_BACKUP_DIR" ]; then
-    log_info "FW backup override: $VIDEO_FW_BACKUP_DIR"
 fi
 if [ "$VERBOSE" -eq 1 ]; then
     log_info "CWD=$(pwd) | SCRIPT_DIR=$SCRIPT_DIR | test_path=$test_path"
@@ -743,59 +706,43 @@ log_info "SLEEPS: app-launch=${APP_LAUNCH_SLEEP}s, inter-test=${INTER_TEST_SLEEP
 # Warn if not root (module/blacklist ops may fail)
 video_warn_if_not_root
 
-# --- Kodiak upstream policy -------------------------------------------------
-# Kodiak upstream uses qcom_iris only.  Do not use the legacy Venus modules
-# (venus_core, venus_dec, venus_enc) for the upstream stack.
-video_ensure_kodiak_upstream() {
-    log_info "Kodiak upstream: switching to qcom_iris only"
+# --- Downstream policy ------------------------------------------------------
+# Downstream uses only iris_vpu. This runner does not select, copy, validate,
+# back up, or explicitly load firmware. Firmware is requested by the driver
+# through the kernel firmware interface.
+video_ensure_downstream_iris_vpu() {
+    log_info "Downstream: switching to iris_vpu only"
 
-    # Remove legacy Venus modules first, in dependency order.  A busy module
-    # cannot be removed safely; leave the failure visible to validation.
-    for module in venus_enc venus_dec venus_core; do
+    # Remove conflicting upstream drivers before loading iris_vpu.
+    for module in qcom_iris venus_enc venus_dec venus_core; do
         if video_has_module_loaded "$module" 2>/dev/null; then
-            log_info "Kodiak upstream: removing conflicting module $module"
+            log_info "Downstream: removing conflicting module $module"
             if ! modprobe -r "$module"; then
-                log_warn "Kodiak upstream: unable to remove $module (module may be busy)"
+                log_warn "Downstream: unable to remove $module (module may be busy)"
+                return 1
             fi
         fi
     done
 
-    if video_has_module_loaded iris_vpu 2>/dev/null; then
-        log_info "Kodiak upstream: removing conflicting module iris_vpu"
-        if ! modprobe -r iris_vpu; then
-            log_warn "Kodiak upstream: unable to remove iris_vpu (module may be busy)"
+    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_info "Downstream: loading iris_vpu"
+        if ! modprobe iris_vpu; then
+            log_warn "Downstream: modprobe iris_vpu failed"
+            return 1
         fi
     fi
 
-    # Load only the upstream qcom_iris driver.  Never modprobe the Venus stack.
-    if ! video_has_module_loaded qcom_iris 2>/dev/null; then
-        log_info "Kodiak upstream: loading qcom_iris"
-        modprobe qcom_iris || {
-            log_warn "Kodiak upstream: modprobe qcom_iris failed"
-            return 1
-        }
-    fi
-
-    if video_has_module_loaded qcom_iris &&
-       ! video_has_module_loaded iris_vpu &&
+    if video_has_module_loaded iris_vpu &&
+       ! video_has_module_loaded qcom_iris &&
        ! video_has_module_loaded venus_core &&
        ! video_has_module_loaded venus_dec &&
        ! video_has_module_loaded venus_enc; then
-        log_pass "Kodiak upstream ready: qcom_iris only"
+        log_pass "Downstream ready: iris_vpu only"
         return 0
     fi
 
-    log_warn "Kodiak upstream is not clean: qcom_iris must be the only video driver"
+    log_warn "Downstream is not clean: iris_vpu must be the only video driver"
     return 1
-}
-
-video_validate_kodiak_upstream() {
-    video_has_module_loaded qcom_iris || return 1
-    video_has_module_loaded iris_vpu && return 1
-    video_has_module_loaded venus_core && return 1
-    video_has_module_loaded venus_dec && return 1
-    video_has_module_loaded venus_enc && return 1
-    return 0
 }
 
 # --- Ensure desired video stack (hot switch best-effort) ---
@@ -866,9 +813,8 @@ if [ "$VIDEO_PACKAGE_RECOVERY_APPLICABLE" -eq 1 ]; then
     fi
 fi
 
-# Firmware handling is shared across platforms.  Do not install a
-# Kodiak-specific upstream firmware payload here; lib_video.sh handles the
-# selected stack and any explicit VIDEO_FW_DS override consistently.
+# Firmware is not handled by this runner. The selected driver requests
+# firmware through the kernel firmware interface.
 
 # --- Optional cleanup: robust capture + normalization of post-stack value ---
 video_stack_probe_mode="full"
@@ -909,19 +855,14 @@ video_step "" "Apply desired stack = $VIDEO_STACK"
 stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
 : > "$stack_tmp"
 
-if [ "$VIDEO_PACKAGE_MANAGED_STACK" -eq 1 ]; then
-    log_info "Package-managed video stack, validating module state without runner modprobe operations"
+if [ "$VIDEO_STACK" = "downstream" ]; then
+    # Downstream is intentionally limited to loading iris_vpu. No firmware
+    # operation is performed by this runner.
+    video_ensure_downstream_iris_vpu >"$stack_tmp" 2>&1 || true
+    printf '%s\n' "$(video_stack_status "$plat")" >>"$stack_tmp"
+elif [ "$VIDEO_PACKAGE_MANAGED_STACK" -eq 1 ]; then
+    log_info "Package-managed video stack; validating module state"
     video_stack_status "$plat" >"$stack_tmp" 2>&1 || true
-elif [ "$plat" = "kodiak" ] &&
-     { [ "$VIDEO_STACK" = "upstream" ] || [ "$VIDEO_STACK" = "up" ] || [ "$VIDEO_STACK" = "base" ]; }; then
-    # Do not call the generic helper here: older versions load venus_core,
-    # venus_dec and venus_enc for Kodiak upstream.
-    video_ensure_kodiak_upstream >"$stack_tmp" 2>&1 || true
-    if video_validate_kodiak_upstream; then
-        printf '%s\n' upstream >>"$stack_tmp"
-    else
-        printf '%s\n' unknown >>"$stack_tmp"
-    fi
 else
     video_ensure_stack "$VIDEO_STACK" "$plat" >"$stack_tmp" 2>&1 || true
 fi
@@ -976,12 +917,7 @@ video_clean_and_refresh_v4l || true
 # --- Hard gate: if requested stack not in effect, abort immediately (platform-aware)
 case "$VIDEO_STACK" in
   upstream|up|base)
-    if [ "$plat" = "kodiak" ]; then
-        video_validate_kodiak_upstream
-    else
-        video_validate_upstream_loaded "$plat"
-    fi
-    if [ "$?" -ne 0 ]; then
+    if ! video_validate_upstream_loaded "$plat"; then
         case "$plat" in
             lemans|monaco)
                 msg="qcom_iris not both present"
@@ -1039,7 +975,11 @@ case "$plat" in
         ;;
     kodiak)
         if [ "$post_stack" = "upstream" ]; then
-            if video_validate_kodiak_upstream; then
+            if video_has_module_loaded qcom_iris &&
+               ! video_has_module_loaded iris_vpu &&
+               ! video_has_module_loaded venus_core &&
+               ! video_has_module_loaded venus_dec &&
+               ! video_has_module_loaded venus_enc; then
                 log_pass "Upstream validated: only qcom_iris present"
             else
                 log_warn "Upstream expected but qcom_iris-only state was not validated"
