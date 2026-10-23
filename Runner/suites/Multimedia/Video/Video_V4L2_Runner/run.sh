@@ -743,6 +743,61 @@ log_info "SLEEPS: app-launch=${APP_LAUNCH_SLEEP}s, inter-test=${INTER_TEST_SLEEP
 # Warn if not root (module/blacklist ops may fail)
 video_warn_if_not_root
 
+# --- Kodiak upstream policy -------------------------------------------------
+# Kodiak upstream uses qcom_iris only.  Do not use the legacy Venus modules
+# (venus_core, venus_dec, venus_enc) for the upstream stack.
+video_ensure_kodiak_upstream() {
+    log_info "Kodiak upstream: switching to qcom_iris only"
+
+    # Remove legacy Venus modules first, in dependency order.  A busy module
+    # cannot be removed safely; leave the failure visible to validation.
+    for module in venus_enc venus_dec venus_core; do
+        if video_has_module_loaded "$module" 2>/dev/null; then
+            log_info "Kodiak upstream: removing conflicting module $module"
+            if ! modprobe -r "$module"; then
+                log_warn "Kodiak upstream: unable to remove $module (module may be busy)"
+            fi
+        fi
+    done
+
+    if video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_info "Kodiak upstream: removing conflicting module iris_vpu"
+        if ! modprobe -r iris_vpu; then
+            log_warn "Kodiak upstream: unable to remove iris_vpu (module may be busy)"
+        fi
+    fi
+
+    # Load only the upstream qcom_iris driver.  Never modprobe the Venus stack.
+    if ! video_has_module_loaded qcom_iris 2>/dev/null; then
+        log_info "Kodiak upstream: loading qcom_iris"
+        modprobe qcom_iris || {
+            log_warn "Kodiak upstream: modprobe qcom_iris failed"
+            return 1
+        }
+    fi
+
+    if video_has_module_loaded qcom_iris &&
+       ! video_has_module_loaded iris_vpu &&
+       ! video_has_module_loaded venus_core &&
+       ! video_has_module_loaded venus_dec &&
+       ! video_has_module_loaded venus_enc; then
+        log_pass "Kodiak upstream ready: qcom_iris only"
+        return 0
+    fi
+
+    log_warn "Kodiak upstream is not clean: qcom_iris must be the only video driver"
+    return 1
+}
+
+video_validate_kodiak_upstream() {
+    video_has_module_loaded qcom_iris || return 1
+    video_has_module_loaded iris_vpu && return 1
+    video_has_module_loaded venus_core && return 1
+    video_has_module_loaded venus_dec && return 1
+    video_has_module_loaded venus_enc && return 1
+    return 0
+}
+
 # --- Ensure desired video stack (hot switch best-effort) ---
 plat="$(video_resolve_platform "$VIDEO_PLATFORM")"
 [ -n "$plat" ] || plat="unknown"
@@ -857,6 +912,16 @@ stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
 if [ "$VIDEO_PACKAGE_MANAGED_STACK" -eq 1 ]; then
     log_info "Package-managed video stack, validating module state without runner modprobe operations"
     video_stack_status "$plat" >"$stack_tmp" 2>&1 || true
+elif [ "$plat" = "kodiak" ] &&
+     { [ "$VIDEO_STACK" = "upstream" ] || [ "$VIDEO_STACK" = "up" ] || [ "$VIDEO_STACK" = "base" ]; }; then
+    # Do not call the generic helper here: older versions load venus_core,
+    # venus_dec and venus_enc for Kodiak upstream.
+    video_ensure_kodiak_upstream >"$stack_tmp" 2>&1 || true
+    if video_validate_kodiak_upstream; then
+        printf '%s\n' upstream >>"$stack_tmp"
+    else
+        printf '%s\n' unknown >>"$stack_tmp"
+    fi
 else
     video_ensure_stack "$VIDEO_STACK" "$plat" >"$stack_tmp" 2>&1 || true
 fi
@@ -911,7 +976,12 @@ video_clean_and_refresh_v4l || true
 # --- Hard gate: if requested stack not in effect, abort immediately (platform-aware)
 case "$VIDEO_STACK" in
   upstream|up|base)
-    if ! video_validate_upstream_loaded "$plat"; then
+    if [ "$plat" = "kodiak" ]; then
+        video_validate_kodiak_upstream
+    else
+        video_validate_upstream_loaded "$plat"
+    fi
+    if [ "$?" -ne 0 ]; then
         case "$plat" in
             lemans|monaco)
                 msg="qcom_iris not both present"
@@ -969,12 +1039,10 @@ case "$plat" in
         ;;
     kodiak)
         if [ "$post_stack" = "upstream" ]; then
-            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc; then
-                log_pass "Upstream validated: venus_core/dec/enc present"
-            elif video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
-                log_pass "Upstream validated: qcom_iris present (pure upstream build on Kodiak)"
+            if video_validate_kodiak_upstream; then
+                log_pass "Upstream validated: only qcom_iris present"
             else
-                log_warn "Upstream expected but required upstream modules were not validated"
+                log_warn "Upstream expected but qcom_iris-only state was not validated"
             fi
         elif [ "$post_stack" = "downstream" ]; then
             if video_has_module_loaded iris_vpu && ! video_has_module_loaded qcom_iris; then
