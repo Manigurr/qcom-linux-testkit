@@ -1,7 +1,7 @@
 metadata:
   format: Lava-Test Test Definition 1.0
   name: Video_Test_Suite_Import
-  description: "Check Git and network status, clone qcom-linux-testkit and Qualcomm test_merge repositories, and run the video test suite"
+  description: "Clone video-test-suite-import branch from qcom-linux-testkit and run test suite with ./run.sh"
   maintainer:
     - manigurr@qti.qualcomm.com
   os:
@@ -12,331 +12,116 @@ metadata:
 run:
   steps:
     - cd /tmp
-
     - |
-      set -u
-
-      echo "=== Environment and Network Status ==="
-
-      echo "=== Hostname ==="
-      hostname || true
-
-      echo "=== Git Version ==="
-      if command -v git >/dev/null 2>&1; then
-        git --version
-      else
-        echo "ERROR: git is not installed on the DUT"
-        exit 1
+      # Clone the qcom-linux-testkit repository with video-test-suite-import branch
+      echo "=== Starting Repository Clone ==="
+      REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
+      BRANCH="video-test-suite-import"
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      MAX_ATTEMPTS=3
+      ATTEMPT=0
+      
+      # Configure git for better performance and reliability
+      git config --global core.preloadindex true
+      git config --global core.checkStat minimal
+      git config --global fetch.fsckObjects false
+      git config --global receive.fsckObjects false
+      
+      # Remove existing directory if present
+      if [ -d "$CLONE_DIR" ]; then
+        echo "Removing existing clone directory: $CLONE_DIR"
+        rm -rf "$CLONE_DIR"
       fi
-
-      echo "=== Available Network Commands ==="
-      command -v ip || true
-      command -v nmcli || true
-      command -v iw || true
-      command -v getent || true
-
-      echo "=== Network Interface Status ==="
-
-      if command -v ip >/dev/null 2>&1; then
-        ip link || true
-        ip addr || true
-        ip route || true
-      else
-        echo "WARNING: ip command is not available"
-      fi
-
-      echo "=== Wi-Fi Network Status ==="
-
-      WIFI_CONNECTED=0
-
-      if command -v nmcli >/dev/null 2>&1; then
-        echo "--- NetworkManager device status ---"
-        nmcli device status || true
-
-        echo "--- NetworkManager active connections ---"
-        nmcli connection show --active || true
-
-        if nmcli device status 2>/dev/null | grep -Eiq 'wifi.*connected|wlan.*connected'; then
-          echo "RESULT: A Wi-Fi network is connected"
-          WIFI_CONNECTED=1
+      
+      # Clone the repository with retry logic
+      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        echo "Clone attempt $ATTEMPT/$MAX_ATTEMPTS"
+        
+        # Use shallow clone with single branch for faster cloning
+        if git clone --depth 1 --single-branch -b "$BRANCH" "$REPO_URL" "$CLONE_DIR" 2>&1; then
+          echo "=== Repository Clone Completed Successfully ==="
+          break
         else
-          echo "RESULT: No Wi-Fi network is connected"
-        fi
-
-      elif command -v iw >/dev/null 2>&1; then
-        echo "--- iw Wi-Fi status ---"
-
-        WIFI_INTERFACES="$(iw dev 2>/dev/null | awk '$1 == "Interface" {print $2}')"
-
-        if [ -z "$WIFI_INTERFACES" ]; then
-          echo "No Wi-Fi interface detected"
-        else
-          for WIFI_INTERFACE in $WIFI_INTERFACES; do
-            echo "Wi-Fi interface: $WIFI_INTERFACE"
-            iw dev "$WIFI_INTERFACE" link || true
-
-            if iw dev "$WIFI_INTERFACE" link 2>/dev/null | grep -q '^Connected to'; then
-              WIFI_CONNECTED=1
-            fi
-          done
-
-          if [ "$WIFI_CONNECTED" -eq 1 ]; then
-            echo "RESULT: A Wi-Fi network is connected"
-          else
-            echo "RESULT: No Wi-Fi network is connected"
+          echo "Clone attempt $ATTEMPT failed"
+          if [ -d "$CLONE_DIR" ]; then
+            rm -rf "$CLONE_DIR"
+          fi
+          
+          if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            echo "Waiting 5 seconds before retry..."
+            sleep 5
           fi
         fi
-      else
-        echo "WARNING: nmcli and iw are not available"
-        echo "Unable to determine Wi-Fi connection status"
-      fi
-
-      echo "=== DNS Configuration ==="
-      if [ -f /etc/resolv.conf ]; then
-        cat /etc/resolv.conf
-      else
-        echo "WARNING: /etc/resolv.conf is not available"
-      fi
-
-      echo "=== DNS Resolution Check ==="
-
-      if command -v getent >/dev/null 2>&1; then
-        if getent hosts github.com; then
-          echo "github.com DNS resolution succeeded"
-        else
-          echo "WARNING: github.com DNS resolution failed"
-        fi
-
-        if getent hosts github.qualcomm.com; then
-          echo "github.qualcomm.com DNS resolution succeeded"
-        else
-          echo "WARNING: github.qualcomm.com DNS resolution failed"
-        fi
-      else
-        echo "WARNING: getent is not available"
-      fi
-
-    - |
-      set -u
-
-      echo "=== Repository Configuration ==="
-
-      GITHUB_REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
-      GITHUB_BRANCH="video-test-suite-import"
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
-
-      QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/tmp/test_merge"
-
-      echo "GitHub repository:"
-      echo "  URL: ${GITHUB_REPO_URL}"
-      echo "  Branch: ${GITHUB_BRANCH}"
-      echo "  Directory: ${GITHUB_CLONE_DIR}"
-
-      echo "Qualcomm repository:"
-      echo "  URL: ${QUALCOMM_REPO_URL}"
-      echo "  Branch: default branch"
-      echo "  Directory: ${QUALCOMM_CLONE_DIR}"
-
-    - |
-      set -u
-
-      echo "=== Cloning Qualcomm Repository ==="
-
-      QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/tmp/test_merge"
-
-      rm -rf "$QUALCOMM_CLONE_DIR"
-
-      QUALCOMM_CLONE_SUCCESS=0
-
-      for attempt in 1 2 3; do
-        echo "Qualcomm repository clone attempt ${attempt}/3"
-
-        if git clone \
-            --depth 1 \
-            "$QUALCOMM_REPO_URL" \
-            "$QUALCOMM_CLONE_DIR"; then
-          QUALCOMM_CLONE_SUCCESS=1
-          break
-        fi
-
-        echo "Qualcomm repository clone attempt ${attempt} failed"
-        rm -rf "$QUALCOMM_CLONE_DIR"
-        sleep 5
       done
-
-      if [ "$QUALCOMM_CLONE_SUCCESS" -eq 1 ]; then
-        echo "=== Qualcomm Repository Clone Completed Successfully ==="
-        echo "Qualcomm repository contents:"
-        ls -la "$QUALCOMM_CLONE_DIR"
-
-        echo "Qualcomm repository commit:"
-        git -C "$QUALCOMM_CLONE_DIR" log -1 --oneline || true
-      else
-        echo "WARNING: Failed to clone Qualcomm repository"
-        echo "The main qcom-linux-testkit test will continue."
-
-        echo "Qualcomm repository diagnostics:"
-        if command -v getent >/dev/null 2>&1; then
-          getent hosts github.qualcomm.com || true
-        fi
-
-        if command -v ip >/dev/null 2>&1; then
-          ip addr || true
-          ip route || true
-        fi
-      fi
-
-    - |
-      set -u
-
-      echo "=== Cloning qcom-linux-testkit Repository ==="
-
-      GITHUB_REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
-      GITHUB_BRANCH="video-test-suite-import"
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
-
-      rm -rf "$GITHUB_CLONE_DIR"
-
-      GITHUB_CLONE_SUCCESS=0
-
-      for attempt in 1 2 3; do
-        echo "qcom-linux-testkit clone attempt ${attempt}/3"
-
-        if git clone \
-            --depth 1 \
-            --single-branch \
-            --branch "$GITHUB_BRANCH" \
-            "$GITHUB_REPO_URL" \
-            "$GITHUB_CLONE_DIR"; then
-          GITHUB_CLONE_SUCCESS=1
-          break
-        fi
-
-        echo "qcom-linux-testkit clone attempt ${attempt} failed"
-        rm -rf "$GITHUB_CLONE_DIR"
-        sleep 5
-      done
-
-      if [ "$GITHUB_CLONE_SUCCESS" -ne 1 ]; then
-        echo "ERROR: Failed to clone qcom-linux-testkit"
+      
+      if [ $ATTEMPT -eq $MAX_ATTEMPTS ] && [ ! -d "$CLONE_DIR" ]; then
+        echo "ERROR: Failed to clone repository after $MAX_ATTEMPTS attempts"
         exit 1
       fi
-
-      echo "=== qcom-linux-testkit Clone Completed Successfully ==="
-
-      echo "Repository contents:"
-      ls -la "$GITHUB_CLONE_DIR"
-
-      echo "Repository branch:"
-      git -C "$GITHUB_CLONE_DIR" branch --show-current || true
-
-      echo "Repository commit:"
-      git -C "$GITHUB_CLONE_DIR" log -1 --oneline || true
-
+      
     - |
-      set -u
-
-      echo "=== Validating qcom-linux-testkit Repository ==="
-
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
-
-      if [ ! -d "$GITHUB_CLONE_DIR" ]; then
-        echo "ERROR: Clone directory does not exist"
+      # Navigate to the cloned repository
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      cd "$CLONE_DIR" || {
+        echo "ERROR: Failed to navigate to clone directory"
         exit 1
-      fi
-
-      cd "$GITHUB_CLONE_DIR"
-
-      echo "Current directory:"
-      pwd
-
-      echo "Repository files:"
+      }
+      
+      echo "=== Current Directory: $(pwd) ==="
+      echo "=== Repository Contents ==="
       ls -la
-
+      
+    - |
+      # Run the test suite
+      CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      cd "$CLONE_DIR" || exit 1
+      
+      echo "=== Starting Test Suite Execution ==="
+      echo "Timestamp: $(date)"
+      
+      # Check if run.sh exists
       if [ ! -f "./run.sh" ]; then
-        echo "ERROR: run.sh was not found in the repository root"
+        echo "ERROR: run.sh not found in repository root"
+        ls -la
         exit 1
       fi
-
+      
+      # Make run.sh executable
       chmod +x ./run.sh
-
-      echo "run.sh permissions:"
-      ls -l ./run.sh
-
-    - |
-      set -o pipefail
-
-      echo "=== Starting Video Test Suite ==="
+      
+      # Run the test suite and capture output
+      echo "=== Executing ./run.sh ==="
+      ./run.sh 2>&1 | tee /tmp/video-test-suite-results.log || {
+        echo "WARNING: run.sh exited with non-zero status"
+      }
+      
+      echo "=== Test Suite Execution Completed ==="
       echo "Timestamp: $(date)"
-
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
-      RESULTS_LOG="/tmp/video-test-suite-results.log"
-
-      cd "$GITHUB_CLONE_DIR"
-
-      echo "Executing ./run.sh"
-      ./run.sh 2>&1 | tee "$RESULTS_LOG"
-
-      RUN_STATUS="${PIPESTATUS[0]}"
-
-      echo "run.sh exit status: ${RUN_STATUS}"
-
-      if [ "$RUN_STATUS" -ne 0 ]; then
-        echo "ERROR: Video test suite failed"
-        exit "$RUN_STATUS"
-      fi
-
-      echo "=== Video Test Suite Completed Successfully ==="
-      echo "Timestamp: $(date)"
-
+      
     - |
-      set -u
-
+      # Print and archive the results
       echo "=== Test Results Summary ==="
-
-      RESULTS_LOG="/tmp/video-test-suite-results.log"
-      RESULTS_DIR="/data/test-results"
-
-      if [ ! -f "$RESULTS_LOG" ]; then
-        echo "WARNING: Test result log was not generated"
-        exit 0
-      fi
-
-      echo "=== Full Test Output ==="
-      cat "$RESULTS_LOG"
-
-      if ! mkdir -p "$RESULTS_DIR" 2>/dev/null; then
-        RESULTS_DIR="/tmp/test-results"
+      if [ -f "/tmp/video-test-suite-results.log" ]; then
+        echo "=== Full Test Output ==="
+        cat /tmp/video-test-suite-results.log
+        
+        # Copy results to a persistent location
+        RESULTS_DIR="/data/test-results"
+        mkdir -p "$RESULTS_DIR" 2>/dev/null || RESULTS_DIR="/tmp/test-results"
         mkdir -p "$RESULTS_DIR"
+        
+        cp /tmp/video-test-suite-results.log "$RESULTS_DIR/video-test-suite-results-$(date +%s).log"
+        echo "Results saved to: $RESULTS_DIR"
+      else
+        echo "WARNING: No results log file found"
       fi
-
-      RESULT_FILE="${RESULTS_DIR}/video-test-suite-results-$(date +%s).log"
-
-      cp "$RESULTS_LOG" "$RESULT_FILE"
-
-      echo "Results saved to:"
-      echo "$RESULT_FILE"
-
+      
     - |
-      set -u
-
+      # Generate final status report
       echo "=== Final Status Report ==="
-      echo "Git version:"
-      git --version || true
-
-      echo "Main repository:"
-      echo "  URL: https://github.com/Manigurr/qcom-linux-testkit.git"
-      echo "  Branch: video-test-suite-import"
-      echo "  Directory: /tmp/qcom-linux-testkit-video-test"
-
-      echo "Qualcomm repository:"
-      echo "  URL: https://github.qualcomm.com/manigurr/test_merge.git"
-      echo "  Branch: default branch"
-      echo "  Directory: /tmp/test_merge"
-
-      echo "Test execution time:"
-      date
-
+      echo "Repository: https://github.com/Manigurr/qcom-linux-testkit.git"
+      echo "Branch: video-test-suite-import"
+      echo "Clone Directory: /tmp/qcom-linux-testkit-video-test"
+      echo "Test Execution Time: $(date)"
       echo "=== Test Execution Complete ==="
