@@ -11,7 +11,7 @@ metadata:
 
 run:
   steps:
-    - cd /tmp
+    - mkdir -p /opt/qcom-linux-testkit && cd /opt/qcom-linux-testkit
 
     - |
       set -u
@@ -187,20 +187,22 @@ run:
 
       GITHUB_REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
       GITHUB_BRANCH="video-test-suite-import"
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
 
       QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/tmp/test_merge"
+      QUALCOMM_CLONE_DIR="/opt/qcom-linux-testkit/test_merge"
 
       echo "GitHub repository:"
       echo "  URL: ${GITHUB_REPO_URL}"
       echo "  Branch: ${GITHUB_BRANCH}"
       echo "  Directory: ${GITHUB_CLONE_DIR}"
+      echo "  Location: /opt/ (recommended for better disk space management)"
 
       echo "Qualcomm repository:"
       echo "  URL: ${QUALCOMM_REPO_URL}"
       echo "  Branch: default branch"
       echo "  Directory: ${QUALCOMM_CLONE_DIR}"
+      echo "  Location: /opt/ (recommended for better disk space management)"
 
     - |
       set -u
@@ -208,7 +210,7 @@ run:
       echo "=== Cloning Qualcomm Repository ==="
 
       QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/tmp/test_merge"
+      QUALCOMM_CLONE_DIR="/opt/qcom-linux-testkit/test_merge"
 
       rm -rf "$QUALCOMM_CLONE_DIR"
 
@@ -259,7 +261,7 @@ run:
 
       GITHUB_REPO_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
       GITHUB_BRANCH="video-test-suite-import"
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
 
       rm -rf "$GITHUB_CLONE_DIR"
 
@@ -312,7 +314,7 @@ run:
 
       echo "=== Validating qcom-linux-testkit Repository ==="
 
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
+      GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
 
       if [ ! -d "$GITHUB_CLONE_DIR" ]; then
         echo "ERROR: Clone directory does not exist"
@@ -343,8 +345,8 @@ run:
       echo "=== Starting Video Test Suite ==="
       echo "Timestamp: $(date)"
 
-      GITHUB_CLONE_DIR="/tmp/qcom-linux-testkit-video-test"
-      RESULTS_LOG="/tmp/video-test-suite-results.log"
+      GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
+      RESULTS_LOG="/opt/qcom-linux-testkit/video-test-suite-results.log"
 
       cd "$GITHUB_CLONE_DIR"
 
@@ -368,7 +370,7 @@ run:
 
       echo "=== Test Results Summary ==="
 
-      RESULTS_LOG="/tmp/video-test-suite-results.log"
+      RESULTS_LOG="/opt/qcom-linux-testkit/video-test-suite-results.log"
       RESULTS_DIR="/data/test-results"
 
       if [ ! -f "$RESULTS_LOG" ]; then
@@ -380,7 +382,7 @@ run:
       cat "$RESULTS_LOG"
 
       if ! mkdir -p "$RESULTS_DIR" 2>/dev/null; then
-        RESULTS_DIR="/tmp/test-results"
+        RESULTS_DIR="/opt/qcom-linux-testkit/test-results"
         mkdir -p "$RESULTS_DIR"
       fi
 
@@ -401,12 +403,14 @@ run:
       echo "Main repository:"
       echo "  URL: https://github.com/Manigurr/qcom-linux-testkit.git"
       echo "  Branch: video-test-suite-import"
-      echo "  Directory: /tmp/qcom-linux-testkit-video-test"
+      echo "  Directory: /opt/qcom-linux-testkit/video-test"
+      echo "  Location: /opt/ (recommended for better disk space management)"
 
       echo "Qualcomm repository:"
       echo "  URL: https://github.qualcomm.com/manigurr/test_merge.git"
       echo "  Branch: default branch"
-      echo "  Directory: /tmp/test_merge"
+      echo "  Directory: /opt/qcom-linux-testkit/test_merge"
+      echo "  Location: /opt/ (recommended for better disk space management)"
 
       echo "Test execution time:"
       date
