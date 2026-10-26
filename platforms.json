@@ -103,7 +103,7 @@
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
 
-  "kodiak": {
+  "QCS6490": {
     "dec_max_width": 4096,
     "dec_max_height": 2160,
     "dec_max_1280_720_sessions": 8,
@@ -129,7 +129,7 @@
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
 
-  "lemans": {
+  "QCS9075": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
     "dec_max_1280_720_sessions": 16,
@@ -155,7 +155,7 @@
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
 
-  "monaco": {
+  "QCS8275": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
     "dec_max_1280_720_sessions": 16,
@@ -180,4 +180,29 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   }
+
+  "QCS615": {
+    "dec_max_width": 4096,
+    "dec_max_height": 2160,
+    "dec_max_1280_720_sessions": 8,
+    "dec_max_1920_1080_sessions": 8,
+    "dec_max_3840_2160_sessions": 1,
+    "dec_max_4096_2160_sessions": 1,
+    "dec_max_7680_4320_sessions": 0,
+    "dec_max_8192_4320_sessions": 0,
+    "enc_max_width": 4096,
+    "enc_max_height": 2160,
+    "enc_max_1280_720_sessions": 8,
+    "enc_max_1920_1080_sessions": 8,
+    "enc_max_3840_2160_sessions": 1,
+    "enc_max_4096_2160_sessions": 1,
+    "enc_max_7680_4320_sessions": 0,
+    "enc_max_8192_4320_sessions": 0,
+    "fluster_jobs": 4,
+    "fluster_min_pass": {"avc": 77, "hevc": 140, "vp9": 235},
+    "decoder": ["avc", "hevc", "vp9"],
+    "encoder": ["avc", "hevc"],
+    "pixel_formats": ["nv12", "qc08c"],
+    "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
+  },
 }
