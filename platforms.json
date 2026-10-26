@@ -24,7 +24,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "hflip", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "dynamic_bitrate", "downscale"]
   },
-
   "glymur": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
@@ -50,7 +49,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
-
   "sm8850": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
@@ -76,7 +74,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
-
   "sm8750": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
@@ -128,7 +125,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
-
   "QCS9075": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
@@ -154,7 +150,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   },
-
   "QCS8275": {
     "dec_max_width": 8192,
     "dec_max_height": 4320,
@@ -180,7 +175,6 @@
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
   }
-
   "QCS615": {
     "dec_max_width": 4096,
     "dec_max_height": 2160,
