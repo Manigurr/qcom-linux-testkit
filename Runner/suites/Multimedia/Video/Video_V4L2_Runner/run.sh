@@ -644,17 +644,7 @@ if [ "${VIDEO_STACK}" = "both" ]; then
 
     reexec_args="$(build_reexec_args)"
 
-    log_info "[both] starting BASE (upstream) pass"
-    # shellcheck disable=SC2086
-    sh -c "'$0' --stack base --log-flavor upstream $reexec_args"
-    rc_base=$?
-
-    base_res_line=""
-    if [ -f "$RES_FILE" ]; then
-        base_res_line="$(cat "$RES_FILE" 2>/dev/null || true)"
-    fi
-
-    log_info "[both] starting OVERLAY (downstream) pass"
+    log_info "[both] starting OVERLAY (downstream) pass first"
     # shellcheck disable=SC2086
     sh -c "'$0' --stack overlay --log-flavor downstream $reexec_args"
     rc_overlay=$?
@@ -662,6 +652,16 @@ if [ "${VIDEO_STACK}" = "both" ]; then
     overlay_res_line=""
     if [ -f "$RES_FILE" ]; then
         overlay_res_line="$(cat "$RES_FILE" 2>/dev/null || true)"
+    fi
+
+    log_info "[both] starting BASE (upstream) pass second"
+    # shellcheck disable=SC2086
+    sh -c "'$0' --stack base --log-flavor upstream $reexec_args"
+    rc_base=$?
+
+    base_res_line=""
+    if [ -f "$RES_FILE" ]; then
+        base_res_line="$(cat "$RES_FILE" 2>/dev/null || true)"
     fi
 
     base_status="$(printf '%s\n' "$base_res_line" | awk '{print $2}')"
@@ -712,6 +712,17 @@ video_warn_if_not_root
 # through the kernel firmware interface.
 video_ensure_downstream_iris_vpu() {
     log_info "Downstream: switching to iris_vpu only"
+
+    # Kodiak boots with iris_vpu already loaded (mixed stack).
+    # If iris_vpu is already the sole video module, skip the switch entirely.
+    if video_has_module_loaded iris_vpu &&
+       ! video_has_module_loaded qcom_iris &&
+       ! video_has_module_loaded venus_core &&
+       ! video_has_module_loaded venus_dec &&
+       ! video_has_module_loaded venus_enc; then
+        log_pass "Downstream already ready: iris_vpu loaded (no switch needed)"
+        return 0
+    fi
 
     # Remove conflicting upstream drivers before loading iris_vpu.
     for module in qcom_iris venus_enc venus_dec venus_core; do

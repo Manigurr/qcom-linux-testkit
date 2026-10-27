@@ -1,7 +1,7 @@
 metadata:
   format: Lava-Test Test Definition 1.0
   name: Video_V4L2_LocalClips
-  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco; run base & overlay"
+  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco; run overlay (downstream) first then base (upstream)"
   maintainer:
     - smuppand@qti.qualcomm.com
   os:
@@ -13,20 +13,15 @@ run:
     - cd Runner
     - export REPO_ROOT="$PWD"
     - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
-
     - |
       RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
-
       # Custom media bundle (local) path
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
-
       # Custom downstream module location (directory containing iris_vpu.ko)
       KO_DIR="/data/vendor/iris_test_app"
-
       # Optional: downstream firmware needed on Kodiak overlay
       DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
-
       # Prefer explicit TARGET; otherwise derive from LAVA device-type
       if [ -n "${TARGET:-}" ]; then
         TL="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
@@ -50,45 +45,32 @@ run:
           *) TL="" ;;
         esac
       fi
-
       case "$TL" in
         kodiak|lemans|monaco|pakala|shikra|talos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
         *) PLAT="" ;; # autodetect
       esac
-
       echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
-
       # Common args (local clips; no Wi-Fi/TAR_URL needed)
       ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
-
       # --- BASE (upstream): NO ko args here ---
       ARGS_BASE="--stack base $ARGS_COMMON"
-
       # --- OVERLAY (downstream): add ko args; only add FW on kodiak ---
       ARGS_OVERLAY="--stack overlay $ARGS_COMMON"
       if [ "$TL" = "kodiak" ]; then
         ARGS_OVERLAY="$ARGS_OVERLAY --downstream-fw $DS_FW"
       fi
-
       echo "BASE ARGS: $ARGS_BASE"
       echo "OVERLAY ARGS: $ARGS_OVERLAY"
-
-      # Run BASE (upstream)
-      # shellcheck disable=SC2086
-      sh -lc "$RPATH $ARGS_BASE" || true
-      "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
-
-      # Detect actual platform if TL is empty (auto-detect case)
+      # [CHANGE 2] Auto-detect platform if TL is still empty BEFORE any run
+      # Moved up so TL is resolved before the OVERLAY case block below
       if [ -z "$TL" ]; then
-        # Source the lib_video.sh to get platform detection
         if [ -f "$REPO_ROOT/utils/lib_video.sh" ]; then
           . "$REPO_ROOT/utils/lib_video.sh"
           TL="$(video_detect_platform)"
           echo "INFO: Auto-detected platform: $TL"
         fi
       fi
-
-      # Run OVERLAY (downstream) - only for platforms that support it
+      # [CHANGE 1] Run OVERLAY (downstream) FIRST
       # pakala, shikra, talos, purwa, hamoa only support upstream/base testing
       case "$TL" in
         pakala|shikra|talos|purwa|hamoa)
@@ -100,6 +82,9 @@ run:
           "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
           ;;
       esac
-
+      # [CHANGE 1] Run BASE (upstream) SECOND
+      # shellcheck disable=SC2086
+      sh -lc "$RPATH $ARGS_BASE" || true
+      "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
       # Optional roll-up (ignored if absent)
       "$REPO_ROOT/utils/result_parse.sh" || true
