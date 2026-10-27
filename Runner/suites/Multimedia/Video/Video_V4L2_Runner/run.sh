@@ -644,7 +644,7 @@ if [ "${VIDEO_STACK}" = "both" ]; then
 
     reexec_args="$(build_reexec_args)"
 
-    log_info "[both] starting OVERLAY (downstream) pass first"
+    log_info "[both] starting OVERLAY (downstream) pass"
     # shellcheck disable=SC2086
     sh -c "'$0' --stack overlay --log-flavor downstream $reexec_args"
     rc_overlay=$?
@@ -654,7 +654,7 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         overlay_res_line="$(cat "$RES_FILE" 2>/dev/null || true)"
     fi
 
-    log_info "[both] starting BASE (upstream) pass second"
+    log_info "[both] starting BASE (upstream) pass"
     # shellcheck disable=SC2086
     sh -c "'$0' --stack base --log-flavor upstream $reexec_args"
     rc_base=$?
@@ -713,17 +713,6 @@ video_warn_if_not_root
 video_ensure_downstream_iris_vpu() {
     log_info "Downstream: switching to iris_vpu only"
 
-    # Kodiak boots with iris_vpu already loaded (mixed stack).
-    # If iris_vpu is already the sole video module, skip the switch entirely.
-    if video_has_module_loaded iris_vpu &&
-       ! video_has_module_loaded qcom_iris &&
-       ! video_has_module_loaded venus_core &&
-       ! video_has_module_loaded venus_dec &&
-       ! video_has_module_loaded venus_enc; then
-        log_pass "Downstream already ready: iris_vpu loaded (no switch needed)"
-        return 0
-    fi
-
     # Remove conflicting upstream drivers before loading iris_vpu.
     for module in qcom_iris venus_enc venus_dec venus_core; do
         if video_has_module_loaded "$module" 2>/dev/null; then
@@ -760,6 +749,21 @@ video_ensure_downstream_iris_vpu() {
 # Upstream uses qcom_iris only. Do not call the generic video_ensure_stack()
 # for upstream because it may load the legacy Venus modules.
 video_ensure_upstream_qcom_iris() {
+    # Talos uses the boot-time legacy Venus stack. Do not unload or load
+    # anything on Talos; only validate the modules already loaded and run tests.
+    if [ "$plat" = "talos" ]; then
+        log_info "Talos: preserving boot-loaded Venus modules; no module switching"
+        if video_has_module_loaded venus_core &&
+           video_has_module_loaded venus_dec &&
+           video_has_module_loaded venus_enc &&
+           ! video_has_module_loaded qcom_iris &&
+           ! video_has_module_loaded iris_vpu; then
+            log_pass "Talos ready: venus_core, venus_dec, venus_enc already loaded"
+            return 0
+        fi
+        log_warn "Talos: expected Venus modules are not loaded or conflicting modules are present"
+        return 1
+    fi
     log_info "Upstream: switching to qcom_iris only"
     for module in iris_vpu venus_enc venus_dec venus_core; do
         if video_has_module_loaded "$module" 2>/dev/null; then
@@ -790,6 +794,15 @@ video_ensure_upstream_qcom_iris() {
 }
 
 video_validate_qcom_iris_upstream() {
+    # Talos is Venus-based. Validation is read-only: do not change modules.
+    if [ "$plat" = "talos" ]; then
+        video_has_module_loaded venus_core || return 1
+        video_has_module_loaded venus_dec || return 1
+        video_has_module_loaded venus_enc || return 1
+        video_has_module_loaded qcom_iris && return 1
+        video_has_module_loaded iris_vpu && return 1
+        return 0
+    fi
     video_has_module_loaded qcom_iris || return 1
     video_has_module_loaded iris_vpu && return 1
     video_has_module_loaded venus_core && return 1
@@ -1046,6 +1059,13 @@ case "$plat" in
             else
                 log_warn "Downstream expected but iris_vpu is missing or qcom_iris is still loaded (Kodiak)"
             fi
+        fi
+        ;;
+    talos)
+        if video_validate_qcom_iris_upstream; then
+            log_pass "Talos validated: boot-loaded Venus modules preserved"
+        else
+            log_warn "Talos expected venus_core/venus_dec/venus_enc without qcom_iris or iris_vpu"
         fi
         ;;
     *)
