@@ -53,6 +53,7 @@ if [ -z "${TIMEOUT:-}" ]; then TIMEOUT="60"; fi
 if [ -z "${STRICT:-}" ]; then STRICT="0"; fi
 if [ -z "${DMESG_SCAN:-}" ]; then DMESG_SCAN="1"; fi
 PATTERN=""
+REQUESTED_TEST=""
 if [ -z "${MAX:-}" ]; then MAX="0"; fi
 if [ -z "${STOP_ON_FAIL:-}" ]; then STOP_ON_FAIL="0"; fi
 DRY="0"
@@ -99,7 +100,7 @@ LOG_FLAVOR=""
 
 usage() {
     cat <<EOF
-Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
+Usage: $0 [iris_v4l2_test] [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--timeout S] [--strict] [--no-dmesg] [--max N] [--stop-on-fail]
           [--loglevel N] [--extract-input-clips true|false]
           [--repeat N] [--repeat-delay S] [--repeat-policy all|any]
@@ -256,6 +257,9 @@ while [ $# -gt 0 ]; do
         --clips-dest)
             shift
             CLIPS_DEST="$1"
+            ;;
+        iris_v4l2_test)
+            REQUESTED_TEST="$1"
             ;;
         --help|-h)
             usage
