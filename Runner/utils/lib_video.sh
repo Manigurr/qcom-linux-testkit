@@ -672,6 +672,7 @@ video_normalize_stack() {
 video_detect_platform() {
     model=""
     compat=""
+
     for dtbase in /proc/device-tree /sys/firmware/devicetree/base; do
         if [ -z "$model" ] && [ -r "$dtbase/model" ]; then
             model="$(tr -d '\000' <"$dtbase/model" 2>/dev/null)"
@@ -680,46 +681,31 @@ video_detect_platform() {
             compat="$(tr -d '\000' <"$dtbase/compatible" 2>/dev/null)"
         fi
     done
+
     dt_text="$(printf '%s\n%s\n' "$model" "$compat" | tr '[:upper:]' '[:lower:]')"
 
+    # Device-tree evidence has priority over fallback text.
     if printf '%s\n' "$dt_text" | grep -Eq 'qcs6490|qcm6490|rb3[^[:space:]]*6490|6490[^[:space:]]*rb3'; then
-        printf '%s\n' "kodiak"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'qcs9100|qcs9075|lemans|9100.*ride|ride.*9100'; then
-        printf '%s\n' "lemans"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'qcs8300|qcs8275|monaco|8300.*ride|ride.*8300'; then
-        printf '%s\n' "monaco"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'sm8750|pakala'; then
-        printf '%s\n' "pakala"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'shikra|cq2390|iq2390'; then
-        printf '%s\n' "shikra"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'glymur|sc8480xp'; then
-        printf '%s\n' "glymur"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'talos|sm6150|sdm6150'; then
-        printf '%s\n' "talos"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'hamoa|iq-x7181'; then
-        printf '%s\n' "hamoa"
-        return 0
-    fi
-    if printf '%s\n' "$dt_text" | grep -Eq 'purwa|iq-x5121'; then
-        printf '%s\n' "purwa"
-        return 0
+        printf '%s\n' kodiak; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'qcs9100|qcs9075|lemans|9100.*ride|ride.*9100'; then
+        printf '%s\n' lemans; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'qcs8300|qcs8275|monaco|8300.*ride|ride.*8300'; then
+        printf '%s\n' monaco; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'sm8750|pakala'; then
+        printf '%s\n' pakala; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'shikra|cq2390|iq2390'; then
+        printf '%s\n' shikra; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'glymur|sc8480xp'; then
+        printf '%s\n' glymur; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'talos|sm6150|sdm6150'; then
+        printf '%s\n' talos; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'hamoa|iq-x7181'; then
+        printf '%s\n' hamoa; return 0
+    elif printf '%s\n' "$dt_text" | grep -Eq 'purwa|iq-x5121'; then
+        printf '%s\n' purwa; return 0
     fi
 
-    # Hostname/cmdline are fallback sources only when DT is inconclusive.
+    # Consult fallback sources only when DT did not identify a platform.
     fallback=""
     [ -r /proc/cmdline ] && fallback="$fallback $(cat /proc/cmdline 2>/dev/null)"
     [ -r /etc/hostname ] && fallback="$fallback $(cat /etc/hostname 2>/dev/null)"
@@ -727,45 +713,28 @@ video_detect_platform() {
     fallback="$(printf '%s' "$fallback" | tr '[:upper:]' '[:lower:]')"
 
     if printf '%s\n' "$fallback" | grep -Eq 'qcs6490|qcm6490|rb3[^[:space:]]*6490|6490[^[:space:]]*rb3'; then
-        printf '%s\n' "kodiak"
-        return 0
+        printf '%s\n' kodiak
+    elif printf '%s\n' "$fallback" | grep -Eq 'qcs9100|qcs9075|lemans|9100.*ride|ride.*9100'; then
+        printf '%s\n' lemans
+    elif printf '%s\n' "$fallback" | grep -Eq 'qcs8300|qcs8275|monaco|8300.*ride|ride.*8300'; then
+        printf '%s\n' monaco
+    elif printf '%s\n' "$fallback" | grep -Eq 'sm8750|pakala'; then
+        printf '%s\n' pakala
+    elif printf '%s\n' "$fallback" | grep -Eq 'shikra|cq2390|iq2390'; then
+        printf '%s\n' shikra
+    elif printf '%s\n' "$fallback" | grep -Eq 'glymur|sc8480xp'; then
+        printf '%s\n' glymur
+    elif printf '%s\n' "$fallback" | grep -Eq 'talos|sm6150|sdm6150'; then
+        printf '%s\n' talos
+    elif printf '%s\n' "$fallback" | grep -Eq 'hamoa|iq-x7181'; then
+        printf '%s\n' hamoa
+    elif printf '%s\n' "$fallback" | grep -Eq 'purwa|iq-x5121'; then
+        printf '%s\n' purwa
+    else
+        printf '%s\n' unknown
     fi
-    if printf '%s\n' "$fallback" | grep -Eq 'qcs9100|qcs9075|lemans|9100.*ride|ride.*9100'; then
-        printf '%s\n' "lemans"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'qcs8300|qcs8275|monaco|8300.*ride|ride.*8300'; then
-        printf '%s\n' "monaco"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'sm8750|pakala'; then
-        printf '%s\n' "pakala"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'shikra|cq2390|iq2390'; then
-        printf '%s\n' "shikra"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'glymur|sc8480xp'; then
-        printf '%s\n' "glymur"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'talos|sm6150|sdm6150'; then
-        printf '%s\n' "talos"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'hamoa|iq-x7181'; then
-        printf '%s\n' "hamoa"
-        return 0
-    fi
-    if printf '%s\n' "$fallback" | grep -Eq 'purwa|iq-x5121'; then
-        printf '%s\n' "purwa"
-        return 0
-    fi
-
-    printf '%s\n' unknown
-    return 1
 }
+# -----------------------------------------------------------------------------
 # Validation helpers
 # -----------------------------------------------------------------------------
 video_validate_upstream_loaded() {
@@ -776,9 +745,21 @@ video_validate_upstream_loaded() {
     esac
  
     case "$plat" in
-        lemans|monaco|pakala|shikra|glymur|talos|hamoa|purwa)
-            # Any upstream build has qcom_iris present
-            if video_has_module_loaded qcom_iris; then
+        lemans|monaco|pakala|shikra|glymur|hamoa|purwa)
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
+                return 0
+            fi
+            return 1
+            ;;
+        talos)
+            if video_has_module_loaded venus_core &&
+               video_has_module_loaded venus_dec &&
+               video_has_module_loaded venus_enc &&
+               ! video_has_module_loaded qcom_iris &&
+               ! video_has_module_loaded iris_vpu; then
+                return 0
+            fi
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
                 return 0
             fi
             return 1
@@ -912,9 +893,17 @@ video_stack_status() {
             fi
             ;;
  
-        pakala|shikra|talos)
-            # Talos preserves the boot-loaded Venus stack.
-            if [ "$plat" = "talos" ] && video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc && ! video_has_module_loaded iris_vpu; then
+        pakala|shikra)
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
+                printf '%s\n' "upstream"
+                return 0
+            fi
+            ;;
+        talos)
+            if video_has_module_loaded venus_core &&
+               video_has_module_loaded venus_dec &&
+               video_has_module_loaded venus_enc &&
+               ! video_has_module_loaded iris_vpu; then
                 printf '%s\n' "upstream"
                 return 0
             fi
@@ -1048,9 +1037,6 @@ video_hot_switch_modules() {
             if [ "$stack" = "downstream" ]; then
                 log_warn "Platform $plat does not support downstream/overlay stack"
                 rc=1
-            elif [ "$plat" = "talos" ] && video_validate_upstream_loaded "$plat"; then
-                log_info "Talos: preserving boot-loaded Venus stack; no module switching"
-                rc=0
             else
                 video_unblock_mod_now "$IRIS_UP_MOD"
                 video_usleep "${MOD_SETTLE_SLEEP}"
@@ -1097,12 +1083,26 @@ video_hot_switch_modules() {
 
                 video_log_fw_hint
             else
-                video_unblock_mod_now "$VENUS_CORE_MOD" "$VENUS_DEC_MOD" "$VENUS_ENC_MOD" "$IRIS_VPU_MOD"
+                # Preserve a valid Venus stack through the fast path above. If a
+                # switch is required, prefer qcom_iris when the running image
+                # exposes it (including --ko-dir/--ko-tree); otherwise use Venus.
+                video_unblock_mod_now "$VENUS_CORE_MOD" "$VENUS_DEC_MOD" "$VENUS_ENC_MOD" "$IRIS_UP_MOD" "$IRIS_VPU_MOD"
                 "$MODPROBE" -r "$IRIS_VPU_MOD" 2>/dev/null || true
+                "$MODPROBE" -r "$VENUS_ENC_MOD" 2>/dev/null || true
+                "$MODPROBE" -r "$VENUS_DEC_MOD" 2>/dev/null || true
+                "$MODPROBE" -r "$VENUS_CORE_MOD" 2>/dev/null || true
                 video_usleep "${MOD_SETTLE_SLEEP}"
-                video_modprobe_or_insmod "$VENUS_CORE_MOD" || rc=1
-                video_modprobe_or_insmod "$VENUS_DEC_MOD" || true
-                video_modprobe_or_insmod "$VENUS_ENC_MOD" || true
+                qcom_candidate="$(video_find_module_file "$IRIS_UP_MOD" 2>/dev/null || true)"
+                qcom_probe="$("$MODPROBE" -n "$IRIS_UP_MOD" 2>/dev/null || true)"
+                if [ -n "$qcom_candidate" ] || [ -n "$qcom_probe" ]; then
+                    log_info "Kodiak: loading supported upstream qcom_iris"
+                    video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
+                else
+                    log_info "Kodiak: qcom_iris unavailable; loading supported Venus stack"
+                    video_modprobe_or_insmod "$VENUS_CORE_MOD" || rc=1
+                    video_modprobe_or_insmod "$VENUS_DEC_MOD" || true
+                    video_modprobe_or_insmod "$VENUS_ENC_MOD" || true
+                fi
                 video_usleep "${MOD_SETTLE_SLEEP}"
                 video_log_fw_hint
             fi
