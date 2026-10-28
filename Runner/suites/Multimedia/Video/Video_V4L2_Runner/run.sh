@@ -887,7 +887,7 @@ video_clean_and_refresh_v4l || true
 # --- Hard gate: if requested stack not in effect, abort immediately (platform-aware)
 case "$VIDEO_STACK" in
   upstream|up|base)
-    if ! video_validate_qcom_iris_upstream; then
+    if ! video_validate_upstream_loaded "$plat"; then
         case "$plat" in
             lemans|monaco)
                 msg="qcom_iris not both present"
@@ -963,7 +963,7 @@ case "$plat" in
         fi
         ;;
     talos)
-        if video_validate_qcom_iris_upstream; then
+        if video_validate_upstream_loaded "$plat"; then
             log_pass "Talos validated: boot-loaded Venus modules preserved"
         else
             log_warn "Talos expected venus_core/venus_dec/venus_enc without qcom_iris or iris_vpu"
