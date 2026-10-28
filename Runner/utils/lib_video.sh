@@ -670,149 +670,28 @@ video_normalize_stack() {
 # Platform detect → supported platform name|unknown
 # -----------------------------------------------------------------------------
 video_detect_platform() {
-    model=""
-    compat=""
-
+    model=""; compat=""
     for dtbase in /proc/device-tree /sys/firmware/devicetree/base; do
-        if [ -z "$model" ] && [ -r "$dtbase/model" ]; then
-            model="$(tr -d '\000' <"$dtbase/model" 2>/dev/null)"
-        fi
-        if [ -z "$compat" ] && [ -r "$dtbase/compatible" ]; then
-            compat="$(tr -d '\000' <"$dtbase/compatible" 2>/dev/null)"
-        fi
+        if [ -z "$model" ] && [ -r "$dtbase/model" ]; then model="$(tr -d '\000' <"$dtbase/model" 2>/dev/null)"; fi
+        if [ -z "$compat" ] && [ -r "$dtbase/compatible" ]; then compat="$(tr -d '\000' <"$dtbase/compatible" 2>/dev/null)"; fi
     done
-
-    fallback=""
-    [ -r /proc/cmdline ] && fallback="$(cat /proc/cmdline 2>/dev/null)"
-    [ -r /etc/hostname ] && fallback="$fallback $(cat /etc/hostname 2>/dev/null)"
-    fallback="$fallback $(uname -n 2>/dev/null)"
-    # Device-tree data is authoritative; use cmdline/hostname only as fallback.
     dt_s="$(printf '%s\n%s\n' "$model" "$compat" | tr '[:upper:]' '[:lower:]')"
-    fallback_s="$(printf '%s\n' "$fallback" | tr '[:upper:]' '[:lower:]')"
- 
-    # Pakala: sm8750, pakala
-    pakala_pat='sm8750|sm8750-mtp|pakala'
- 
-    # Shikra: shikra, cq2390, cq2390m, iq2390, iq2390s
-    shikra_pat='shikra|cq2390|cq2390m|iq2390|iq2390s'
- 
-    # Glymur: glymur, sc8480xp
-    glymur_pat='glymur|sc8480xp'
- 
-    # talos: talos, sm6150, sdm6150
-    talos_pat='talos|sm6150|sdm6150'
- 
-    # Monaco: qcs8300-ride, iq-8275-evk, qcs8275, generic qcs8300, or ride-sx+8300
-    monaco_pat='qcs8300-ride|iq-8275-evk|qcs8275|qcs8300|ride-sx.*8300|8300.*ride-sx'
- 
-    # LeMans: qcs9100-ride, qcs9075, generic qcs9100, or ride-sx+9100
-    lemans_pat='qcs9100-ride|qcs9075|qcs9100|ride-sx.*9100|9100.*ride-sx'
- 
-    # Kodiak: qcs6490, qcm6490, or rb3+6490
-    kodiak_pat='qcs6490|qcm6490|rb3.*6490|6490.*rb3'
- 
-    # Hamoa: Hamoa, IQ-X7181 EVK, or generic IQ-X7181
-    hamoa_pat='hamoa|iq-x7181-evk|iq-x7181'
- 
-    # Purwa: Purwa, IQ-X5121 EVK, or generic IQ-X5121
-    purwa_pat='purwa|iq-x5121-evk|iq-x5121'
-    
-    # Match DT first.
-    if printf '%s' "$dt_s" | grep -Eq "$pakala_pat"; then
-        printf '%s\n' "pakala"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$shikra_pat"; then
-        printf '%s\n' "shikra"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$glymur_pat"; then
-        printf '%s\n' "glymur"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$talos_pat"; then
-        printf '%s\n' "talos"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$lemans_pat"; then
-        printf '%s\n' "lemans"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$monaco_pat"; then
-        printf '%s\n' "monaco"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$kodiak_pat"; then
-        printf '%s\n' "kodiak"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$hamoa_pat"; then
-        printf '%s\n' "hamoa"
-        return 0
-    fi
- 
-    if printf '%s' "$dt_s" | grep -Eq "$purwa_pat"; then
-        printf '%s\n' "purwa"
-        return 0
-    fi
- 
-    # Consult fallback sources only when DT has no supported match.
-    if [ -n "$fallback_s" ]; then
-    if printf '%s' "$fallback_s" | grep -Eq "$pakala_pat"; then
-        printf '%s\n' "pakala"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$shikra_pat"; then
-        printf '%s\n' "shikra"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$glymur_pat"; then
-        printf '%s\n' "glymur"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$talos_pat"; then
-        printf '%s\n' "talos"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$lemans_pat"; then
-        printf '%s\n' "lemans"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$monaco_pat"; then
-        printf '%s\n' "monaco"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$kodiak_pat"; then
-        printf '%s\n' "kodiak"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$hamoa_pat"; then
-        printf '%s\n' "hamoa"
-        return 0
-    fi
- 
-    if printf '%s' "$fallback_s" | grep -Eq "$purwa_pat"; then
-        printf '%s\n' "purwa"
-        return 0
-    fi
- 
-    fi
-
-    printf '%s\n' "unknown"
+    fallback=""; [ -r /proc/cmdline ] && fallback="$fallback $(cat /proc/cmdline 2>/dev/null)"; [ -r /etc/hostname ] && fallback="$fallback $(cat /etc/hostname 2>/dev/null)"; fallback="$fallback $(uname -n 2>/dev/null)"
+    fallback_s="$(printf '%s' "$fallback" | tr '[:upper:]' '[:lower:]')"
+    pakala_pat='sm8750|sm8750-mtp|pakala'; shikra_pat='shikra|cq2390|cq2390m|iq2390|iq2390s'; glymur_pat='glymur|sc8480xp'; talos_pat='talos|sm6150|sdm6150'; monaco_pat='qcs8300-ride|iq-8275-evk|qcs8275|qcs8300|ride-sx.*8300|8300.*ride-sx'; lemans_pat='qcs9100-ride|qcs9075|qcs9100|ride-sx.*9100|9100.*ride-sx'; kodiak_pat='qcs6490|qcm6490|rb3.*6490|6490.*rb3'; hamoa_pat='hamoa|iq-x7181-evk|iq-x7181'; purwa_pat='purwa|iq-x5121-evk|iq-x5121'
+    for source in dt_s fallback_s; do
+        eval "text=\\$${source}"
+        if printf '%s' "$text" | grep -Eq "$pakala_pat"; then printf '%s\n' pakala; return; fi
+        if printf '%s' "$text" | grep -Eq "$shikra_pat"; then printf '%s\n' shikra; return; fi
+        if printf '%s' "$text" | grep -Eq "$glymur_pat"; then printf '%s\n' glymur; return; fi
+        if printf '%s' "$text" | grep -Eq "$talos_pat"; then printf '%s\n' talos; return; fi
+        if printf '%s' "$text" | grep -Eq "$lemans_pat"; then printf '%s\n' lemans; return; fi
+        if printf '%s' "$text" | grep -Eq "$monaco_pat"; then printf '%s\n' monaco; return; fi
+        if printf '%s' "$text" | grep -Eq "$kodiak_pat"; then printf '%s\n' kodiak; return; fi
+        if printf '%s' "$text" | grep -Eq "$hamoa_pat"; then printf '%s\n' hamoa; return; fi
+        if printf '%s' "$text" | grep -Eq "$purwa_pat"; then printf '%s\n' purwa; return; fi
+    done
+    printf '%s\n' unknown
 }
 
 # -----------------------------------------------------------------------------
@@ -827,13 +706,13 @@ video_validate_upstream_loaded() {
  
     case "$plat" in
         lemans|monaco|pakala|shikra|glymur|hamoa|purwa)
-            video_has_module_loaded qcom_iris
-            return $?
+            if video_has_module_loaded qcom_iris; then return 0; fi
+            return 1
             ;;
         talos)
-            video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc &&
-            ! video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu
-            return $?
+            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc && ! video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then return 0; fi
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then return 0; fi
+            return 1
             ;;
  
         kodiak)
@@ -935,18 +814,6 @@ video_assert_stack() {
     esac
 }
 
-# Validate policy before package recovery, blacklisting, or module changes.
-video_stack_request_supported() {
-    plat="$1"
-    want="$(video_normalize_stack "$2")"
-    case "$plat" in ""|auto|unknown) plat="$(video_detect_platform)" ;; esac
-    case "$want:$plat" in
-        downstream:pakala|downstream:shikra|downstream:talos) return 1 ;;
-        upstream:talos|upstream:*) return 0 ;;
-        downstream:*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
 video_stack_status() {
     plat="$1"
  
@@ -977,17 +844,11 @@ video_stack_status() {
             ;;
  
         pakala|shikra)
-            if video_has_module_loaded qcom_iris; then
-                printf '%s\n' "upstream"
-                return 0
-            fi
+            if video_has_module_loaded qcom_iris; then printf '%s\n' "upstream"; return 0; fi
             ;;
         talos)
-            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc &&
-               ! video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
-                printf '%s\n' "upstream"
-                return 0
-            fi
+            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc && ! video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then printf '%s\n' "upstream"; return 0; fi
+            if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then printf '%s\n' "upstream"; return 0; fi
             ;;
  
         kodiak)
@@ -1040,7 +901,7 @@ video_unload_all_video_modules() {
     }
 
     case "$plat" in
-        lemans|monaco|pakala|shikra|glymur)
+        lemans|monaco|pakala|shikra|glymur|talos)
             tryrmmod "$IRIS_UP_MOD"
             tryrmmod "$IRIS_VPU_MOD"
             tryrmmod "$IRIS_UP_MOD"
@@ -1109,7 +970,7 @@ video_hot_switch_modules() {
             fi
             ;;
  
-        pakala|shikra)
+        pakala|shikra|talos)
             # These platforms only support upstream/base testing
             if [ "$stack" = "downstream" ]; then
                 log_warn "Platform $plat does not support downstream/overlay stack"
@@ -1128,13 +989,6 @@ video_hot_switch_modules() {
                     video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
                 fi
                 video_usleep "${MOD_SETTLE_SLEEP}"
-            fi
-            ;;
-        talos)
-            # Talos is boot-loaded Venus; never unload or reload its modules.
-            if [ "$stack" = "downstream" ] || ! video_validate_upstream_loaded talos; then
-                log_warn "Talos supports only its existing boot-loaded Venus upstream stack"
-                rc=1
             fi
             ;;
         kodiak)
@@ -1270,13 +1124,6 @@ video_ensure_stack() {
             ;;
     esac
  
-    # Reject unsupported requests before any blacklist or module operation.
-    if ! video_stack_request_supported "$plat" "$want"; then
-        log_warn "Platform $plat does not support requested stack $want; preserving current stack"
-        printf '%s\n' "$cur_state"
-        return 1
-    fi
-
     # Only reach here if a switch is actually required.
     video_apply_blacklist_for_stack "$plat" "$want" || return 1
     video_usleep "${MOD_SETTLE_SLEEP}"

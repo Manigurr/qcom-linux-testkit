@@ -72,6 +72,7 @@ POST_TEST_SLEEP="0" # settle time after each case
 # --- Custom module source (opt-in; default is untouched) ---
 KO_DIRS="" # colon-separated list of dirs that contain .ko files
 KO_TREE="" # alt root that has lib/modules/$KVER
+VIDEO_FW_DS=""
 KO_TARBALL="" # optional tarball that we unpack once
 KO_PREFER_CUSTOM="0" # 1 = try custom first; default 0 = system first
 
@@ -106,7 +107,6 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--junit FILE] [--dry-run] [--verbose]
           [--stack auto|upstream|downstream|base|overlay|up|down|both]
           [--platform pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa]
-          [--downstream-fw PATH] # optional Kodiak firmware override
           [--force]
           [--app /path/to/iris_v4l2_test]
           [--ssid SSID] [--password PASS]
@@ -275,9 +275,9 @@ done
 
 # Export envs used by lib
 export VIDEO_APP
-export VIDEO_FW_DS
 export VIDEO_NO_REBOOT
 export VIDEO_FORCE
+export VIDEO_FW_DS
 export LOG_DIR
 export TAR_URL
 export SSID
@@ -600,9 +600,6 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         fi
 
 
-        if [ -n "${VIDEO_FW_DS:-}" ]; then
-            args="$args --downstream-fw '$VIDEO_FW_DS'"
-        fi
         if [ "${VIDEO_FORCE:-0}" -eq 1 ]; then
             args="$args --force"
         fi
@@ -715,18 +712,51 @@ log_info "SLEEPS: app-launch=${APP_LAUNCH_SLEEP}s, inter-test=${INTER_TEST_SLEEP
 # Warn if not root (module/blacklist ops may fail)
 video_warn_if_not_root
 
-# Stack policy and switching are centralized in lib_video.sh.
+# --- Downstream policy ------------------------------------------------------
+# Downstream uses only iris_vpu. This runner does not select, copy, validate,
+# back up, or explicitly load firmware. Firmware is requested by the driver
+# through the kernel firmware interface.
+video_ensure_downstream_iris_vpu() {
+    log_info "Downstream: switching to iris_vpu only"
+
+    # Remove conflicting upstream drivers before loading iris_vpu.
+    for module in qcom_iris venus_enc venus_dec venus_core; do
+        if video_has_module_loaded "$module" 2>/dev/null; then
+            log_info "Downstream: removing conflicting module $module"
+            if ! modprobe -r "$module"; then
+                log_warn "Downstream: unable to remove $module (module may be busy)"
+                return 1
+            fi
+        fi
+    done
+
+    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+        log_info "Downstream: loading iris_vpu"
+        if ! modprobe iris_vpu; then
+            log_warn "Downstream: modprobe iris_vpu failed"
+            return 1
+        fi
+    fi
+
+    if video_has_module_loaded iris_vpu &&
+       ! video_has_module_loaded qcom_iris &&
+       ! video_has_module_loaded venus_core &&
+       ! video_has_module_loaded venus_dec &&
+       ! video_has_module_loaded venus_enc; then
+        log_pass "Downstream ready: iris_vpu only"
+        return 0
+    fi
+
+    log_warn "Downstream is not clean: iris_vpu must be the only video driver"
+    return 1
+}
+
 # --- Ensure desired video stack (hot switch best-effort) ---
 plat="$(video_resolve_platform "$VIDEO_PLATFORM")"
 [ -n "$plat" ] || plat="unknown"
 log_info "Detected platform: $plat"
 
 VIDEO_STACK="$(video_normalize_stack "$VIDEO_STACK")"
-if ! video_stack_request_supported "$plat" "$VIDEO_STACK"; then
-    log_fail "$TESTNAME FAIL - stack '$VIDEO_STACK' is not supported on platform '$plat'; running stack was not changed"
-    printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
-    exit 1
-fi
 pre_stack="$(video_stack_status "$plat")"
 log_info "Current video stack (pre): $pre_stack"
 
@@ -744,6 +774,18 @@ fi
 
 VIDEO_PACKAGE_MANAGED_STACK=0
 VIDEO_PACKAGE_RECOVERY_APPLICABLE=0
+# Reject unsupported requests before package recovery or module changes.
+case "$VIDEO_STACK" in
+    downstream)
+        case "$plat" in
+            pakala|shikra|talos)
+                log_fail "[STACK] Downstream/overlay is unsupported on platform $plat; leaving the current stack unchanged."
+                printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+                exit 1
+                ;;
+        esac
+        ;;
+esac
 video_package_set_ready_before=0
 
 if [ "$VIDEO_STACK" = "downstream" ]; then
@@ -832,9 +874,12 @@ stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
 : > "$stack_tmp"
 
 if [ "$VIDEO_PACKAGE_MANAGED_STACK" -eq 1 ]; then
+    # Package setup owns the module state; do not unload/reload it here.
     log_info "Package-managed video stack; validating module state only"
     video_stack_status "$plat" >"$stack_tmp" 2>&1 || true
 else
+    # Shared helper selects the image-supported driver and preserves custom
+    # module-tree and install-block recovery behavior.
     video_ensure_stack "$VIDEO_STACK" "$plat" >"$stack_tmp" 2>&1 || true
 fi
 if [ -s "$stack_tmp" ]; then
@@ -887,7 +932,7 @@ video_clean_and_refresh_v4l || true
 # --- Hard gate: if requested stack not in effect, abort immediately (platform-aware)
 case "$VIDEO_STACK" in
   upstream|up|base)
-    if ! video_validate_upstream_loaded "$plat"; then
+    if ! video_validate_upstream_loaded; then
         case "$plat" in
             lemans|monaco)
                 msg="qcom_iris not both present"
@@ -945,14 +990,15 @@ case "$plat" in
         ;;
     kodiak)
         if [ "$post_stack" = "upstream" ]; then
-            if video_has_module_loaded qcom_iris &&
-               ! video_has_module_loaded iris_vpu &&
-               ! video_has_module_loaded venus_core &&
-               ! video_has_module_loaded venus_dec &&
-               ! video_has_module_loaded venus_enc; then
-                log_pass "Upstream validated: only qcom_iris present"
+            if video_has_module_loaded venus_core &&
+               video_has_module_loaded venus_dec &&
+               video_has_module_loaded venus_enc &&
+               ! video_has_module_loaded iris_vpu; then
+                log_pass "Upstream validated: Venus stack present"
+            elif video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
+                log_pass "Upstream validated: qcom_iris present"
             else
-                log_warn "Upstream expected but qcom_iris-only state was not validated"
+                log_warn "Upstream expected but no supported Kodiak upstream stack was validated"
             fi
         elif [ "$post_stack" = "downstream" ]; then
             if video_has_module_loaded iris_vpu && ! video_has_module_loaded qcom_iris; then
@@ -963,7 +1009,7 @@ case "$plat" in
         fi
         ;;
     talos)
-        if video_validate_upstream_loaded "$plat"; then
+        if video_validate_upstream_loaded; then
             log_pass "Talos validated: boot-loaded Venus modules preserved"
         else
             log_warn "Talos expected venus_core/venus_dec/venus_enc without qcom_iris or iris_vpu"
