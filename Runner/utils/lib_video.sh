@@ -767,7 +767,10 @@ video_validate_upstream_loaded() {
  
         kodiak)
             # Upstream valid if Venus trio present OR pure qcom_iris-only present
-            if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc; then
+            if video_has_module_loaded venus_core &&
+               video_has_module_loaded venus_dec &&
+               video_has_module_loaded venus_enc &&
+               ! video_has_module_loaded iris_vpu; then
                 return 0
             fi
  
@@ -1127,6 +1130,25 @@ video_ensure_stack() {
     esac
  
     want="$(video_normalize_stack "$want_raw")"
+ 
+    # Talos uses the boot-loaded Venus/upstream stack. Do not blacklist,
+    # unload, reload, or hot-switch modules for auto/upstream/base.
+    if [ "$plat" = "talos" ]; then
+        if [ "$want" = "auto" ]; then
+            want="upstream"
+        fi
+        if [ "$want" = "downstream" ]; then
+            log_warn "Platform talos does not support downstream/overlay stack"
+            return 1
+        fi
+        if video_validate_upstream_loaded "$plat"; then
+            printf '%s\n' "upstream"
+            return 0
+        fi
+        log_warn "Talos upstream stack is not valid; leaving boot-loaded modules unchanged"
+        printf '%s\n' "unknown"
+        return 1
+    fi
  
     if [ "$want" = "auto" ]; then
         pref="$(video_auto_preference_from_blacklist "$plat")"

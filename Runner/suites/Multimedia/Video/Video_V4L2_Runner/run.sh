@@ -106,6 +106,7 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--junit FILE] [--dry-run] [--verbose]
           [--stack auto|upstream|downstream|base|overlay|up|down|both]
           [--platform pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa]
+          [--downstream-fw PATH] # optional Kodiak downstream firmware override
           [--force]
           [--app /path/to/iris_v4l2_test]
           [--ssid SSID] [--password PASS]
@@ -196,6 +197,10 @@ while [ $# -gt 0 ]; do
             shift
             VIDEO_PLATFORM="$1"
             ;;
+        --downstream-fw)
+            shift
+            VIDEO_FW_DS="$1"
+            ;;
         --force)
             VIDEO_FORCE=1
             ;;
@@ -270,6 +275,7 @@ done
 
 # Export envs used by lib
 export VIDEO_APP
+export VIDEO_FW_DS
 export VIDEO_NO_REBOOT
 export VIDEO_FORCE
 export LOG_DIR
@@ -290,7 +296,7 @@ video_resolve_platform() {
     case "$normalized" in
         ""|auto|unknown|none|unspecified) video_detect_platform ;;
         pakala|shikra|glymur|talos|lemans|monaco|kodiak|hamoa|purwa) printf '%s\n' "$normalized" ;;
-        *) log_warn "Ignoring unsupported VIDEO_PLATFORM='$candidate'; detecting from device tree."; video_detect_platform ;;
+        *) printf 'Ignoring unsupported VIDEO_PLATFORM="%s"; detecting from device tree.\n' "$candidate" >&2; video_detect_platform ;;
     esac
 }
 
@@ -707,44 +713,8 @@ log_info "SLEEPS: app-launch=${APP_LAUNCH_SLEEP}s, inter-test=${INTER_TEST_SLEEP
 video_warn_if_not_root
 
 # --- Downstream policy ------------------------------------------------------
-# Downstream uses only iris_vpu. This runner does not select, copy, validate,
-# back up, or explicitly load firmware. Firmware is requested by the driver
-# through the kernel firmware interface.
-video_ensure_downstream_iris_vpu() {
-    log_info "Downstream: switching to iris_vpu only"
-
-    # Remove conflicting upstream drivers before loading iris_vpu.
-    for module in qcom_iris venus_enc venus_dec venus_core; do
-        if video_has_module_loaded "$module" 2>/dev/null; then
-            log_info "Downstream: removing conflicting module $module"
-            if ! modprobe -r "$module"; then
-                log_warn "Downstream: unable to remove $module (module may be busy)"
-                return 1
-            fi
-        fi
-    done
-
-    if ! video_has_module_loaded iris_vpu 2>/dev/null; then
-        log_info "Downstream: loading iris_vpu"
-        if ! modprobe iris_vpu; then
-            log_warn "Downstream: modprobe iris_vpu failed"
-            return 1
-        fi
-    fi
-
-    if video_has_module_loaded iris_vpu &&
-       ! video_has_module_loaded qcom_iris &&
-       ! video_has_module_loaded venus_core &&
-       ! video_has_module_loaded venus_dec &&
-       ! video_has_module_loaded venus_enc; then
-        log_pass "Downstream ready: iris_vpu only"
-        return 0
-    fi
-
-    log_warn "Downstream is not clean: iris_vpu must be the only video driver"
-    return 1
-}
-
+# Module selection/loading/recovery is centralized in lib_video.sh.
+# The runner must not call modprobe directly.
 # --- Ensure desired video stack (hot switch best-effort) ---
 plat="$(video_resolve_platform "$VIDEO_PLATFORM")"
 [ -n "$plat" ] || plat="unknown"
