@@ -1030,7 +1030,15 @@ video_hot_switch_modules() {
                     video_usleep "${MOD_SETTLE_SLEEP}"
                     video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
                 fi
-                video_modprobe_or_insmod "$IRIS_VPU_MOD" || true
+                # Lemans/Monaco/Glymur upstream is qcom_iris-only.
+                # Do not load iris_vpu here: its presence makes the upstream
+                # validator reject the stack and caused the base pass to abort.
+                # Remove it defensively in case a module alias/dependency loaded it.
+                if video_has_module_loaded "$IRIS_VPU_MOD"; then
+                    log_info "Removing $IRIS_VPU_MOD to keep the upstream stack pure"
+                    "$MODPROBE" -r "$IRIS_VPU_MOD" 2>/dev/null || rc=1
+                    video_usleep 0.2
+                fi
                 video_usleep "${MOD_SETTLE_SLEEP}"
             fi
             ;;

@@ -902,7 +902,7 @@ case "$VIDEO_STACK" in
     if ! video_validate_upstream_loaded "$plat"; then
         case "$plat" in
             lemans|monaco)
-                msg="qcom_iris not both present"
+                msg="qcom_iris missing or iris_vpu is still loaded"
                 ;;
             kodiak)
                 msg="upstream modules not present"
