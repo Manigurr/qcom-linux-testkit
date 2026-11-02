@@ -1,7 +1,7 @@
 metadata:
   format: Lava-Test Test Definition 1.0
   name: Video_Test_Suite_Import
-  description: "Check Git and network status, clone qcom-linux-testkit and Qualcomm test_merge repositories, and run the video test suite"
+  description: "Check Git, network, and system time; clone qcom-linux-testkit and run the video test suite"
   maintainer:
     - manigurr@qti.qualcomm.com
   os:
@@ -16,127 +16,59 @@ run:
     - |
       set -u
 
-      echo "=== System Time Synchronization ==="
-      echo "Current system time (before sync):"
-      date
+      echo "=== Initial Network Status ==="
 
-      # Try multiple methods to sync time
-      TIME_SYNC_SUCCESS=0
-
-      if command -v ntpdate >/dev/null 2>&1; then
-        echo "Attempting time sync with ntpdate..."
-        if ntpdate -s pool.ntp.org 2>/dev/null; then
-          echo "Time synchronized successfully with ntpdate"
-          TIME_SYNC_SUCCESS=1
-        else
-          echo "WARNING: ntpdate sync failed, trying alternative method"
-        fi
+      if command -v hostname >/dev/null 2>&1; then
+        hostname || true
       fi
 
-      if [ "$TIME_SYNC_SUCCESS" -eq 0 ] && command -v timedatectl >/dev/null 2>&1; then
-        echo "Attempting time sync with timedatectl..."
-        if timedatectl set-ntp true 2>/dev/null; then
-          echo "Time synchronization enabled with timedatectl"
-          sleep 2
-          TIME_SYNC_SUCCESS=1
-        else
-          echo "WARNING: timedatectl sync failed"
-        fi
-      fi
+      if command -v ip >/dev/null 2>&1; then
+        echo "--- Network interfaces ---"
+        ip addr || true
 
-      if [ "$TIME_SYNC_SUCCESS" -eq 0 ] && command -v ntpd >/dev/null 2>&1; then
-        echo "Attempting time sync with ntpd..."
-        if ntpd -q -g 2>/dev/null; then
-          echo "Time synchronized successfully with ntpd"
-          TIME_SYNC_SUCCESS=1
-        else
-          echo "WARNING: ntpd sync failed"
-        fi
-      fi
-
-      echo "Current system time (after sync):"
-      date
-
-      if [ "$TIME_SYNC_SUCCESS" -eq 0 ]; then
-        echo "WARNING: Could not synchronize system time, but continuing..."
-      fi
-
-    - |
-      set -u
-
-      echo "=== Environment and Network Status ==="
-
-      echo "=== Hostname ==="
-      hostname || true
-
-      echo "=== Git Version ==="
-      if command -v git >/dev/null 2>&1; then
-        git --version
+        echo "--- Default route ---"
+        ip route show default || true
       else
-        echo "ERROR: git is not installed on the DUT"
+        echo "ERROR: ip command is not available; cannot verify network readiness"
         exit 1
       fi
 
-      echo "=== Available Network Commands ==="
-      command -v ip || true
-      command -v nmcli || true
-      command -v iw || true
-      command -v getent || true
-
-      echo "=== Network Interface Status ==="
-
-      if command -v ip >/dev/null 2>&1; then
-        ip link || true
-        ip addr || true
-        ip route || true
-      else
-        echo "WARNING: ip command is not available"
-      fi
-
-      echo "=== Wi-Fi Network Status ==="
-
-      WIFI_CONNECTED=0
+      echo "=== Wi-Fi Status ==="
 
       if command -v nmcli >/dev/null 2>&1; then
-        echo "--- NetworkManager device status ---"
         nmcli device status || true
 
-        echo "--- NetworkManager active connections ---"
-        nmcli connection show --active || true
-
-        if nmcli device status 2>/dev/null | grep -Eiq 'wifi.*connected|wlan.*connected'; then
-          echo "RESULT: A Wi-Fi network is connected"
-          WIFI_CONNECTED=1
+        if LC_ALL=C nmcli --terse --fields TYPE,STATE device status 2>/dev/null |
+          awk -F: '$1 == "wifi" && $2 == "connected" { found=1 } END { exit !found }'; then
+          echo "RESULT: A Wi-Fi device is connected"
         else
-          echo "RESULT: No Wi-Fi network is connected"
+          echo "RESULT: No connected Wi-Fi device detected"
         fi
-
       elif command -v iw >/dev/null 2>&1; then
-        echo "--- iw Wi-Fi status ---"
-
-        WIFI_INTERFACES="$(iw dev 2>/dev/null | awk '$1 == "Interface" {print $2}')"
+        WIFI_CONNECTED=0
+        WIFI_INTERFACES="$(iw dev 2>/dev/null | awk '$1 == "Interface" { print $2 }')"
 
         if [ -z "$WIFI_INTERFACES" ]; then
           echo "No Wi-Fi interface detected"
         else
           for WIFI_INTERFACE in $WIFI_INTERFACES; do
-            echo "Wi-Fi interface: $WIFI_INTERFACE"
-            iw dev "$WIFI_INTERFACE" link || true
-
-            if iw dev "$WIFI_INTERFACE" link 2>/dev/null | grep -q '^Connected to'; then
+            echo "--- Wi-Fi interface: ${WIFI_INTERFACE} ---"
+            if iw dev "$WIFI_INTERFACE" link 2>/dev/null |
+              grep -q '^Connected to'; then
               WIFI_CONNECTED=1
             fi
+            iw dev "$WIFI_INTERFACE" link || true
           done
 
           if [ "$WIFI_CONNECTED" -eq 1 ]; then
             echo "RESULT: A Wi-Fi network is connected"
           else
-            echo "RESULT: No Wi-Fi network is connected"
+            echo "RESULT: No connected Wi-Fi device detected"
           fi
         fi
       else
-        echo "WARNING: nmcli and iw are not available"
-        echo "Unable to determine Wi-Fi connection status"
+        echo "WARNING: Neither nmcli nor iw is available"
+        echo "Wi-Fi status cannot be determined"
       fi
 
       echo "=== DNS Configuration ==="
@@ -146,22 +78,155 @@ run:
         echo "WARNING: /etc/resolv.conf is not available"
       fi
 
-      echo "=== DNS Resolution Check ==="
+      echo "=== Waiting for Network and GitHub DNS ==="
 
-      if command -v getent >/dev/null 2>&1; then
-        if getent hosts github.com; then
-          echo "github.com DNS resolution succeeded"
-        else
-          echo "WARNING: github.com DNS resolution failed"
+      NETWORK_READY=0
+      NETWORK_WAIT_SECONDS=180
+      NETWORK_INTERVAL_SECONDS=5
+      NETWORK_ATTEMPTS=$((NETWORK_WAIT_SECONDS / NETWORK_INTERVAL_SECONDS))
+
+      for attempt in $(seq 1 "$NETWORK_ATTEMPTS"); do
+        echo "Network readiness check ${attempt}/${NETWORK_ATTEMPTS}"
+
+        if ip route show default 2>/dev/null | grep -q '^default' &&
+          getent hosts github.com >/dev/null 2>&1; then
+          NETWORK_READY=1
+          break
         fi
 
-        if getent hosts github.qualcomm.com; then
-          echo "github.qualcomm.com DNS resolution succeeded"
+        sleep "$NETWORK_INTERVAL_SECONDS"
+      done
+
+      if [ "$NETWORK_READY" -ne 1 ]; then
+        echo "ERROR: Network route or github.com DNS is unavailable after ${NETWORK_WAIT_SECONDS} seconds"
+        echo "--- Interface addresses ---"
+        ip addr || true
+        echo "--- Routes ---"
+        ip route || true
+        echo "--- DNS lookup ---"
+        getent hosts github.com || true
+        exit 1
+      fi
+
+      echo "Network route and github.com DNS are ready"
+      getent hosts github.com || true
+
+    - |
+      set -u
+
+      echo "=== System Time Synchronization ==="
+      echo "Current system time before synchronization:"
+      date -u || true
+
+      TIME_SYNC_CONFIRMED=0
+
+      if command -v ntpdate >/dev/null 2>&1; then
+        echo "Attempting time synchronization with ntpdate..."
+        if ntpdate -u pool.ntp.org; then
+          TIME_SYNC_CONFIRMED=1
+          echo "Time synchronization succeeded with ntpdate"
         else
-          echo "WARNING: github.qualcomm.com DNS resolution failed"
+          echo "WARNING: ntpdate synchronization failed"
         fi
+      fi
+
+      if [ "$TIME_SYNC_CONFIRMED" -ne 1 ] &&
+        command -v ntpd >/dev/null 2>&1; then
+        echo "Attempting time synchronization with ntpd..."
+        if ntpd -q -g; then
+          TIME_SYNC_CONFIRMED=1
+          echo "Time synchronization succeeded with ntpd"
+        else
+          echo "WARNING: ntpd synchronization failed"
+        fi
+      fi
+
+      if [ "$TIME_SYNC_CONFIRMED" -ne 1 ] &&
+        command -v timedatectl >/dev/null 2>&1; then
+        echo "Enabling NTP with timedatectl..."
+        if timedatectl set-ntp true; then
+          echo "NTP enabled; waiting for synchronization status"
+        else
+          echo "WARNING: timedatectl could not enable NTP"
+        fi
+
+        for attempt in $(seq 1 12); do
+          SYNC_STATUS="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+
+          if [ "$SYNC_STATUS" = "yes" ]; then
+            TIME_SYNC_CONFIRMED=1
+            echo "timedatectl reports that the clock is synchronized"
+            break
+          fi
+
+          echo "Clock is not yet synchronized (${attempt}/12)"
+          sleep 5
+        done
+      fi
+
+      echo "Current system time after synchronization attempts:"
+      date -u || true
+
+      CURRENT_YEAR="$(date -u +%Y 2>/dev/null || echo 0)"
+
+      case "$CURRENT_YEAR" in
+        ''|*[!0-9]*)
+          CURRENT_YEAR=0
+          ;;
+      esac
+
+      if [ "$TIME_SYNC_CONFIRMED" -eq 1 ]; then
+        echo "System time synchronization was confirmed"
+      elif [ "$CURRENT_YEAR" -ge 2025 ]; then
+        echo "WARNING: Synchronization could not be confirmed, but the clock is not at the known-invalid 1980 epoch"
       else
-        echo "WARNING: getent is not available"
+        echo "ERROR: System clock is invalid or unsynchronized (year: ${CURRENT_YEAR})"
+        echo "HTTPS Git operations are expected to fail with an invalid system clock."
+        exit 1
+      fi
+
+    - |
+      set -u
+
+      echo "=== Environment and Network Diagnostics ==="
+
+      echo "--- Hostname ---"
+      hostname || true
+
+      echo "--- Git version ---"
+      if command -v git >/dev/null 2>&1; then
+        git --version
+      else
+        echo "ERROR: git is not installed on the DUT"
+        exit 1
+      fi
+
+      echo "--- Available network commands ---"
+      command -v ip || true
+      command -v nmcli || true
+      command -v iw || true
+      command -v getent || true
+
+      echo "--- Network interfaces ---"
+      ip link || true
+      ip addr || true
+
+      echo "--- Routes ---"
+      ip route || true
+
+      echo "--- GitHub DNS resolution ---"
+      if getent hosts github.com; then
+        echo "github.com DNS resolution succeeded"
+      else
+        echo "ERROR: github.com DNS resolution failed"
+        exit 1
+      fi
+
+      echo "--- DNS configuration ---"
+      if [ -f /etc/resolv.conf ]; then
+        cat /etc/resolv.conf
+      else
+        echo "WARNING: /etc/resolv.conf is not available"
       fi
 
     - |
@@ -169,7 +234,6 @@ run:
 
       echo "=== Git Configuration ==="
 
-      # Configure git for better performance and reliability
       git config --global core.preloadindex true
       git config --global core.checkStat minimal
       git config --global fetch.fsckObjects false
@@ -178,7 +242,8 @@ run:
       git config --global core.compression 0
 
       echo "Git configuration applied"
-      git config --global --list | grep -E "core\.|http\.|fetch\.|receive\." || true
+      git config --global --list |
+        grep -E 'core\.|http\.|fetch\.|receive\.' || true
 
     - |
       set -u
@@ -189,70 +254,9 @@ run:
       GITHUB_BRANCH="video-test-suite-import"
       GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
 
-      QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/opt/qcom-linux-testkit/test_merge"
-
-      echo "GitHub repository:"
-      echo "  URL: ${GITHUB_REPO_URL}"
-      echo "  Branch: ${GITHUB_BRANCH}"
-      echo "  Directory: ${GITHUB_CLONE_DIR}"
-      echo "  Location: /opt/ (recommended for better disk space management)"
-
-      echo "Qualcomm repository:"
-      echo "  URL: ${QUALCOMM_REPO_URL}"
-      echo "  Branch: default branch"
-      echo "  Directory: ${QUALCOMM_CLONE_DIR}"
-      echo "  Location: /opt/ (recommended for better disk space management)"
-
-    - |
-      set -u
-
-      echo "=== Cloning Qualcomm Repository ==="
-
-      QUALCOMM_REPO_URL="https://github.qualcomm.com/manigurr/test_merge.git"
-      QUALCOMM_CLONE_DIR="/opt/qcom-linux-testkit/test_merge"
-
-      rm -rf "$QUALCOMM_CLONE_DIR"
-
-      QUALCOMM_CLONE_SUCCESS=0
-
-      for attempt in 1 2 3; do
-        echo "Qualcomm repository clone attempt ${attempt}/3"
-
-        if git clone \
-            --depth 1 \
-            "$QUALCOMM_REPO_URL" \
-            "$QUALCOMM_CLONE_DIR"; then
-          QUALCOMM_CLONE_SUCCESS=1
-          break
-        fi
-
-        echo "Qualcomm repository clone attempt ${attempt} failed"
-        rm -rf "$QUALCOMM_CLONE_DIR"
-        sleep 5
-      done
-
-      if [ "$QUALCOMM_CLONE_SUCCESS" -eq 1 ]; then
-        echo "=== Qualcomm Repository Clone Completed Successfully ==="
-        echo "Qualcomm repository contents:"
-        ls -la "$QUALCOMM_CLONE_DIR"
-
-        echo "Qualcomm repository commit:"
-        git -C "$QUALCOMM_CLONE_DIR" log -1 --oneline || true
-      else
-        echo "WARNING: Failed to clone Qualcomm repository"
-        echo "The main qcom-linux-testkit test will continue."
-
-        echo "Qualcomm repository diagnostics:"
-        if command -v getent >/dev/null 2>&1; then
-          getent hosts github.qualcomm.com || true
-        fi
-
-        if command -v ip >/dev/null 2>&1; then
-          ip addr || true
-          ip route || true
-        fi
-      fi
+      echo "Repository URL: ${GITHUB_REPO_URL}"
+      echo "Branch: ${GITHUB_BRANCH}"
+      echo "Clone directory: ${GITHUB_CLONE_DIR}"
 
     - |
       set -u
@@ -271,26 +275,26 @@ run:
         echo "qcom-linux-testkit clone attempt ${attempt}/3"
 
         if git clone \
-            --depth 1 \
-            --single-branch \
-            --branch "$GITHUB_BRANCH" \
-            "$GITHUB_REPO_URL" \
-            "$GITHUB_CLONE_DIR"; then
+          --depth 1 \
+          --single-branch \
+          --branch "$GITHUB_BRANCH" \
+          "$GITHUB_REPO_URL" \
+          "$GITHUB_CLONE_DIR"; then
           GITHUB_CLONE_SUCCESS=1
           break
         fi
 
-        echo "qcom-linux-testkit clone attempt ${attempt} failed"
+        echo "Clone attempt ${attempt} failed"
         rm -rf "$GITHUB_CLONE_DIR"
-        
-        # Add diagnostic info on failure
-        echo "Diagnostic information:"
-        date
-        if command -v getent >/dev/null 2>&1; then
-          getent hosts github.com || true
+
+        echo "--- Clone diagnostics ---"
+        date -u || true
+        getent hosts github.com || true
+        ip route || true
+
+        if [ "$attempt" -lt 3 ]; then
+          sleep 5
         fi
-        
-        sleep 5
       done
 
       if [ "$GITHUB_CLONE_SUCCESS" -ne 1 ]; then
@@ -300,13 +304,13 @@ run:
 
       echo "=== qcom-linux-testkit Clone Completed Successfully ==="
 
-      echo "Repository contents:"
+      echo "--- Repository contents ---"
       ls -la "$GITHUB_CLONE_DIR"
 
-      echo "Repository branch:"
+      echo "--- Repository branch ---"
       git -C "$GITHUB_CLONE_DIR" branch --show-current || true
 
-      echo "Repository commit:"
+      echo "--- Repository commit ---"
       git -C "$GITHUB_CLONE_DIR" log -1 --oneline || true
 
     - |
@@ -317,7 +321,7 @@ run:
       GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
 
       if [ ! -d "$GITHUB_CLONE_DIR" ]; then
-        echo "ERROR: Clone directory does not exist"
+        echo "ERROR: Clone directory does not exist: ${GITHUB_CLONE_DIR}"
         exit 1
       fi
 
@@ -340,20 +344,22 @@ run:
       ls -l ./run.sh
 
     - |
-      set -o pipefail
+      set -u
 
       echo "=== Starting Video Test Suite ==="
-      echo "Timestamp: $(date)"
+      echo "Timestamp: $(date -u)"
 
       GITHUB_CLONE_DIR="/opt/qcom-linux-testkit/video-test"
       RESULTS_LOG="/opt/qcom-linux-testkit/video-test-suite-results.log"
 
       cd "$GITHUB_CLONE_DIR"
 
-      echo "Executing ./run.sh"
-      ./run.sh 2>&1 | tee "$RESULTS_LOG"
+      echo "Executing: ./run.sh iris_v4l2_test"
 
-      RUN_STATUS="${PIPESTATUS[0]}"
+      ./run.sh iris_v4l2_test >"$RESULTS_LOG" 2>&1
+      RUN_STATUS=$?
+
+      cat "$RESULTS_LOG"
 
       echo "run.sh exit status: ${RUN_STATUS}"
 
@@ -363,7 +369,7 @@ run:
       fi
 
       echo "=== Video Test Suite Completed Successfully ==="
-      echo "Timestamp: $(date)"
+      echo "Timestamp: $(date -u)"
 
     - |
       set -u
@@ -383,12 +389,18 @@ run:
 
       if ! mkdir -p "$RESULTS_DIR" 2>/dev/null; then
         RESULTS_DIR="/opt/qcom-linux-testkit/test-results"
-        mkdir -p "$RESULTS_DIR"
+        if ! mkdir -p "$RESULTS_DIR"; then
+          echo "ERROR: Could not create a results directory"
+          exit 1
+        fi
       fi
 
       RESULT_FILE="${RESULTS_DIR}/video-test-suite-results-$(date +%s).log"
 
-      cp "$RESULTS_LOG" "$RESULT_FILE"
+      if ! cp "$RESULTS_LOG" "$RESULT_FILE"; then
+        echo "ERROR: Could not copy the results log to ${RESULT_FILE}"
+        exit 1
+      fi
 
       echo "Results saved to:"
       echo "$RESULT_FILE"
@@ -397,6 +409,7 @@ run:
       set -u
 
       echo "=== Final Status Report ==="
+
       echo "Git version:"
       git --version || true
 
@@ -404,15 +417,8 @@ run:
       echo "  URL: https://github.com/Manigurr/qcom-linux-testkit.git"
       echo "  Branch: video-test-suite-import"
       echo "  Directory: /opt/qcom-linux-testkit/video-test"
-      echo "  Location: /opt/ (recommended for better disk space management)"
-
-      echo "Qualcomm repository:"
-      echo "  URL: https://github.qualcomm.com/manigurr/test_merge.git"
-      echo "  Branch: default branch"
-      echo "  Directory: /opt/qcom-linux-testkit/test_merge"
-      echo "  Location: /opt/ (recommended for better disk space management)"
 
       echo "Test execution time:"
-      date
+      date -u || true
 
       echo "=== Test Execution Complete ==="
