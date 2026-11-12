@@ -1,0 +1,23 @@
+name: "Stress Test Plan"
+description: "Comprehensive stress testing suite with concurrent operations and loop stress"
+target_device: "qcs9100"
+boot_method: "fastboot"
+
+test_suites:
+  - name: "video_stress_extended"
+    path: "suites/Multimedia/video_stress_extended_test.sh"
+    timeout: 1200
+    required: true
+
+execution:
+  parallel: false
+  stop_on_failure: false
+  retry_failed: true
+  max_retries: 1
+  timeout_global: 1500
+
+reporting:
+  format: "json"
+  output_dir: "/opt/testkit/results"
+  include_metrics: true
+  include_logs: true

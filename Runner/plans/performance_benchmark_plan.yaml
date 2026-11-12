@@ -1,0 +1,24 @@
+name: "Performance Benchmark Test Plan"
+description: "Comprehensive performance benchmarking suite for CPU, Memory, I/O, and Network"
+target_device: "qcs9100"
+boot_method: "fastboot"
+
+test_suites:
+  - name: "performance_benchmark_extended"
+    path: "suites/Performance/performance_benchmark_extended_test.sh"
+    timeout: 900
+    required: true
+
+execution:
+  parallel: false
+  stop_on_failure: false
+  retry_failed: true
+  max_retries: 1
+  timeout_global: 1200
+
+reporting:
+  format: "json"
+  output_dir: "/opt/testkit/results"
+  include_metrics: true
+  include_logs: true
+  include_performance: true

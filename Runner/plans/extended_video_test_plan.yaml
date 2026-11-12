@@ -1,0 +1,56 @@
+name: "Extended Video Test Plan"
+description: "Comprehensive video testing with extended test cases including codec, performance, stress, and integration tests"
+target_device: "qcs9100"
+boot_method: "fastboot"
+
+test_suites:
+  # Standard video tests
+  - name: "video_basic"
+    path: "suites/Multimedia/video_basic.sh"
+    timeout: 300
+    required: true
+    
+  # Extended codec tests
+  - name: "video_codec_extended"
+    path: "suites/Multimedia/video_codec_extended_test.sh"
+    timeout: 600
+    required: true
+    
+  # Performance benchmarks
+  - name: "performance_benchmark_extended"
+    path: "suites/Performance/performance_benchmark_extended_test.sh"
+    timeout: 900
+    required: false
+    
+  # Stress tests
+  - name: "video_stress_extended"
+    path: "suites/Multimedia/video_stress_extended_test.sh"
+    timeout: 1200
+    required: false
+    
+  # Integration tests
+  - name: "video_pipeline_integration"
+    path: "suites/Multimedia/video_pipeline_integration_test.sh"
+    timeout: 600
+    required: true
+
+# Test execution configuration
+execution:
+  parallel: false
+  stop_on_failure: false
+  retry_failed: true
+  max_retries: 2
+  timeout_global: 3600
+
+# Result reporting
+reporting:
+  format: "json"
+  output_dir: "/opt/testkit/results"
+  include_metrics: true
+  include_logs: true
+  include_performance: true
+  
+# Notifications
+notifications:
+  on_failure: true
+  on_completion: true

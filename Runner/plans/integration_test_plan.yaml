@@ -1,0 +1,23 @@
+name: "Integration Test Plan"
+description: "End-to-end integration testing suite for complete video pipeline validation"
+target_device: "qcs9100"
+boot_method: "fastboot"
+
+test_suites:
+  - name: "video_pipeline_integration"
+    path: "suites/Multimedia/video_pipeline_integration_test.sh"
+    timeout: 600
+    required: true
+
+execution:
+  parallel: false
+  stop_on_failure: true
+  retry_failed: true
+  max_retries: 2
+  timeout_global: 900
+
+reporting:
+  format: "json"
+  output_dir: "/opt/testkit/results"
+  include_metrics: true
+  include_logs: true
