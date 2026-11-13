@@ -8,15 +8,36 @@ metadata:
     - openembedded
   scope:
     - functional
+
 run:
   steps:
-    - cd Runner
-    - export REPO_ROOT="$PWD"
-    - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
-
     - |
+      REPO_ROOT="/opt/Runner"
       RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
+
+      echo "Checking deployed repository at $REPO_ROOT"
+
+      if [ ! -d "$REPO_ROOT" ]; then
+        echo "ERROR: Deployed repository directory is missing: $REPO_ROOT"
+        echo "Contents of /opt:"
+        ls -la /opt
+        exit 1
+      fi
+
+      if [ ! -f "$RPATH" ]; then
+        echo "ERROR: Deployed runner script is missing: $RPATH"
+        echo "Searching for run.sh under $REPO_ROOT:"
+        find "$REPO_ROOT" -type f -name run.sh -print
+        exit 1
+      fi
+
+      echo "Deployed runner found:"
+      ls -l "$RPATH"
+
+      cd "$REPO_ROOT" || exit 1
+      export REPO_ROOT="$PWD"
+      export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
 
       # Custom media bundle (local) path
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
@@ -33,27 +54,46 @@ run:
       else
         DEVTYPE_RAW="${DEVICE_TYPE:-${LAVA_DEVICE_TYPE:-${LAVA_DEVICE_TYPE_NAME:-${DEVICE_TYPE_NAME:-}}}}"
         DEVTYPE="$(printf '%s' "$DEVTYPE_RAW" | tr '[:upper:]' '[:lower:]')"
+
         case "$DEVTYPE" in
           # monaco
-          qcs8300-ride|qcs8300-ride-sx|iq-8275-evk) TL="monaco" ;;
+          qcs8300-ride|qcs8300-ride-sx|iq-8275-evk)
+            TL="monaco"
+            ;;
           # lemans
-          qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx) TL="lemans" ;;
+          qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx)
+            TL="lemans"
+            ;;
           # kodiak
-          qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit) TL="kodiak" ;;
+          qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit)
+            TL="kodiak"
+            ;;
           # pakala (sm8750) - upstream only
-          *pakala*|*sm8750*) TL="pakala" ;;
+          *pakala*|*sm8750*)
+            TL="pakala"
+            ;;
           # hamoa
-          hamoa|iq-x7181-evk|iq-x7181) TL="hamoa" ;;
+          hamoa|iq-x7181-evk|iq-x7181)
+            TL="hamoa"
+            ;;
           # purwa
-          purwa|iq-x5121-evk|iq-x5121) TL="purwa" ;;
+          purwa|iq-x5121-evk|iq-x5121)
+            TL="purwa"
+            ;;
           # fallback to autodetect in run.sh
-          *) TL="" ;;
+          *)
+            TL=""
+            ;;
         esac
       fi
 
       case "$TL" in
-        kodiak|lemans|monaco|pakala|shikra|talos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
-        *) PLAT="" ;; # autodetect
+        kodiak|lemans|monaco|pakala|shikra|talos|glymur|purwa|hamoa)
+          PLAT="--platform $TL"
+          ;;
+        *)
+          PLAT="" # autodetect
+          ;;
       esac
 
       echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
@@ -64,13 +104,16 @@ run:
         TL="$(video_detect_platform)"
         echo "INFO: Auto-detected platform: $TL"
       fi
+
       # Required order for Kodiak/Glymur/Lemans/Monaco:
       # downstream module check/tests first, then upstream module check/tests.
       ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
       ARGS_OVERLAY="--stack overlay $ARGS_COMMON --ko-dir $KO_DIR --ko-prefer-custom"
       ARGS_BASE="--stack base $ARGS_COMMON"
+
       echo "OVERLAY (downstream) ARGS: $ARGS_OVERLAY"
       echo "BASE (upstream) ARGS: $ARGS_BASE"
+
       case "$TL" in
         kodiak|glymur|lemans|monaco)
           # Pass 1: downstream module check and downstream tests.
@@ -82,11 +125,13 @@ run:
           echo "INFO: Platform $TL is upstream-only; skipping downstream pass"
           ;;
       esac
+
       # Pass 2: upstream module check and upstream tests.
       # Talos uses boot-loaded Venus modules. run.sh validates them without
       # unloading/loading qcom_iris or changing the stack.
       # shellcheck disable=SC2086
       sh -lc "$RPATH $ARGS_BASE" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
+
       # Optional roll-up (ignored if absent)
       "$REPO_ROOT/utils/result_parse.sh" || true
