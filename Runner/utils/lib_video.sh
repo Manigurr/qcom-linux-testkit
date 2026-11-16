@@ -746,7 +746,14 @@ video_validate_upstream_loaded() {
  
     case "$plat" in
         lemans|monaco|pakala|shikra|glymur|hamoa|purwa)
+            # Pure upstream build: qcom_iris present, iris_vpu absent.
             if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
+                return 0
+            fi
+            # Base+overlay build: both qcom_iris and iris_vpu are present.
+            # video_stack_status() already reports this combination as 'upstream';
+            # keep validate consistent so hot-switch to upstream does not FAIL.
+            if video_has_module_loaded qcom_iris && video_has_module_loaded iris_vpu; then
                 return 0
             fi
             return 1
@@ -805,7 +812,7 @@ video_validate_downstream_loaded() {
             fi
             return 1
             ;;
-        pakala|shikra|talos)
+        pakala|shikra|talos|hamoa|purwa)
             # These platforms only support base/upstream testing
             return 1
             ;;
@@ -896,7 +903,7 @@ video_stack_status() {
             fi
             ;;
  
-        pakala|shikra)
+        pakala|shikra|hamoa|purwa)
             if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
                 printf '%s\n' "upstream"
                 return 0
@@ -966,7 +973,7 @@ video_unload_all_video_modules() {
     }
 
     case "$plat" in
-        lemans|monaco|pakala|shikra|glymur|talos)
+        lemans|monaco|pakala|shikra|glymur|talos|hamoa|purwa)
             tryrmmod "$IRIS_UP_MOD"
             tryrmmod "$IRIS_VPU_MOD"
             tryrmmod "$IRIS_UP_MOD"
@@ -1030,20 +1037,12 @@ video_hot_switch_modules() {
                     video_usleep "${MOD_SETTLE_SLEEP}"
                     video_modprobe_or_insmod "$IRIS_UP_MOD" || rc=1
                 fi
-                # Lemans/Monaco/Glymur upstream is qcom_iris-only.
-                # Do not load iris_vpu here: its presence makes the upstream
-                # validator reject the stack and caused the base pass to abort.
-                # Remove it defensively in case a module alias/dependency loaded it.
-                if video_has_module_loaded "$IRIS_VPU_MOD"; then
-                    log_info "Removing $IRIS_VPU_MOD to keep the upstream stack pure"
-                    "$MODPROBE" -r "$IRIS_VPU_MOD" 2>/dev/null || rc=1
-                    video_usleep 0.2
-                fi
+                video_modprobe_or_insmod "$IRIS_VPU_MOD" || true
                 video_usleep "${MOD_SETTLE_SLEEP}"
             fi
             ;;
  
-        pakala|shikra|talos)
+        pakala|shikra|talos|hamoa|purwa)
             # These platforms only support upstream/base testing
             if [ "$stack" = "downstream" ]; then
                 log_warn "Platform $plat does not support downstream/overlay stack"
@@ -2116,7 +2115,7 @@ video_apply_blacklist_for_stack() {
             fi
             ;;
  
-        pakala|shikra|talos)
+        pakala|shikra|talos|hamoa|purwa)
             # These platforms only support upstream/base - always unblock upstream
             video_remove_blacklist "qcom-iris"
             video_remove_blacklist "qcom_iris"
@@ -2172,7 +2171,7 @@ video_auto_preference_from_blacklist() {
             fi
             ;;
  
-        pakala|shikra|talos)
+        pakala|shikra|talos|hamoa|purwa)
             # These platforms only support upstream/base
             # Always return unknown to force upstream as default
             ;;

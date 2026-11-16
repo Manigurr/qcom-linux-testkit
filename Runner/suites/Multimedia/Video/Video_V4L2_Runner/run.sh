@@ -743,7 +743,7 @@ VIDEO_PACKAGE_RECOVERY_APPLICABLE=0
 case "$(video_normalize_stack "$VIDEO_STACK")" in
     downstream)
         case "$plat" in
-            pakala|shikra|talos)
+            pakala|shikra|talos|hamoa|purwa)
                 log_fail "$TESTNAME FAIL - platform $plat does not support downstream/overlay stack"
                 printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
                 exit 1
@@ -751,6 +751,14 @@ case "$(video_normalize_stack "$VIDEO_STACK")" in
         esac
         ;;
 esac
+# --- Preflight: reject a supplied --downstream-fw path that does not exist ---
+# This must run before any stack/module changes so we fail fast and cleanly.
+if [ -n "${VIDEO_FW_DS:-}" ] && [ ! -f "$VIDEO_FW_DS" ]; then
+    log_fail "$TESTNAME FAIL - --downstream-fw path does not exist: $VIDEO_FW_DS"
+    printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+fi
+
 video_package_set_ready_before=0
 
 if [ "$VIDEO_STACK" = "downstream" ]; then
@@ -902,7 +910,7 @@ case "$VIDEO_STACK" in
     if ! video_validate_upstream_loaded "$plat"; then
         case "$plat" in
             lemans|monaco)
-                msg="qcom_iris missing or iris_vpu is still loaded"
+                msg="qcom_iris not both present"
                 ;;
             kodiak)
                 msg="upstream modules not present"
