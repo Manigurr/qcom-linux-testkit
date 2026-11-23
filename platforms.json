@@ -174,7 +174,7 @@
     "encoder": ["avc", "hevc"],
     "pixel_formats": ["nv12", "qc08c", "qc10c", "p010"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
-  }
+  },
   "QCS615": {
     "dec_max_width": 4096,
     "dec_max_height": 2160,
@@ -198,5 +198,5 @@
     "encoder": ["avc", "hevc"],
     "pixel_formats": ["nv12", "qc08c"],
     "encoder_supported_features": ["multislice", "ltr", "hierp", "rotate", "vflip", "intrarefresh_cyclic", "intrarefresh_random", "multislice_maxbytes", "multislice_maxmb", "dynamic_bitrate", "downscale"]
-  },
+  }
 }
