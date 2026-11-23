@@ -1,92 +1,251 @@
 metadata:
   format: Lava-Test Test Definition 1.0
   name: Video_V4L2_LocalClips
-  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco; run downstream then upstream"
+  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; run downstream then upstream"
   maintainer:
     - smuppand@qti.qualcomm.com
   os:
     - openembedded
   scope:
     - functional
+
 run:
   steps:
-    - cd Runner
-    - export REPO_ROOT="$PWD"
-    - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
-
     - |
-      RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
-      RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
+      bash <<'BASH'
+      set -u
+      set -o pipefail
 
-      # Custom media bundle (local) path
+      TESTKIT_URL="https://github.com/Manigurr/qcom-linux-testkit.git"
+      TESTKIT_BRANCH="video-test-suite-import"
+      TESTKIT_DIR="/opt/qcom-linux-testkit"
+
       CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
-
-      # Custom downstream module location (directory containing iris_vpu.ko)
+      APP="/data/vendor/iris_test_app/iris_v4l2_test"
       KO_DIR="/data/vendor/iris_test_app"
 
-      # Optional: downstream firmware needed on Kodiak overlay
-      DS_FW="/data/vendor/iris_test_app/vpu20_1v.mbn"
+      mkdir -p /opt/tmp || {
+        echo "ERROR: Cannot create /opt/tmp"
+        exit 1
+      }
+      export TMPDIR="/opt/tmp"
 
-      # Prefer explicit TARGET; otherwise derive from LAVA device-type
-      if [ -n "${TARGET:-}" ]; then
-        TL="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
+      RUN_LOG="/opt/video_pre_merge_$(date +%Y%m%d_%H%M%S).log"
+      touch "$RUN_LOG" || {
+        echo "ERROR: Cannot write run log: $RUN_LOG"
+        exit 1
+      }
+
+      exec > >(tee -a "$RUN_LOG") 2>&1
+
+      echo "INFO: Complete run log: $RUN_LOG"
+      echo "INFO: TMPDIR: $TMPDIR"
+
+      cd Runner || {
+        echo "ERROR: Cannot find or enter Runner directory"
+        exit 1
+      }
+
+      RUNNER_ROOT="$PWD"
+      V4L2_DIR="$RUNNER_ROOT/suites/Multimedia/Video/Video_V4L2_Runner"
+      V4L2_RUN="$V4L2_DIR/run.sh"
+
+      # Prefer explicit TARGET; otherwise derive the platform from LAVA metadata.
+      PLATFORM="${TARGET:-}"
+      if [ -n "$PLATFORM" ]; then
+        PLATFORM="$(printf '%s' "$PLATFORM" | tr '[:upper:]' '[:lower:]')"
       else
         DEVTYPE_RAW="${DEVICE_TYPE:-${LAVA_DEVICE_TYPE:-${LAVA_DEVICE_TYPE_NAME:-${DEVICE_TYPE_NAME:-}}}}"
         DEVTYPE="$(printf '%s' "$DEVTYPE_RAW" | tr '[:upper:]' '[:lower:]')"
+
         case "$DEVTYPE" in
-          # monaco
-          qcs8300-ride|qcs8300-ride-sx|iq-8275-evk) TL="monaco" ;;
-          # lemans
-          qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx) TL="lemans" ;;
-          # kodiak
-          qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit) TL="kodiak" ;;
-          # pakala (sm8750) - upstream only
-          *pakala*|*sm8750*) TL="pakala" ;;
-          # hamoa
-          hamoa|iq-x7181-evk|iq-x7181) TL="hamoa" ;;
-          # purwa
-          purwa|iq-x5121-evk|iq-x5121) TL="purwa" ;;
-          # fallback to autodetect in run.sh
-          *) TL="" ;;
+          qcs8300-ride|qcs8300-ride-sx|iq-8275-evk)
+            PLATFORM="monaco"
+            ;;
+          qcs9100-ride-r3|sa8775p-ride|iq-9075-evk|qcs9075-rb8|qcs9100-ride-sx)
+            PLATFORM="lemans"
+            ;;
+          qcs6490-rb3gen2|rb3gen2|qcs6490-rb3gen2-core-kit)
+            PLATFORM="kodiak"
+            ;;
+          *glymur*)
+            PLATFORM="glymur"
+            ;;
+          *)
+            PLATFORM=""
+            ;;
         esac
       fi
 
-      case "$TL" in
-        kodiak|lemans|monaco|pakala|shikra|talos|glymur|purwa|hamoa) PLAT="--platform $TL" ;;
-        *) PLAT="" ;; # autodetect
-      esac
-
-      echo "DEBUG: TARGET='${TARGET:-}' DEVTYPE='${DEVTYPE:-}' -> TL='$TL' PLAT='$PLAT'"
-
-      # Detect actual platform before building stack arguments.
-      if [ -z "$TL" ] && [ -f "$REPO_ROOT/utils/lib_video.sh" ]; then
-        . "$REPO_ROOT/utils/lib_video.sh"
-        TL="$(video_detect_platform)"
-        echo "INFO: Auto-detected platform: $TL"
+      # Clone the testkit to /opt if it is not already cloned.
+      if [ -d "$TESTKIT_DIR/.git" ]; then
+        echo "INFO: Reusing testkit checkout at $TESTKIT_DIR"
+      elif [ -e "$TESTKIT_DIR" ]; then
+        echo "ERROR: $TESTKIT_DIR exists but is not a Git checkout."
+        echo "Inspect it before removing or renaming it."
+        exit 1
+      else
+        echo "INFO: Cloning branch '$TESTKIT_BRANCH' into $TESTKIT_DIR"
+        if ! git clone --depth 1 --single-branch \
+            --branch "$TESTKIT_BRANCH" \
+            "$TESTKIT_URL" \
+            "$TESTKIT_DIR"; then
+          echo "ERROR: Clone failed into $TESTKIT_DIR."
+          exit 1
+        fi
       fi
-      # Required order for Kodiak/Glymur/Lemans/Monaco:
-      # downstream module check/tests first, then upstream module check/tests.
-      ARGS_COMMON="--clips-tar $CLIPS_TAR --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
-      ARGS_OVERLAY="--stack overlay $ARGS_COMMON --ko-dir $KO_DIR --ko-prefer-custom"
-      ARGS_BASE="--stack base $ARGS_COMMON"
-      echo "OVERLAY (downstream) ARGS: $ARGS_OVERLAY"
-      echo "BASE (upstream) ARGS: $ARGS_BASE"
-      case "$TL" in
-        kodiak|glymur|lemans|monaco)
-          # Pass 1: downstream module check and downstream tests.
-          # shellcheck disable=SC2086
-          sh -lc "$RPATH $ARGS_OVERLAY" || true
-          "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
+
+      ROOT_RUN="$TESTKIT_DIR/run.sh"
+
+      if [ ! -f "$ROOT_RUN" ]; then
+        echo "ERROR: Testkit root runner not found: $ROOT_RUN"
+        exit 1
+      fi
+
+      if [ ! -f "$V4L2_RUN" ]; then
+        echo "ERROR: Stack-aware V4L2 runner not found: $V4L2_RUN"
+        exit 1
+      fi
+
+      if [ ! -r "$CLIPS_TAR" ]; then
+        echo "ERROR: Clips archive is missing or unreadable: $CLIPS_TAR"
+        exit 1
+      fi
+
+      if [ ! -r "$APP" ]; then
+        echo "ERROR: Test app is missing or unreadable: $APP"
+        exit 1
+      fi
+
+      # Auto-detect if TARGET and LAVA device-type mapping did not identify a platform.
+      if [ -z "$PLATFORM" ] && [ -f "$RUNNER_ROOT/utils/lib_video.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$RUNNER_ROOT/utils/lib_video.sh"
+        if command -v video_detect_platform >/dev/null 2>&1; then
+          PLATFORM="$(video_detect_platform)"
+          PLATFORM="$(printf '%s' "$PLATFORM" | tr '[:upper:]' '[:lower:]')"
+        fi
+      fi
+
+      case "$PLATFORM" in
+        kodiak|lemans|monaco|glymur)
           ;;
         *)
-          echo "INFO: Platform $TL is upstream-only; skipping downstream pass"
+          echo "ERROR: Unsupported or undetected platform '${PLATFORM:-unknown}'."
+          echo "Supported platforms: kodiak, lemans, monaco, glymur."
+          exit 1
           ;;
       esac
-      # Pass 2: upstream module check and upstream tests.
-      # Talos uses boot-loaded Venus modules. run.sh validates them without
-      # unloading/loading qcom_iris or changing the stack.
-      # shellcheck disable=SC2086
-      sh -lc "$RPATH $ARGS_BASE" || true
-      "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
-      # Optional roll-up (ignored if absent)
-      "$REPO_ROOT/utils/result_parse.sh" || true
+
+      echo "INFO: Platform: $PLATFORM"
+      echo "INFO: Testkit root runner: $ROOT_RUN"
+      echo "INFO: Stack-aware V4L2 runner: $V4L2_RUN"
+
+      # Check the testkit capability file before starting the stack passes.
+      PLATFORMS_JSON="$TESTKIT_DIR/platforms.json"
+      if [ -f "$PLATFORMS_JSON" ]; then
+        if ! python3 -m json.tool "$PLATFORMS_JSON" >/dev/null 2>&1; then
+          echo "ERROR: Invalid JSON in $PLATFORMS_JSON"
+          echo "The cloned testkit suite may fail capability/config discovery."
+        fi
+      else
+        echo "ERROR: Testkit capability file not found: $PLATFORMS_JSON"
+      fi
+
+      ARGS_COMMON=(
+        --platform "$PLATFORM"
+        --clips-tar "$CLIPS_TAR"
+        --app "$APP"
+        --retry-on-fail 2
+        --loglevel 15
+      )
+
+      DOWNSTREAM_RC=0
+      UPSTREAM_RC=0
+      DOWNSTREAM_SUITE_RC=0
+      UPSTREAM_SUITE_RC=0
+
+      run_stack_and_testkit() {
+        local stack="$1"
+        local v4l2_stack="$2"
+        local v4l2_log="/opt/video_pre_merge_${PLATFORM}_${stack}_v4l2.log"
+        local suite_log="/opt/video_pre_merge_${PLATFORM}_${stack}_testkit.log"
+        local v4l2_rc=0
+        local suite_rc=0
+        local -a args
+
+        args=(--stack "$v4l2_stack" "${ARGS_COMMON[@]}")
+
+        if [ "$v4l2_stack" = "overlay" ]; then
+          args+=(--ko-dir "$KO_DIR" --ko-prefer-custom)
+        fi
+
+        echo
+        echo "============================================================"
+        echo "Starting ${stack} stack pass for $PLATFORM"
+        echo "============================================================"
+
+        echo "INFO: Selecting/running stack through existing V4L2 runner"
+        (
+          cd "$V4L2_DIR" || exit 1
+          bash "$V4L2_RUN" "${args[@]}"
+        ) 2>&1 | tee "$v4l2_log"
+        v4l2_rc=${PIPESTATUS[0]}
+
+        if ! grep -Fq "Video stack (post): $stack" "$v4l2_log"; then
+          echo "ERROR: Could not confirm that the device reached the $stack stack."
+          echo "Skipping testkit root runner for this pass to avoid testing the wrong stack."
+          suite_rc=1
+        else
+          echo "INFO: Running cloned testkit root run.sh with no arguments on $stack"
+          (
+            cd "$TESTKIT_DIR" || exit 1
+            bash "$ROOT_RUN"
+          ) 2>&1 | tee "$suite_log"
+          suite_rc=${PIPESTATUS[0]}
+
+          if grep -Eq \
+            'JSONDecodeError|All configs skipped for platform|Iris configs: 0 to run|ERROR: no Iris Decoder/Encoder nodes found|FAILED TESTS|[*]{10} FAILED [*]{10}' \
+            "$suite_log"; then
+            echo "ERROR: Testkit log reports a configuration error, no runnable tests, or a failed suite."
+            suite_rc=1
+          fi
+        fi
+
+        echo "INFO: ${stack} V4L2 runner exit code: $v4l2_rc"
+        echo "INFO: ${stack} testkit exit code: $suite_rc"
+        echo "INFO: ${stack} V4L2 log: $v4l2_log"
+        echo "INFO: ${stack} testkit log: $suite_log"
+
+        if [ "$stack" = "downstream" ]; then
+          DOWNSTREAM_RC="$v4l2_rc"
+          DOWNSTREAM_SUITE_RC="$suite_rc"
+        else
+          UPSTREAM_RC="$v4l2_rc"
+          UPSTREAM_SUITE_RC="$suite_rc"
+        fi
+      }
+
+      # Required order: downstream/overlay first, then upstream/base.
+      run_stack_and_testkit "downstream" "overlay"
+      run_stack_and_testkit "upstream" "base"
+
+      echo
+      echo "====================== Final status ======================"
+      echo "Platform:                  $PLATFORM"
+      echo "Downstream V4L2 runner:    $DOWNSTREAM_RC"
+      echo "Downstream video suite:    $DOWNSTREAM_SUITE_RC"
+      echo "Upstream V4L2 runner:      $UPSTREAM_RC"
+      echo "Upstream video suite:      $UPSTREAM_SUITE_RC"
+      echo "Complete run log:          $RUN_LOG"
+      echo "=========================================================="
+
+      if [ "$DOWNSTREAM_RC" -ne 0 ] || \
+         [ "$DOWNSTREAM_SUITE_RC" -ne 0 ] || \
+         [ "$UPSTREAM_RC" -ne 0 ] || \
+         [ "$UPSTREAM_SUITE_RC" -ne 0 ]; then
+        exit 1
+      fi
+
+      exit 0
+      BASH
