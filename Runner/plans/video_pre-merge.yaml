@@ -77,6 +77,19 @@ run:
         esac
       fi
 
+      # Diagnose the NetworkManager connection file before cloning the testkit.
+      NM_FILE="/etc/NetworkManager/system-connections/Hydra.nmconnection"
+
+      echo
+      echo "================ Network connection file ================"
+      if [ -f "$NM_FILE" ]; then
+        echo "INFO: Found $NM_FILE; contents:"
+        cat "$NM_FILE"
+      else
+        echo "INFO: Connection file not found: $NM_FILE"
+      fi
+      echo "=========================================================="
+
       # Clone the testkit to /opt if it is not already cloned.
       if [ -d "$TESTKIT_DIR/.git" ]; then
         echo "INFO: Reusing testkit checkout at $TESTKIT_DIR"
@@ -94,6 +107,12 @@ run:
           exit 1
         fi
       fi
+
+      # Check the device IP addresses after the clone step.
+      echo
+      echo "================ Current IP addresses ================"
+      ip addr
+      echo "======================================================="
 
       ROOT_RUN="$TESTKIT_DIR/run.sh"
 
