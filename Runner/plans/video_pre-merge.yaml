@@ -97,7 +97,16 @@ run:
 
       echo "--- ip -br addr ---"
       ip -br addr
-
+      sleep 15
+      ip addr
+      nmcli connection show --active
+      sleep 5
+      nmcli connection show --active
+      sleep 5
+      nmcli connection show --active
+      sleep 5
+      nmcli connection show --active
+      
       echo "--- ip route ---"
       ip route
 
@@ -158,13 +167,6 @@ run:
       echo "================ Current IP addresses ================"
       sleep 15
       ip addr
-      nmcli connection show --active
-      sleep 5
-      nmcli connection show --active
-      sleep 5
-      nmcli connection show --active
-      sleep 5
-      nmcli connection show --active
       echo "======================================================="
 
       ROOT_RUN="$TESTKIT_DIR/run.sh"
